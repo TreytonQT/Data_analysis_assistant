@@ -12,6 +12,7 @@ from dashboard.data_processing import (
     build_alerts,
     compute_commission_table,
     compute_metric_table,
+    compute_stopped_commission_table,
     format_display_table,
     load_commission_config,
     load_business_config,
@@ -22,6 +23,7 @@ from dashboard.data_processing import (
     normalize_target_config,
     read_local_table,
     select_metric_config,
+    split_counted_and_stopped_data,
 )
 from dashboard.display import SIDEBAR_BANNER_PATH, month_label
 from dashboard.filters import apply_home_filters
@@ -186,7 +188,7 @@ def show_metric_cards(summary_table, metric_config):
     display_metrics = [
         name
         for name in summary_table.columns
-        if name not in {"月份", "销售专员", "店铺", "店铺编码", "店铺类型", "是否计数", "部门"}
+        if name not in {"月份", "销售专员", "店铺", "店铺编码", "店铺类型", "停提款时间", "是否停提款数据", "部门"}
     ]
 
     for idx, metric_name in enumerate(display_metrics[:6]):
@@ -233,60 +235,81 @@ def commission_metric_lookup(metric_lookup):
             "弃置": {"格式": "金额"},
             "职位提点": {"格式": "百分比"},
             "提成预估": {"格式": "金额"},
+            "库存计提分摊": {"格式": "金额"},
+            "弃置分摊": {"格式": "金额"},
+            "缺提成预估": {"格式": "金额"},
             "缺配置月份数": {"格式": "整数"},
         }
     )
     return result
 
 
-def render_commission_dashboard(filtered, metric_config_df, commission_config_df, metric_lookup):
+def render_commission_dashboard(counted, stopped, metric_config_df, commission_config_df, metric_lookup):
     st.subheader("提成预估")
     commission_lookup = commission_metric_lookup(metric_lookup)
     try:
-        detail = compute_commission_table(filtered, metric_config_df, commission_config_df)
+        detail = compute_commission_table(counted, metric_config_df, commission_config_df)
     except Exception as exc:
         st.error(f"提成预估无法计算：{exc}")
         return
 
     if detail.empty:
-        st.info("当前筛选范围内暂无可计算的提成数据。")
-        return
+        st.info("当前计入范围内暂无可计算的提成数据。")
+    else:
+        missing = detail[detail["配置状态"].ne("已配置")]
+        if not missing.empty:
+            labels = [f"{month_label(row['月份'])} - {row['开发员']}" for _, row in missing.head(12).iterrows()]
+            suffix = " 等" if len(missing) > 12 else ""
+            st.warning("以下月份和开发员缺少完整提成配置，暂不计算提成：" + "；".join(labels) + suffix)
 
-    missing = detail[detail["配置状态"].ne("已配置")]
-    if not missing.empty:
-        labels = [f"{month_label(row['月份'])} - {row['开发员']}" for _, row in missing.head(12).iterrows()]
-        suffix = " 等" if len(missing) > 12 else ""
-        st.warning("以下月份和开发员缺少完整提成配置，暂不计算提成：" + "；".join(labels) + suffix)
+        numeric_detail = detail.copy()
+        for col in ["营业额", "毛利润", "毛利率", "费用率", "库存计提", "弃置", "职位提点", "提成预估"]:
+            numeric_detail[col] = pd.to_numeric(numeric_detail[col], errors="coerce")
+        numeric_detail["_缺配置"] = numeric_detail["配置状态"].ne("已配置")
 
-    numeric_detail = detail.copy()
-    for col in ["营业额", "毛利润", "毛利率", "费用率", "库存计提", "弃置", "职位提点", "提成预估"]:
-        numeric_detail[col] = pd.to_numeric(numeric_detail[col], errors="coerce")
-    numeric_detail["_缺配置"] = numeric_detail["配置状态"].ne("已配置")
-
-    summary = (
-        numeric_detail.groupby("开发员", dropna=False, as_index=False)
-        .agg(
-            营业额=("营业额", "sum"),
-            毛利润=("毛利润", "sum"),
-            提成预估=("提成预估", lambda values: values.sum(min_count=1)),
-            缺配置月份数=("_缺配置", "sum"),
+        summary = (
+            numeric_detail.groupby("开发员", dropna=False, as_index=False)
+            .agg(
+                营业额=("营业额", "sum"),
+                毛利润=("毛利润", "sum"),
+                提成预估=("提成预估", lambda values: values.sum(min_count=1)),
+                缺配置月份数=("_缺配置", "sum"),
+            )
+            .sort_values("提成预估", ascending=False, na_position="last")
         )
-        .sort_values("提成预估", ascending=False, na_position="last")
-    )
-    summary["毛利率"] = summary.apply(
-        lambda row: row["毛利润"] / row["营业额"] if pd.notna(row["营业额"]) and row["营业额"] else pd.NA,
-        axis=1,
-    )
-    summary = summary[["开发员", "营业额", "毛利润", "毛利率", "提成预估", "缺配置月份数"]]
+        summary["毛利率"] = summary.apply(
+            lambda row: row["毛利润"] / row["营业额"] if pd.notna(row["营业额"]) and row["营业额"] else pd.NA,
+            axis=1,
+        )
+        summary = summary[["开发员", "营业额", "毛利润", "毛利率", "提成预估", "缺配置月份数"]]
 
-    chart_data = summary.dropna(subset=["提成预估"])
-    if not chart_data.empty:
-        chart_if_available(chart_data, "开发员", "提成预估", title="开发员提成预估")
-    st.dataframe(format_display_table(summary, commission_lookup), use_container_width=True, hide_index=True)
+        chart_data = summary.dropna(subset=["提成预估"])
+        if not chart_data.empty:
+            chart_if_available(chart_data, "开发员", "提成预估", title="开发员提成预估")
+        st.dataframe(format_display_table(summary, commission_lookup), use_container_width=True, hide_index=True)
 
-    detail_display = detail.copy()
-    detail_display["月份"] = detail_display["月份"].map(month_label)
-    st.dataframe(format_display_table(detail_display, commission_lookup), use_container_width=True, hide_index=True)
+        detail_display = detail.copy()
+        detail_display["月份"] = detail_display["月份"].map(month_label)
+        st.dataframe(format_display_table(detail_display, commission_lookup), use_container_width=True, hide_index=True)
+
+    st.markdown("**停提款店铺缺提成**")
+    try:
+        stopped_detail = compute_stopped_commission_table(stopped, metric_config_df, commission_config_df)
+    except Exception as exc:
+        st.error(f"停提款店铺缺提成无法计算：{exc}")
+        return
+    if stopped_detail.empty:
+        st.info("当前筛选范围内没有停提款店铺数据。")
+        return
+    stopped_missing = stopped_detail[stopped_detail["配置状态"].ne("已配置")]
+    if not stopped_missing.empty:
+        labels = [f"{month_label(row['月份'])} - {row['开发员']}" for _, row in stopped_missing.head(12).iterrows()]
+        suffix = " 等" if len(stopped_missing) > 12 else ""
+        st.warning("以下停提款店铺缺少完整提成配置，暂不计算缺提成：" + "；".join(labels) + suffix)
+    stopped_display = stopped_detail.copy()
+    stopped_display["月份"] = stopped_display["月份"].map(month_label)
+    stopped_display["停提款时间"] = stopped_display["停提款时间"].map(month_label)
+    st.dataframe(format_display_table(stopped_display, commission_lookup), use_container_width=True, hide_index=True)
 
 
 def render_developer_store_type_pies(filtered, metric_config_df):
@@ -372,7 +395,7 @@ def build_discovered_store_config(reports):
         .sort_values("店铺名")
     )
     stores["店铺类型"] = ""
-    stores["是否计数"] = "是"
+    stores["停提款时间"] = ""
     stores["店铺所属部门"] = ""
     return normalize_store_config(stores).fillna("")
 
@@ -412,7 +435,11 @@ def render_business_config_editors(reports=None):
         key="store_config_editor",
         column_config={
             "店铺类型": st.column_config.SelectboxColumn("店铺类型", options=["", "中企", "本土", "其他"]),
-            "是否计数": st.column_config.SelectboxColumn("是否计数", options=["是", "否"]),
+            "停提款时间": st.column_config.SelectboxColumn(
+                "停提款时间",
+                options=[""] + sorted(reports["月份"].dropna().unique().tolist()) if reports is not None and not reports.empty else [""],
+                format_func=lambda value: "" if not value else month_label(value),
+            ),
         },
     )
     if st.button("保存店铺配置", use_container_width=True):
@@ -568,19 +595,22 @@ def render_home_page(data, metric_config_df, metric_lookup, commission_config_df
     if filtered.empty:
         st.warning("当前筛选条件下没有数据。")
         return
+    counted, stopped = split_counted_and_stopped_data(filtered)
+    if counted.empty:
+        st.warning("当前筛选条件下的常规看板没有计入数据；如存在停提款店铺数据，可在提成预估板块查看。")
 
-    errors = validate_metric_formulas(filtered, metric_config_df)
+    errors = validate_metric_formulas(counted, metric_config_df) if not counted.empty else []
     if errors:
         st.error("部分公式无法计算：\n\n" + "\n".join(f"- {e}" for e in errors))
         return
 
     overview_metrics = metrics_for_group(metric_config_df, "总览", fallback_to_overview=False)
-    overview = compute_metric_table(filtered, overview_metrics, [])
+    overview = compute_metric_table(counted, overview_metrics, [])
     st.subheader("总览 KPI")
     show_metric_cards(overview, metric_lookup)
 
     trend_metrics = metrics_for_group(metric_config_df, "趋势")
-    trend = compute_metric_table(filtered, trend_metrics, ["月份"])
+    trend = compute_metric_table(counted, trend_metrics, ["月份"])
     trend = trend.sort_values("月份") if "月份" in trend.columns else trend
     trend_chart = add_month_display(trend)
     trend_display = format_display_table(trend_chart.drop(columns=["月份"], errors="ignore"), metric_lookup)
@@ -591,19 +621,19 @@ def render_home_page(data, metric_config_df, metric_lookup, commission_config_df
     st.dataframe(trend_display, use_container_width=True, hide_index=True)
 
     developer_metrics = metrics_for_group(metric_config_df, "开发员分析")
-    developer_table = compute_metric_table(filtered, developer_metrics, ["销售专员"])
+    developer_table = compute_metric_table(counted, developer_metrics, ["销售专员"])
     developer_table = developer_table.sort_values(by="销售额", ascending=False) if "销售额" in developer_table.columns else developer_table
 
     st.subheader("开发员分析")
     if "销售额" in developer_table.columns:
         chart_if_available(developer_table.head(15), "销售专员", "销售额", title="开发员销售额排行")
-    render_developer_store_type_pies(filtered, metric_config_df)
+    render_developer_store_type_pies(counted, metric_config_df)
     st.dataframe(format_display_table(developer_table, metric_lookup), use_container_width=True, hide_index=True)
 
-    render_commission_dashboard(filtered, metric_config_df, commission_config_df, metric_lookup)
+    render_commission_dashboard(counted, stopped, metric_config_df, commission_config_df, metric_lookup)
 
     store_metrics = metrics_for_group(metric_config_df, "店铺分析")
-    store_table = compute_metric_table(filtered, store_metrics, ["部门", "店铺编码", "店铺类型"])
+    store_table = compute_metric_table(counted, store_metrics, ["部门", "店铺编码", "店铺类型"])
     store_table = store_table.sort_values(by="销售额", ascending=False) if "销售额" in store_table.columns else store_table
 
     st.subheader("店铺分析")
@@ -612,7 +642,7 @@ def render_home_page(data, metric_config_df, metric_lookup, commission_config_df
     st.dataframe(format_display_table(store_table, metric_lookup), use_container_width=True, hide_index=True)
 
     developer_store_metrics = metrics_for_group(metric_config_df, "开发员店铺分析")
-    developer_store_table = compute_metric_table(filtered, developer_store_metrics, ["店铺编码", "店铺类型"])
+    developer_store_table = compute_metric_table(counted, developer_store_metrics, ["店铺编码", "店铺类型"])
     if "销售额" in developer_store_table.columns:
         developer_store_table = developer_store_table.sort_values(by="销售额", ascending=False)
         total_sales = developer_store_table["销售额"].sum()
