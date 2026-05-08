@@ -8,15 +8,20 @@ import plotly.express as px
 import streamlit as st
 
 from dashboard.data_processing import (
+    build_discovered_commission_config,
     build_alerts,
+    compute_commission_table,
     compute_metric_table,
     format_display_table,
+    load_commission_config,
     load_business_config,
     load_metric_config,
     merge_business_config,
+    normalize_commission_config,
     normalize_store_config,
     normalize_target_config,
     read_local_table,
+    select_metric_config,
 )
 from dashboard.display import SIDEBAR_BANNER_PATH, month_label
 from dashboard.filters import apply_home_filters
@@ -34,6 +39,7 @@ CONFIG_DIR = Path(__file__).resolve().parent / "configs"
 METRIC_CONFIG_PATH = CONFIG_DIR / "metrics_config.csv"
 STORE_CONFIG_PATH = CONFIG_DIR / "store_config.csv"
 TARGET_CONFIG_PATH = CONFIG_DIR / "monthly_targets.csv"
+COMMISSION_CONFIG_PATH = CONFIG_DIR / "commission_config.csv"
 
 
 NAV_ITEMS = {
@@ -215,6 +221,98 @@ def chart_if_available(df, x, y, color=None, title=None, kind="bar"):
     st.plotly_chart(fig, use_container_width=True)
 
 
+def commission_metric_lookup(metric_lookup):
+    result = metric_lookup.copy()
+    result.update(
+        {
+            "营业额": {"格式": "金额"},
+            "毛利润": {"格式": "金额"},
+            "毛利率": {"格式": "百分比"},
+            "费用率": {"格式": "百分比"},
+            "库存计提": {"格式": "金额"},
+            "弃置": {"格式": "金额"},
+            "职位提点": {"格式": "百分比"},
+            "提成预估": {"格式": "金额"},
+            "缺配置月份数": {"格式": "整数"},
+        }
+    )
+    return result
+
+
+def render_commission_dashboard(filtered, metric_config_df, commission_config_df, metric_lookup):
+    st.subheader("提成预估")
+    commission_lookup = commission_metric_lookup(metric_lookup)
+    try:
+        detail = compute_commission_table(filtered, metric_config_df, commission_config_df)
+    except Exception as exc:
+        st.error(f"提成预估无法计算：{exc}")
+        return
+
+    if detail.empty:
+        st.info("当前筛选范围内暂无可计算的提成数据。")
+        return
+
+    missing = detail[detail["配置状态"].ne("已配置")]
+    if not missing.empty:
+        labels = [f"{month_label(row['月份'])} - {row['开发员']}" for _, row in missing.head(12).iterrows()]
+        suffix = " 等" if len(missing) > 12 else ""
+        st.warning("以下月份和开发员缺少完整提成配置，暂不计算提成：" + "；".join(labels) + suffix)
+
+    numeric_detail = detail.copy()
+    for col in ["营业额", "毛利润", "毛利率", "费用率", "库存计提", "弃置", "职位提点", "提成预估"]:
+        numeric_detail[col] = pd.to_numeric(numeric_detail[col], errors="coerce")
+    numeric_detail["_缺配置"] = numeric_detail["配置状态"].ne("已配置")
+
+    summary = (
+        numeric_detail.groupby("开发员", dropna=False, as_index=False)
+        .agg(
+            营业额=("营业额", "sum"),
+            毛利润=("毛利润", "sum"),
+            提成预估=("提成预估", lambda values: values.sum(min_count=1)),
+            缺配置月份数=("_缺配置", "sum"),
+        )
+        .sort_values("提成预估", ascending=False, na_position="last")
+    )
+    summary["毛利率"] = summary.apply(
+        lambda row: row["毛利润"] / row["营业额"] if pd.notna(row["营业额"]) and row["营业额"] else pd.NA,
+        axis=1,
+    )
+    summary = summary[["开发员", "营业额", "毛利润", "毛利率", "提成预估", "缺配置月份数"]]
+
+    chart_data = summary.dropna(subset=["提成预估"])
+    if not chart_data.empty:
+        chart_if_available(chart_data, "开发员", "提成预估", title="开发员提成预估")
+    st.dataframe(format_display_table(summary, commission_lookup), use_container_width=True, hide_index=True)
+
+    detail_display = detail.copy()
+    detail_display["月份"] = detail_display["月份"].map(month_label)
+    st.dataframe(format_display_table(detail_display, commission_lookup), use_container_width=True, hide_index=True)
+
+
+def render_developer_store_type_pies(filtered, metric_config_df):
+    try:
+        sales_metric = select_metric_config(metric_config_df, ["销售额"])
+        store_type_table = compute_metric_table(filtered, sales_metric, ["销售专员", "店铺类型"])
+    except Exception as exc:
+        st.warning(f"店铺类型占比无法计算：{exc}")
+        return
+
+    if store_type_table.empty or "销售额" not in store_type_table.columns:
+        return
+    totals = store_type_table.groupby("销售专员", as_index=False)["销售额"].sum().sort_values("销售额", ascending=False)
+    developers = totals["销售专员"].tolist()
+    for offset in range(0, len(developers), 3):
+        cols = st.columns(3)
+        for col, developer in zip(cols, developers[offset : offset + 3]):
+            chart_data = store_type_table[store_type_table["销售专员"].eq(developer)].copy()
+            chart_data = chart_data[chart_data["销售额"].fillna(0).ne(0)]
+            if chart_data.empty:
+                continue
+            fig = px.pie(chart_data, names="店铺类型", values="销售额", title=str(developer), hole=0.35)
+            fig.update_layout(height=300, margin=dict(l=10, r=10, t=45, b=10), showlegend=True)
+            col.plotly_chart(fig, use_container_width=True)
+
+
 def add_month_display(df):
     result = df.copy()
     if "月份" in result.columns:
@@ -256,6 +354,13 @@ def merge_config_rows(existing, discovered, key_col):
     return combined.drop_duplicates(subset=[key_col], keep="first").reset_index(drop=True)
 
 
+def merge_config_rows_by_keys(existing, discovered, key_cols):
+    combined = pd.concat([existing, discovered], ignore_index=True)
+    for key_col in key_cols:
+        combined = combined[combined[key_col].astype(str).str.strip().ne("")]
+    return combined.drop_duplicates(subset=key_cols, keep="first").reset_index(drop=True)
+
+
 def build_discovered_store_config(reports):
     if reports is None or reports.empty:
         return normalize_store_config(pd.DataFrame()).fillna("")
@@ -290,8 +395,12 @@ def build_discovered_target_config(reports):
 def render_business_config_editors(reports=None):
     local_store = load_local_config(STORE_CONFIG_PATH, normalize_store_config)
     local_target = load_local_config(TARGET_CONFIG_PATH, normalize_target_config)
+    local_commission = load_local_config(COMMISSION_CONFIG_PATH, normalize_commission_config)
     store_config = merge_config_rows(local_store, build_discovered_store_config(reports), "店铺名")
     target_config = merge_config_rows(local_target, build_discovered_target_config(reports), "开发员")
+    commission_config = merge_config_rows_by_keys(
+        local_commission, build_discovered_commission_config(reports), ["月份", "开发员"]
+    ).sort_values(["月份", "开发员"])
 
     st.caption("报表里出现的新店铺和开发员会自动补到表格中，点击保存后写入本地配置。")
     st.markdown("**店铺配置**")
@@ -324,7 +433,25 @@ def render_business_config_editors(reports=None):
         saved.to_csv(TARGET_CONFIG_PATH, index=False, encoding="utf-8-sig")
         st.success("目标配置已保存。")
 
-    return normalize_store_config(edited_store), normalize_target_config(edited_target)
+    st.markdown("**提成配置**")
+    st.caption("按月份和开发员维护费用率、库存计提、弃置和职位提点；费用率和职位提点可填 8%、0.08 或 8。")
+    edited_commission = st.data_editor(
+        commission_config.fillna(""),
+        num_rows="dynamic",
+        use_container_width=True,
+        hide_index=True,
+        key="commission_config_editor",
+    )
+    if st.button("保存提成配置", use_container_width=True):
+        saved = normalize_commission_config(edited_commission).fillna("")
+        saved.to_csv(COMMISSION_CONFIG_PATH, index=False, encoding="utf-8-sig")
+        st.success("提成配置已保存。")
+
+    return (
+        normalize_store_config(edited_store),
+        normalize_target_config(edited_target),
+        normalize_commission_config(edited_commission),
+    )
 
 
 def process_report_uploads(report_files):
@@ -431,7 +558,7 @@ def validate_metric_formulas(filtered, metric_config_df):
     return errors
 
 
-def render_home_page(data, metric_config_df, metric_lookup):
+def render_home_page(data, metric_config_df, metric_lookup, commission_config_df):
     st.title("首页")
     if data is None or data.empty:
         st.info("暂无可分析的业绩报表，请先到“上传中心”上传 CSV。")
@@ -470,7 +597,10 @@ def render_home_page(data, metric_config_df, metric_lookup):
     st.subheader("开发员分析")
     if "销售额" in developer_table.columns:
         chart_if_available(developer_table.head(15), "销售专员", "销售额", title="开发员销售额排行")
+    render_developer_store_type_pies(filtered, metric_config_df)
     st.dataframe(format_display_table(developer_table, metric_lookup), use_container_width=True, hide_index=True)
+
+    render_commission_dashboard(filtered, metric_config_df, commission_config_df, metric_lookup)
 
     store_metrics = metrics_for_group(metric_config_df, "店铺分析")
     store_table = compute_metric_table(filtered, store_metrics, ["部门", "店铺编码", "店铺类型"])
@@ -562,6 +692,11 @@ def main():
     except Exception as exc:
         st.error(f"指标公式配置读取失败：{exc}")
         return
+    try:
+        commission_config_df = load_commission_config()
+    except Exception as exc:
+        st.error(f"提成配置读取失败：{exc}")
+        return
 
     records = load_upload_records()
     data = None
@@ -573,7 +708,7 @@ def main():
             data = None
 
     if page == "首页":
-        render_home_page(data, metric_config_df, metric_lookup)
+        render_home_page(data, metric_config_df, metric_lookup, commission_config_df)
     elif page == "上传中心":
         render_upload_center(records)
     else:
