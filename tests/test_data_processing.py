@@ -5,10 +5,13 @@ import pandas as pd
 from dashboard.data_processing import (
     compute_commission_table,
     compute_metric_table,
+    compute_stopped_commission_table,
     merge_business_config,
     normalize_commission_config,
     normalize_report,
+    normalize_store_config,
     select_metric_config,
+    split_counted_and_stopped_data,
 )
 
 
@@ -88,6 +91,38 @@ class DataProcessingTests(unittest.TestCase):
 
         self.assertEqual(merged.loc[0, "销售额目标"], 100)
         self.assertAlmostEqual(merged.loc[0, "毛利率目标"], 0.23)
+
+    def test_legacy_store_count_flag_does_not_migrate_to_stop_month(self):
+        config = normalize_store_config(
+            pd.DataFrame(
+                {
+                    "店铺名": ["ZXU", "SGE"],
+                    "店铺类型": ["中企", "本土"],
+                    "是否计数": ["是", "否"],
+                    "店铺所属部门": ["运营部", "运营部"],
+                }
+            )
+        )
+
+        self.assertEqual(config["停提款时间"].tolist(), ["", ""])
+
+    def test_stop_withdrawal_month_splits_counted_and_stopped_data(self):
+        report = normalize_report(
+            pd.DataFrame(
+                {
+                    "销售专员": ["A", "A", "A"],
+                    "月份": ["2026-02", "2026-03", "2026-04"],
+                    "店铺": ["6-ZXU 德国", "6-ZXU 德国", "6-ZXU 德国"],
+                }
+            )
+        )
+        store_config = pd.DataFrame({"店铺名": ["ZXU"], "店铺类型": ["中企"], "停提款时间": ["2026-03"], "店铺所属部门": ["运营部"]})
+        merged = merge_business_config(report, store_config, pd.DataFrame())
+
+        counted, stopped = split_counted_and_stopped_data(merged)
+
+        self.assertEqual(counted["月份"].tolist(), ["2026-02"])
+        self.assertEqual(stopped["月份"].tolist(), ["2026-03", "2026-04"])
 
     def test_commission_config_accepts_percent_variants(self):
         config = normalize_commission_config(
@@ -187,6 +222,71 @@ class DataProcessingTests(unittest.TestCase):
 
         self.assertEqual(result.loc["中企", "销售额"], 101)
         self.assertEqual(result.loc["本土", "销售额"], 202)
+
+    def test_stopped_commission_calculates_per_store_and_allocates_fixed_costs(self):
+        report = normalize_report(
+            pd.DataFrame(
+                {
+                    "销售专员": ["A", "A"],
+                    "月份": ["2026-03", "2026-03"],
+                    "店铺": ["6-ZXU 德国", "7-YIP 法国"],
+                    "销售额--FBA销售额": [100, 300],
+                    "COD": [0, 0],
+                    "毛利润": [30, 90],
+                }
+            )
+        )
+        store_config = pd.DataFrame(
+            {
+                "店铺名": ["ZXU", "YIP"],
+                "店铺类型": ["中企", "本土"],
+                "停提款时间": ["2026-03", "2026-03"],
+                "店铺所属部门": ["运营部", "运营部"],
+            }
+        )
+        merged = merge_business_config(report, store_config, pd.DataFrame())
+        _, stopped = split_counted_and_stopped_data(merged)
+        commission = pd.DataFrame(
+            {
+                "月份": ["2026-03"],
+                "开发员": ["A"],
+                "费用率": ["10%"],
+                "库存计提": [40],
+                "弃置": [20],
+                "职位提点": ["20%"],
+            }
+        )
+
+        result = compute_stopped_commission_table(stopped, self.commission_metrics(), commission).set_index("店铺编码")
+
+        self.assertAlmostEqual(result.loc["ZXU", "库存计提分摊"], 10)
+        self.assertAlmostEqual(result.loc["ZXU", "弃置分摊"], 5)
+        self.assertAlmostEqual(result.loc["ZXU", "缺提成预估"], 1)
+        self.assertAlmostEqual(result.loc["YIP", "库存计提分摊"], 30)
+        self.assertAlmostEqual(result.loc["YIP", "弃置分摊"], 15)
+        self.assertAlmostEqual(result.loc["YIP", "缺提成预估"], 3)
+
+    def test_stopped_commission_marks_missing_config(self):
+        report = normalize_report(
+            pd.DataFrame(
+                {
+                    "销售专员": ["A"],
+                    "月份": ["2026-03"],
+                    "店铺": ["6-ZXU 德国"],
+                    "销售额--FBA销售额": [100],
+                    "COD": [0],
+                    "毛利润": [30],
+                }
+            )
+        )
+        store_config = pd.DataFrame({"店铺名": ["ZXU"], "店铺类型": ["中企"], "停提款时间": ["2026-03"], "店铺所属部门": ["运营部"]})
+        merged = merge_business_config(report, store_config, pd.DataFrame())
+        _, stopped = split_counted_and_stopped_data(merged)
+
+        result = compute_stopped_commission_table(stopped, self.commission_metrics(), pd.DataFrame())
+
+        self.assertEqual(result.iloc[0]["配置状态"], "缺配置")
+        self.assertTrue(pd.isna(result.iloc[0]["缺提成预估"]))
 
 
 if __name__ == "__main__":

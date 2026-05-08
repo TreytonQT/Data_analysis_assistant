@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parent.parent
 CONFIG_DIR = ROOT / "configs"
 
 METRIC_COLUMNS = ["指标名称", "显示分组", "公式", "格式", "排序", "是否启用"]
-STORE_COLUMNS = ["店铺名", "店铺类型", "是否计数", "店铺所属部门"]
+STORE_COLUMNS = ["店铺名", "店铺类型", "停提款时间", "店铺所属部门"]
 TARGET_COLUMNS = ["开发员", "目标业绩", "目标毛利率"]
 COMMISSION_COLUMNS = ["月份", "开发员", "费用率", "库存计提", "弃置", "职位提点"]
 COMMISSION_OUTPUT_COLUMNS = [
@@ -28,6 +28,23 @@ COMMISSION_OUTPUT_COLUMNS = [
     "弃置",
     "职位提点",
     "提成预估",
+    "配置状态",
+]
+STOPPED_COMMISSION_OUTPUT_COLUMNS = [
+    "月份",
+    "开发员",
+    "店铺编码",
+    "店铺类型",
+    "部门",
+    "停提款时间",
+    "营业额",
+    "毛利润",
+    "毛利率",
+    "费用率",
+    "库存计提分摊",
+    "弃置分摊",
+    "职位提点",
+    "缺提成预估",
     "配置状态",
 ]
 
@@ -96,6 +113,7 @@ def normalize_store_config(store_config: pd.DataFrame) -> pd.DataFrame:
     aliases = {
         "店铺编码": "店铺名",
         "部门": "店铺所属部门",
+        "停提款月份": "停提款时间",
     }
     store_config = store_config.rename(columns={old: new for old, new in aliases.items() if old in store_config.columns})
 
@@ -105,6 +123,7 @@ def normalize_store_config(store_config: pd.DataFrame) -> pd.DataFrame:
         if col not in store_config.columns:
             store_config[col] = None
     store_config = store_config[STORE_COLUMNS].copy()
+    store_config["停提款时间"] = store_config["停提款时间"].map(normalize_config_month).fillna("")
     store_config = store_config[store_config["店铺名"].notna()].drop_duplicates(subset=["店铺名"], keep="first")
     return store_config
 
@@ -195,10 +214,26 @@ def normalize_month(value) -> str | None:
     if pd.isna(value):
         return None
     text = str(value)
+    text = text.strip()
+    if not text:
+        return None
+    chinese_match = re.search(r"(\d{2,4})\s*年\s*(\d{1,2})\s*月", text)
+    if chinese_match:
+        year = int(chinese_match.group(1))
+        if year < 100:
+            year += 2000
+        return f"{year:04d}-{int(chinese_match.group(2)):02d}"
     match = re.search(r"(\d{4})[-/](\d{1,2})", text)
     if not match:
         return text
     return f"{int(match.group(1)):04d}-{int(match.group(2)):02d}"
+
+
+def normalize_config_month(value) -> str | None:
+    normalized = normalize_month(value)
+    if normalized is None:
+        return None
+    return normalized if re.fullmatch(r"\d{4}-\d{2}", str(normalized)) else None
 
 
 def extract_store_code(value) -> str:
@@ -239,12 +274,17 @@ def merge_business_config(df: pd.DataFrame, store_config: pd.DataFrame, target_c
     store_config["店铺编码"] = store_config["店铺名"].map(extract_store_code)
     store_config = store_config.rename(columns={"店铺所属部门": "部门"})
     if not store_config.empty:
-        result = result.merge(store_config[["店铺编码", "店铺类型", "是否计数", "部门"]], on="店铺编码", how="left")
+        result = result.merge(store_config[["店铺编码", "店铺类型", "停提款时间", "部门"]], on="店铺编码", how="left")
 
-    for col in ["店铺类型", "是否计数", "部门"]:
+    for col in ["店铺类型", "停提款时间", "部门"]:
         if col not in result.columns:
             result[col] = None
-    result[["店铺类型", "是否计数", "部门"]] = result[["店铺类型", "是否计数", "部门"]].fillna("未配置")
+    result[["店铺类型", "部门"]] = result[["店铺类型", "部门"]].fillna("未配置")
+    result["停提款时间"] = result["停提款时间"].fillna("").map(lambda value: normalize_month(value) or "")
+    result["是否停提款数据"] = result.apply(
+        lambda row: bool(row["停提款时间"]) and str(row["月份"]) >= str(row["停提款时间"]),
+        axis=1,
+    )
 
     target_config = target_config.copy()
     target_config = normalize_target_config(target_config)
@@ -260,6 +300,15 @@ def merge_business_config(df: pd.DataFrame, store_config: pd.DataFrame, target_c
         if col not in result.columns:
             result[col] = pd.NA
     return result
+
+
+def split_counted_and_stopped_data(data: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if data.empty:
+        return data.copy(), data.copy()
+    if "是否停提款数据" not in data.columns:
+        return data.copy(), data.iloc[0:0].copy()
+    stopped_mask = data["是否停提款数据"].fillna(False).astype(bool)
+    return data[~stopped_mask].copy(), data[stopped_mask].copy()
 
 
 def normalize_rate(series: pd.Series) -> pd.Series:
@@ -342,6 +391,50 @@ def compute_commission_table(
         * merged.loc[has_all_params, "职位提点"]
     )
     return merged[COMMISSION_OUTPUT_COLUMNS].sort_values(["月份", "开发员"]).reset_index(drop=True)
+
+
+def compute_stopped_commission_table(
+    df: pd.DataFrame, metric_config: pd.DataFrame, commission_config: pd.DataFrame
+) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame(columns=STOPPED_COMMISSION_OUTPUT_COLUMNS)
+
+    metrics = select_metric_config(metric_config, ["销售额", "毛利润", "毛利率"])
+    group_cols = ["月份", "销售专员", "店铺编码", "店铺类型", "部门", "停提款时间"]
+    base = compute_metric_table(df, metrics, group_cols).rename(
+        columns={"销售专员": "开发员", "销售额": "营业额"}
+    )
+    if base.empty:
+        return pd.DataFrame(columns=STOPPED_COMMISSION_OUTPUT_COLUMNS)
+
+    config = normalize_commission_config(commission_config).copy()
+    config["__has_commission_config"] = True
+    merged = base.merge(config, on=["月份", "开发员"], how="left")
+    if "__has_commission_config" not in merged.columns:
+        merged["__has_commission_config"] = False
+    merged["__has_commission_config"] = merged["__has_commission_config"].fillna(False)
+
+    merged["__月开发员停提款营业额"] = merged.groupby(["月份", "开发员"])["营业额"].transform("sum")
+    merged["__分摊比例"] = merged.apply(
+        lambda row: row["营业额"] / row["__月开发员停提款营业额"] if row["__月开发员停提款营业额"] else 0,
+        axis=1,
+    )
+    merged["库存计提分摊"] = merged["库存计提"] * merged["__分摊比例"]
+    merged["弃置分摊"] = merged["弃置"] * merged["__分摊比例"]
+
+    param_cols = ["费用率", "库存计提", "弃置", "职位提点"]
+    has_all_params = merged["__has_commission_config"] & merged[param_cols].notna().all(axis=1)
+    merged["配置状态"] = has_all_params.map(lambda value: "已配置" if value else "缺配置")
+    merged["缺提成预估"] = pd.NA
+    merged.loc[has_all_params, "缺提成预估"] = (
+        (
+            merged.loc[has_all_params, "营业额"] * (merged.loc[has_all_params, "毛利率"] - merged.loc[has_all_params, "费用率"])
+            - merged.loc[has_all_params, "库存计提分摊"]
+            - merged.loc[has_all_params, "弃置分摊"]
+        )
+        * merged.loc[has_all_params, "职位提点"]
+    )
+    return merged[STOPPED_COMMISSION_OUTPUT_COLUMNS].sort_values(["月份", "开发员", "店铺编码"]).reset_index(drop=True)
 
 
 def compute_metric_table(df: pd.DataFrame, metric_config: pd.DataFrame, group_cols: list[str]) -> pd.DataFrame:
