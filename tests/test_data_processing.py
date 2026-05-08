@@ -8,6 +8,7 @@ from dashboard.data_processing import (
     compute_stopped_commission_table,
     merge_business_config,
     normalize_commission_config,
+    normalize_department_fee_config,
     normalize_report,
     normalize_store_config,
     select_metric_config,
@@ -124,7 +125,20 @@ class DataProcessingTests(unittest.TestCase):
         self.assertEqual(counted["月份"].tolist(), ["2026-02"])
         self.assertEqual(stopped["月份"].tolist(), ["2026-03", "2026-04"])
 
-    def test_commission_config_accepts_percent_variants(self):
+    def test_department_fee_config_accepts_percent_variants(self):
+        config = normalize_department_fee_config(
+            pd.DataFrame(
+                {
+                    "月份": ["2026-01", "2026-01", "2026-01"],
+                    "部门": ["D1", "D2", "D3"],
+                    "费用率": ["8%", "0.08", "8"],
+                }
+            )
+        )
+
+        self.assertTrue((config["费用率"].round(4) == 0.08).all())
+
+    def test_commission_config_keeps_developer_costs_without_fee_rate(self):
         config = normalize_commission_config(
             pd.DataFrame(
                 {
@@ -138,7 +152,7 @@ class DataProcessingTests(unittest.TestCase):
             )
         )
 
-        self.assertTrue((config["费用率"].round(4) == 0.08).all())
+        self.assertNotIn("费用率", config.columns)
         self.assertTrue((config["职位提点"].round(4) == 0.08).all())
 
     def test_commission_calculates_by_month_developer_and_marks_missing_config(self):
@@ -148,6 +162,7 @@ class DataProcessingTests(unittest.TestCase):
                     "销售专员": ["A", "A"],
                     "月份": ["2026-01", "2026-02"],
                     "店铺": ["6-ZXU 德国", "6-ZXU 德国"],
+                    "部门": ["D1", "D1"],
                     "销售额--FBA销售额": [100, 200],
                     "COD": [0, 0],
                     "毛利润": [30, 60],
@@ -158,14 +173,14 @@ class DataProcessingTests(unittest.TestCase):
             {
                 "月份": ["2026-01"],
                 "开发员": ["A"],
-                "费用率": ["10%"],
                 "库存计提": [5],
                 "弃置": [1],
                 "职位提点": ["20%"],
             }
         )
+        fee_config = pd.DataFrame({"月份": ["2026-01"], "部门": ["D1"], "费用率": ["10%"]})
 
-        result = compute_commission_table(report, self.commission_metrics(), config)
+        result = compute_commission_table(report, self.commission_metrics(), config, fee_config)
         jan = result[result["月份"].eq("2026-01")].iloc[0]
         feb = result[result["月份"].eq("2026-02")].iloc[0]
 
@@ -181,6 +196,7 @@ class DataProcessingTests(unittest.TestCase):
                     "销售专员": ["A"],
                     "月份": ["2026-01"],
                     "店铺": ["6-ZXU 德国"],
+                    "部门": ["D1"],
                     "销售额--FBA销售额": [100],
                     "COD": [0],
                     "毛利润": [5],
@@ -191,16 +207,52 @@ class DataProcessingTests(unittest.TestCase):
             {
                 "月份": ["2026-01"],
                 "开发员": ["A"],
-                "费用率": ["10%"],
                 "库存计提": [0],
                 "弃置": [0],
                 "职位提点": ["20%"],
             }
         )
+        fee_config = pd.DataFrame({"月份": ["2026-01"], "部门": ["D1"], "费用率": ["10%"]})
 
-        result = compute_commission_table(report, self.commission_metrics(), config)
+        result = compute_commission_table(report, self.commission_metrics(), config, fee_config)
 
         self.assertAlmostEqual(result.iloc[0]["提成预估"], -1.0)
+
+    def test_commission_uses_department_fee_rates_before_developer_summary(self):
+        report = normalize_report(
+            pd.DataFrame(
+                {
+                    "销售专员": ["A", "A"],
+                    "月份": ["2026-01", "2026-01"],
+                    "店铺": ["6-ZXU 德国", "7-YIP 法国"],
+                    "部门": ["联合部门", "运营二十部"],
+                    "销售额--FBA销售额": [100, 300],
+                    "COD": [0, 0],
+                    "毛利润": [30, 90],
+                }
+            )
+        )
+        commission = pd.DataFrame(
+            {
+                "月份": ["2026-01"],
+                "开发员": ["A"],
+                "库存计提": [40],
+                "弃置": [20],
+                "职位提点": ["20%"],
+            }
+        )
+        department_fee = pd.DataFrame(
+            {
+                "月份": ["2026-01", "2026-01"],
+                "部门": ["联合部门", "运营二十部"],
+                "费用率": ["10%", "20%"],
+            }
+        )
+
+        result = compute_commission_table(report, self.commission_metrics(), commission, department_fee)
+
+        self.assertAlmostEqual(result.iloc[0]["费用率"], 0.175)
+        self.assertAlmostEqual(result.iloc[0]["提成预估"], -2.0)
 
     def test_store_type_sales_uses_configured_sales_formula(self):
         report = normalize_report(
@@ -250,14 +302,14 @@ class DataProcessingTests(unittest.TestCase):
             {
                 "月份": ["2026-03"],
                 "开发员": ["A"],
-                "费用率": ["10%"],
                 "库存计提": [40],
                 "弃置": [20],
                 "职位提点": ["20%"],
             }
         )
+        department_fee = pd.DataFrame({"月份": ["2026-03"], "部门": ["运营部"], "费用率": ["10%"]})
 
-        result = compute_stopped_commission_table(stopped, self.commission_metrics(), commission).set_index("店铺编码")
+        result = compute_stopped_commission_table(stopped, self.commission_metrics(), commission, department_fee).set_index("店铺编码")
 
         self.assertAlmostEqual(result.loc["ZXU", "库存计提分摊"], 10)
         self.assertAlmostEqual(result.loc["ZXU", "弃置分摊"], 5)
@@ -283,7 +335,9 @@ class DataProcessingTests(unittest.TestCase):
         merged = merge_business_config(report, store_config, pd.DataFrame())
         _, stopped = split_counted_and_stopped_data(merged)
 
-        result = compute_stopped_commission_table(stopped, self.commission_metrics(), pd.DataFrame())
+        department_fee = pd.DataFrame({"月份": ["2026-03"], "部门": ["运营部"], "费用率": ["10%"]})
+
+        result = compute_stopped_commission_table(stopped, self.commission_metrics(), pd.DataFrame(), department_fee)
 
         self.assertEqual(result.iloc[0]["配置状态"], "缺配置")
         self.assertTrue(pd.isna(result.iloc[0]["缺提成预估"]))

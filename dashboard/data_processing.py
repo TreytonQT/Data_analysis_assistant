@@ -16,7 +16,8 @@ CONFIG_DIR = ROOT / "configs"
 METRIC_COLUMNS = ["指标名称", "显示分组", "公式", "格式", "排序", "是否启用"]
 STORE_COLUMNS = ["店铺名", "店铺类型", "停提款时间", "店铺所属部门"]
 TARGET_COLUMNS = ["开发员", "目标业绩", "目标毛利率"]
-COMMISSION_COLUMNS = ["月份", "开发员", "费用率", "库存计提", "弃置", "职位提点"]
+COMMISSION_COLUMNS = ["月份", "开发员", "库存计提", "弃置", "职位提点"]
+DEPARTMENT_FEE_COLUMNS = ["月份", "部门", "费用率"]
 COMMISSION_OUTPUT_COLUMNS = [
     "月份",
     "开发员",
@@ -108,6 +109,10 @@ def load_commission_config(uploaded_file=None) -> pd.DataFrame:
     return normalize_commission_config(read_upload_table(uploaded_file, CONFIG_DIR / "commission_config.csv"))
 
 
+def load_department_fee_config(uploaded_file=None) -> pd.DataFrame:
+    return normalize_department_fee_config(read_upload_table(uploaded_file, CONFIG_DIR / "department_fee_config.csv"))
+
+
 def normalize_store_config(store_config: pd.DataFrame) -> pd.DataFrame:
     store_config = store_config.copy()
     aliases = {
@@ -153,7 +158,6 @@ def normalize_commission_config(commission_config: pd.DataFrame) -> pd.DataFrame
     aliases = {
         "销售专员": "开发员",
         "月份": "月份",
-        "费率": "费用率",
         "库存": "库存计提",
         "提点": "职位提点",
         "职位提成点": "职位提点",
@@ -171,11 +175,34 @@ def normalize_commission_config(commission_config: pd.DataFrame) -> pd.DataFrame
     commission_config = commission_config[
         commission_config["月份"].notna() & commission_config["开发员"].notna()
     ].drop_duplicates(subset=["月份", "开发员"], keep="first")
-    commission_config["费用率"] = normalize_rate(commission_config["费用率"])
     commission_config["职位提点"] = normalize_rate(commission_config["职位提点"])
     commission_config["库存计提"] = normalize_config_number(commission_config["库存计提"])
     commission_config["弃置"] = normalize_config_number(commission_config["弃置"])
     return commission_config.reset_index(drop=True)
+
+
+def normalize_department_fee_config(department_fee_config: pd.DataFrame) -> pd.DataFrame:
+    department_fee_config = department_fee_config.copy()
+    aliases = {
+        "店铺所属部门": "部门",
+        "费用部门": "部门",
+        "费率": "费用率",
+    }
+    department_fee_config = department_fee_config.rename(
+        columns={old: new for old, new in aliases.items() if old in department_fee_config.columns}
+    )
+    if department_fee_config.empty:
+        department_fee_config = pd.DataFrame(columns=DEPARTMENT_FEE_COLUMNS)
+    for col in DEPARTMENT_FEE_COLUMNS:
+        if col not in department_fee_config.columns:
+            department_fee_config[col] = None
+    department_fee_config = department_fee_config[DEPARTMENT_FEE_COLUMNS].copy()
+    department_fee_config["月份"] = department_fee_config["月份"].map(normalize_month)
+    department_fee_config = department_fee_config[
+        department_fee_config["月份"].notna() & department_fee_config["部门"].notna()
+    ].drop_duplicates(subset=["月份", "部门"], keep="first")
+    department_fee_config["费用率"] = normalize_rate(department_fee_config["费用率"])
+    return department_fee_config.reset_index(drop=True)
 
 
 def load_reports(files: Iterable) -> pd.DataFrame:
@@ -337,11 +364,23 @@ def build_discovered_commission_config(reports: pd.DataFrame | None) -> pd.DataF
         .rename(columns={"销售专员": "开发员"})
         .sort_values(["月份", "开发员"])
     )
-    commission["费用率"] = ""
     commission["库存计提"] = ""
     commission["弃置"] = ""
     commission["职位提点"] = ""
     return normalize_commission_config(commission).fillna("")
+
+
+def build_discovered_department_fee_config(reports: pd.DataFrame | None) -> pd.DataFrame:
+    if reports is None or reports.empty or "部门" not in reports.columns:
+        return normalize_department_fee_config(pd.DataFrame()).fillna("")
+    fee_config = (
+        reports[["月份", "部门"]]
+        .dropna()
+        .drop_duplicates()
+        .sort_values(["月份", "部门"])
+    )
+    fee_config["费用率"] = ""
+    return normalize_department_fee_config(fee_config).fillna("")
 
 
 def select_metric_config(metric_config: pd.DataFrame, metric_names: list[str]) -> pd.DataFrame:
@@ -359,42 +398,85 @@ def select_metric_config(metric_config: pd.DataFrame, metric_names: list[str]) -
 
 
 def compute_commission_table(
-    df: pd.DataFrame, metric_config: pd.DataFrame, commission_config: pd.DataFrame
+    df: pd.DataFrame,
+    metric_config: pd.DataFrame,
+    commission_config: pd.DataFrame,
+    department_fee_config: pd.DataFrame,
 ) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame(columns=COMMISSION_OUTPUT_COLUMNS)
 
     metrics = select_metric_config(metric_config, ["销售额", "毛利润", "毛利率"])
-    base = compute_metric_table(df, metrics, ["月份", "销售专员"]).rename(
+    base = compute_metric_table(df, metrics, ["月份", "销售专员", "部门"]).rename(
         columns={"销售专员": "开发员", "销售额": "营业额"}
     )
     if base.empty:
         return pd.DataFrame(columns=COMMISSION_OUTPUT_COLUMNS)
 
+    fee_config = normalize_department_fee_config(department_fee_config).copy()
+    fee_config["__has_department_fee_config"] = True
+    base = base.merge(fee_config, on=["月份", "部门"], how="left")
+    if "__has_department_fee_config" not in base.columns:
+        base["__has_department_fee_config"] = False
+    base["__has_department_fee_config"] = base["__has_department_fee_config"].fillna(False)
+    base["__部门费用额"] = base["营业额"] * base["费用率"]
+    base["__部门提成前利润"] = base["营业额"] * (base["毛利率"] - base["费用率"])
+
+    has_department_fee = base["__has_department_fee_config"].fillna(False).astype(bool) & base["费用率"].notna()
+    dept_missing = (
+        base[~has_department_fee]
+        .groupby(["月份", "开发员"], dropna=False)
+        .size()
+        .rename("__缺部门费用率数")
+        .reset_index()
+    )
+    base_summary = (
+        base.groupby(["月份", "开发员"], dropna=False, as_index=False)
+        .agg(
+            营业额=("营业额", "sum"),
+            毛利润=("毛利润", "sum"),
+            __部门费用额=("__部门费用额", "sum"),
+            __部门提成前利润=("__部门提成前利润", "sum"),
+        )
+        .merge(dept_missing, on=["月份", "开发员"], how="left")
+    )
+    base_summary["__缺部门费用率数"] = base_summary["__缺部门费用率数"].fillna(0)
+    base_summary["毛利率"] = base_summary.apply(
+        lambda row: row["毛利润"] / row["营业额"] if pd.notna(row["营业额"]) and row["营业额"] else pd.NA,
+        axis=1,
+    )
+    base_summary["费用率"] = base_summary.apply(
+        lambda row: row["__部门费用额"] / row["营业额"] if pd.notna(row["营业额"]) and row["营业额"] else pd.NA,
+        axis=1,
+    )
+
     config = normalize_commission_config(commission_config).copy()
     config["__has_commission_config"] = True
-    merged = base.merge(config, on=["月份", "开发员"], how="left")
+    merged = base_summary.merge(config, on=["月份", "开发员"], how="left")
     if "__has_commission_config" not in merged.columns:
         merged["__has_commission_config"] = False
     merged["__has_commission_config"] = merged["__has_commission_config"].fillna(False)
 
-    param_cols = ["费用率", "库存计提", "弃置", "职位提点"]
-    has_all_params = merged["__has_commission_config"] & merged[param_cols].notna().all(axis=1)
+    param_cols = ["库存计提", "弃置", "职位提点"]
+    has_all_params = (
+        merged["__has_commission_config"]
+        & merged[param_cols].notna().all(axis=1)
+        & merged["__缺部门费用率数"].eq(0)
+    )
     merged["配置状态"] = has_all_params.map(lambda value: "已配置" if value else "缺配置")
     merged["提成预估"] = pd.NA
     merged.loc[has_all_params, "提成预估"] = (
-        (
-            merged.loc[has_all_params, "营业额"] * (merged.loc[has_all_params, "毛利率"] - merged.loc[has_all_params, "费用率"])
-            - merged.loc[has_all_params, "库存计提"]
-            - merged.loc[has_all_params, "弃置"]
-        )
+        (merged.loc[has_all_params, "__部门提成前利润"] - merged.loc[has_all_params, "库存计提"] - merged.loc[has_all_params, "弃置"])
         * merged.loc[has_all_params, "职位提点"]
     )
     return merged[COMMISSION_OUTPUT_COLUMNS].sort_values(["月份", "开发员"]).reset_index(drop=True)
 
 
 def compute_stopped_commission_table(
-    df: pd.DataFrame, metric_config: pd.DataFrame, commission_config: pd.DataFrame
+    df: pd.DataFrame,
+    metric_config: pd.DataFrame,
+    commission_config: pd.DataFrame,
+    department_fee_config: pd.DataFrame,
 ) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame(columns=STOPPED_COMMISSION_OUTPUT_COLUMNS)
@@ -406,6 +488,13 @@ def compute_stopped_commission_table(
     )
     if base.empty:
         return pd.DataFrame(columns=STOPPED_COMMISSION_OUTPUT_COLUMNS)
+
+    fee_config = normalize_department_fee_config(department_fee_config).copy()
+    fee_config["__has_department_fee_config"] = True
+    base = base.merge(fee_config, on=["月份", "部门"], how="left")
+    if "__has_department_fee_config" not in base.columns:
+        base["__has_department_fee_config"] = False
+    base["__has_department_fee_config"] = base["__has_department_fee_config"].fillna(False)
 
     config = normalize_commission_config(commission_config).copy()
     config["__has_commission_config"] = True
@@ -422,8 +511,13 @@ def compute_stopped_commission_table(
     merged["库存计提分摊"] = merged["库存计提"] * merged["__分摊比例"]
     merged["弃置分摊"] = merged["弃置"] * merged["__分摊比例"]
 
-    param_cols = ["费用率", "库存计提", "弃置", "职位提点"]
-    has_all_params = merged["__has_commission_config"] & merged[param_cols].notna().all(axis=1)
+    param_cols = ["库存计提", "弃置", "职位提点"]
+    has_all_params = (
+        merged["__has_commission_config"]
+        & merged[param_cols].notna().all(axis=1)
+        & merged["__has_department_fee_config"].fillna(False).astype(bool)
+        & merged["费用率"].notna()
+    )
     merged["配置状态"] = has_all_params.map(lambda value: "已配置" if value else "缺配置")
     merged["缺提成预估"] = pd.NA
     merged.loc[has_all_params, "缺提成预估"] = (
