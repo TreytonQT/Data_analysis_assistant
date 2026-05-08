@@ -9,16 +9,19 @@ import streamlit as st
 
 from dashboard.data_processing import (
     build_discovered_commission_config,
+    build_discovered_department_fee_config,
     build_alerts,
     compute_commission_table,
     compute_metric_table,
     compute_stopped_commission_table,
     format_display_table,
     load_commission_config,
+    load_department_fee_config,
     load_business_config,
     load_metric_config,
     merge_business_config,
     normalize_commission_config,
+    normalize_department_fee_config,
     normalize_store_config,
     normalize_target_config,
     read_local_table,
@@ -42,6 +45,7 @@ METRIC_CONFIG_PATH = CONFIG_DIR / "metrics_config.csv"
 STORE_CONFIG_PATH = CONFIG_DIR / "store_config.csv"
 TARGET_CONFIG_PATH = CONFIG_DIR / "monthly_targets.csv"
 COMMISSION_CONFIG_PATH = CONFIG_DIR / "commission_config.csv"
+DEPARTMENT_FEE_CONFIG_PATH = CONFIG_DIR / "department_fee_config.csv"
 
 
 NAV_ITEMS = {
@@ -244,11 +248,11 @@ def commission_metric_lookup(metric_lookup):
     return result
 
 
-def render_commission_dashboard(counted, stopped, metric_config_df, commission_config_df, metric_lookup):
+def render_commission_dashboard(counted, stopped, metric_config_df, commission_config_df, department_fee_config_df, metric_lookup):
     st.subheader("提成预估")
     commission_lookup = commission_metric_lookup(metric_lookup)
     try:
-        detail = compute_commission_table(counted, metric_config_df, commission_config_df)
+        detail = compute_commission_table(counted, metric_config_df, commission_config_df, department_fee_config_df)
     except Exception as exc:
         st.error(f"提成预估无法计算：{exc}")
         return
@@ -294,7 +298,7 @@ def render_commission_dashboard(counted, stopped, metric_config_df, commission_c
 
     st.markdown("**停提款店铺缺提成**")
     try:
-        stopped_detail = compute_stopped_commission_table(stopped, metric_config_df, commission_config_df)
+        stopped_detail = compute_stopped_commission_table(stopped, metric_config_df, commission_config_df, department_fee_config_df)
     except Exception as exc:
         st.error(f"停提款店铺缺提成无法计算：{exc}")
         return
@@ -419,8 +423,15 @@ def render_business_config_editors(reports=None):
     local_store = load_local_config(STORE_CONFIG_PATH, normalize_store_config)
     local_target = load_local_config(TARGET_CONFIG_PATH, normalize_target_config)
     local_commission = load_local_config(COMMISSION_CONFIG_PATH, normalize_commission_config)
+    local_department_fee = load_local_config(DEPARTMENT_FEE_CONFIG_PATH, normalize_department_fee_config)
     store_config = merge_config_rows(local_store, build_discovered_store_config(reports), "店铺名")
     target_config = merge_config_rows(local_target, build_discovered_target_config(reports), "开发员")
+    reports_with_store = None
+    if reports is not None and not reports.empty:
+        reports_with_store = merge_business_config(reports, store_config, target_config)
+    department_fee_config = merge_config_rows_by_keys(
+        local_department_fee, build_discovered_department_fee_config(reports_with_store), ["月份", "部门"]
+    ).sort_values(["月份", "部门"])
     commission_config = merge_config_rows_by_keys(
         local_commission, build_discovered_commission_config(reports), ["月份", "开发员"]
     ).sort_values(["月份", "开发员"])
@@ -460,8 +471,29 @@ def render_business_config_editors(reports=None):
         saved.to_csv(TARGET_CONFIG_PATH, index=False, encoding="utf-8-sig")
         st.success("目标配置已保存。")
 
+    st.markdown("**部门费用率配置**")
+    st.caption("按月份和店铺所属部门维护费用率；可填 8%、0.08 或 8。提成计算会按店铺所属部门套用对应费用率。")
+    edited_department_fee = st.data_editor(
+        department_fee_config.fillna(""),
+        num_rows="dynamic",
+        use_container_width=True,
+        hide_index=True,
+        key="department_fee_config_editor",
+        column_config={
+            "月份": st.column_config.SelectboxColumn(
+                "月份",
+                options=[""] + sorted(reports["月份"].dropna().unique().tolist()) if reports is not None and not reports.empty else [""],
+                format_func=lambda value: "" if not value else month_label(value),
+            ),
+        },
+    )
+    if st.button("保存部门费用率配置", use_container_width=True):
+        saved = normalize_department_fee_config(edited_department_fee).fillna("")
+        saved.to_csv(DEPARTMENT_FEE_CONFIG_PATH, index=False, encoding="utf-8-sig")
+        st.success("部门费用率配置已保存。")
+
     st.markdown("**提成配置**")
-    st.caption("按月份和开发员维护费用率、库存计提、弃置和职位提点；费用率和职位提点可填 8%、0.08 或 8。")
+    st.caption("按月份和开发员维护库存计提、弃置和职位提点；职位提点可填 8%、0.08 或 8。")
     edited_commission = st.data_editor(
         commission_config.fillna(""),
         num_rows="dynamic",
@@ -585,7 +617,7 @@ def validate_metric_formulas(filtered, metric_config_df):
     return errors
 
 
-def render_home_page(data, metric_config_df, metric_lookup, commission_config_df):
+def render_home_page(data, metric_config_df, metric_lookup, commission_config_df, department_fee_config_df):
     st.title("首页")
     if data is None or data.empty:
         st.info("暂无可分析的业绩报表，请先到“上传中心”上传 CSV。")
@@ -630,7 +662,7 @@ def render_home_page(data, metric_config_df, metric_lookup, commission_config_df
     render_developer_store_type_pies(counted, metric_config_df)
     st.dataframe(format_display_table(developer_table, metric_lookup), use_container_width=True, hide_index=True)
 
-    render_commission_dashboard(counted, stopped, metric_config_df, commission_config_df, metric_lookup)
+    render_commission_dashboard(counted, stopped, metric_config_df, commission_config_df, department_fee_config_df, metric_lookup)
 
     store_metrics = metrics_for_group(metric_config_df, "店铺分析")
     store_table = compute_metric_table(counted, store_metrics, ["部门", "店铺编码", "店铺类型"])
@@ -727,6 +759,11 @@ def main():
     except Exception as exc:
         st.error(f"提成配置读取失败：{exc}")
         return
+    try:
+        department_fee_config_df = load_department_fee_config()
+    except Exception as exc:
+        st.error(f"部门费用率配置读取失败：{exc}")
+        return
 
     records = load_upload_records()
     data = None
@@ -738,7 +775,7 @@ def main():
             data = None
 
     if page == "首页":
-        render_home_page(data, metric_config_df, metric_lookup, commission_config_df)
+        render_home_page(data, metric_config_df, metric_lookup, commission_config_df, department_fee_config_df)
     elif page == "上传中心":
         render_upload_center(records)
     else:
