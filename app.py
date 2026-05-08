@@ -11,6 +11,7 @@ from dashboard.data_processing import (
     build_discovered_commission_config,
     build_discovered_department_fee_config,
     build_alerts,
+    build_sales_dashboard_tables,
     compute_commission_table,
     compute_metric_table,
     compute_stopped_commission_table,
@@ -19,6 +20,7 @@ from dashboard.data_processing import (
     load_department_fee_config,
     load_business_config,
     load_metric_config,
+    load_operational_sales_source,
     merge_business_config,
     normalize_commission_config,
     normalize_department_fee_config,
@@ -32,8 +34,11 @@ from dashboard.display import SIDEBAR_BANNER_PATH, month_label
 from dashboard.filters import apply_home_filters
 from dashboard.report_store import (
     delete_upload_record,
+    get_operational_sales_source_path,
+    load_operational_sales_source_record,
     load_reports_from_records,
     load_upload_records,
+    persist_operational_sales_source,
     persist_uploaded_reports,
 )
 
@@ -50,6 +55,7 @@ DEPARTMENT_FEE_CONFIG_PATH = CONFIG_DIR / "department_fee_config.csv"
 
 NAV_ITEMS = {
     "首页": "📊 首页",
+    "销量看板": "📦 销量看板",
     "上传中心": "⬆️ 上传中心",
     "配置中心": "⚙️ 配置中心",
 }
@@ -224,6 +230,38 @@ def chart_if_available(df, x, y, color=None, title=None, kind="bar"):
         fig = px.bar(df, x=x, y=y, color=color, title=title)
     fig.update_layout(height=360, margin=dict(l=10, r=10, t=45, b=10))
     fig.update_xaxes(type="category", categoryorder="array", categoryarray=df[x].tolist())
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def sales_metric_lookup():
+    return {
+        "在售个数": {"格式": "整数"},
+        "昨日订单": {"格式": "整数"},
+        "前天订单": {"格式": "整数"},
+        "上前订单": {"格式": "整数"},
+        "-26订单": {"格式": "整数"},
+        "总库存": {"格式": "整数"},
+        "产品数占比": {"格式": "百分比"},
+        "30天贡献占比": {"格式": "百分比"},
+        "昨日D值": {"格式": "数字"},
+        "7天D值": {"格式": "数字"},
+        "7天日均": {"格式": "数字"},
+        "30天日均": {"格式": "数字"},
+        "中企单量": {"格式": "数字"},
+        "本土单量": {"格式": "数字"},
+        "总计": {"格式": "数字"},
+    }
+
+
+def plot_sales_bar(df, x, y, title):
+    if df.empty or x not in df.columns or y not in df.columns:
+        return
+    chart_data = df[df[y].fillna(0).ne(0)].copy()
+    if chart_data.empty:
+        return
+    fig = px.bar(chart_data, x=x, y=y, title=title)
+    fig.update_layout(height=300, margin=dict(l=10, r=10, t=45, b=10))
+    fig.update_xaxes(type="category", categoryorder="array", categoryarray=chart_data[x].tolist())
     st.plotly_chart(fig, use_container_width=True)
 
 
@@ -533,6 +571,33 @@ def process_report_uploads(report_files):
         st.success(f"{action} {result.month}：{result.original_name}")
 
 
+def process_operational_sales_upload(uploaded_file):
+    if uploaded_file is None:
+        return
+    data = uploaded_file.getvalue()
+    fingerprint = f"{uploaded_file.name}:{len(data)}:{hashlib.sha256(data).hexdigest()}"
+    if st.session_state.get("processed_operational_sales_upload") == fingerprint:
+        return
+    load_operational_sales_source(uploaded_file)
+    persist_operational_sales_source(uploaded_file)
+    st.session_state["processed_operational_sales_upload"] = fingerprint
+    st.success(f"已保存运营原始表：{uploaded_file.name}")
+
+
+def render_operational_sales_source_record():
+    st.subheader("已上传运营原始表")
+    record = load_operational_sales_source_record()
+    if record.empty:
+        st.info("暂无已保存的运营原始表。上传 XLSX 后刷新或重新打开也会保留。")
+        return
+
+    display = record.copy()
+    display["文件大小"] = pd.to_numeric(display["文件大小"], errors="coerce").map(
+        lambda value: "-" if pd.isna(value) else f"{value / 1024:.1f} KB"
+    )
+    st.dataframe(display, use_container_width=True, hide_index=True)
+
+
 def render_upload_records(records):
     st.subheader("已上传报表记录")
     if records.empty:
@@ -702,6 +767,94 @@ def render_home_page(data, metric_config_df, metric_lookup, commission_config_df
     )
 
 
+def render_sales_dashboard_page():
+    st.title("销量看板")
+    source_path = get_operational_sales_source_path()
+    if source_path is None:
+        st.info("暂无可分析的运营原始表，请先到“上传中心”上传运营原始表 XLSX。")
+        return
+
+    try:
+        operational_data = load_operational_sales_source(source_path)
+        store_config, _ = load_business_config()
+        tables = build_sales_dashboard_tables(operational_data, store_config)
+    except Exception as exc:
+        st.error(f"销量看板无法读取或计算：{exc}")
+        return
+
+    developer_options = sorted(
+        operational_data.loc[operational_data["开发员"].astype(str).str.strip().ne(""), "开发员"]
+        .dropna()
+        .astype(str)
+        .unique()
+        .tolist()
+    )
+    if developer_options:
+        with st.container(key="sales_filter_bar"):
+            selected_developers = st.multiselect("开发员", developer_options, default=developer_options)
+        if not selected_developers:
+            st.warning("请选择至少一个开发员。")
+            return
+        operational_data = operational_data[operational_data["开发员"].isin(selected_developers)].copy()
+        try:
+            tables = build_sales_dashboard_tables(operational_data, store_config)
+        except Exception as exc:
+            st.error(f"销量看板无法按筛选条件计算：{exc}")
+            return
+
+    source = tables["source"]
+    stores = tables["stores"]
+    levels = tables["levels"]
+    date_compare = tables["date_compare"]
+    metric_lookup = sales_metric_lookup()
+
+    if source.empty or stores.empty:
+        st.warning("运营原始表中没有可展示的数据。")
+        return
+
+    multi_store_count = source.loc[source["是否多店铺编码"], "MSKU"].nunique()
+    if multi_store_count:
+        st.warning(f"检测到 {multi_store_count} 个 MSKU 同时关联多个不同店铺编码，已按店铺编码分别计入。")
+
+    total_onsale = stores["在售个数"].sum()
+    total_yesterday = stores["昨日订单"].sum()
+    total_7_avg = stores["7天日均"].sum()
+    total_30_avg = stores["30天日均"].sum()
+    total_stock = stores["总库存"].sum()
+    kpi_cols = st.columns(5)
+    kpi_cols[0].metric("在售个数", f"{total_onsale:,.0f}")
+    kpi_cols[1].metric("昨日订单", f"{total_yesterday:,.0f}")
+    kpi_cols[2].metric("7天日均", f"{total_7_avg:,.2f}")
+    kpi_cols[3].metric("30天日均", f"{total_30_avg:,.2f}")
+    kpi_cols[4].metric("总库存", f"{total_stock:,.0f}")
+
+    chart_cols = st.columns(3)
+    with chart_cols[0]:
+        plot_sales_bar(stores, "店铺编码", "昨日订单", "昨日店铺订单量")
+    with chart_cols[1]:
+        plot_sales_bar(stores, "店铺编码", "-26订单", "-26订单量")
+    with chart_cols[2]:
+        plot_sales_bar(stores, "店铺编码", "30天日均", "30天店铺日均订单量")
+
+    table_cols = st.columns([1.15, 0.85])
+    with table_cols[0]:
+        st.subheader("店铺明细")
+        st.dataframe(format_display_table(stores, metric_lookup), use_container_width=True, hide_index=True)
+    with table_cols[1]:
+        st.subheader("产品等级")
+        st.dataframe(format_display_table(levels, metric_lookup), use_container_width=True, hide_index=True)
+        st.subheader("日期对比")
+        st.dataframe(format_display_table(date_compare, metric_lookup), use_container_width=True, hide_index=True)
+
+    csv = stores.to_csv(index=False, encoding="utf-8-sig")
+    st.download_button(
+        "导出销量看板店铺明细 CSV",
+        data=csv,
+        file_name="sales_dashboard_store_detail.csv",
+        mime="text/csv",
+    )
+
+
 def render_upload_center(records):
     st.title("上传中心")
     report_files = st.file_uploader("业绩报表 CSV", type=["csv"], accept_multiple_files=True)
@@ -710,6 +863,14 @@ def render_upload_center(records):
     except Exception as exc:
         st.error(f"业绩报表保存失败：{exc}")
     render_upload_records(load_upload_records())
+
+    st.divider()
+    operational_file = st.file_uploader("运营原始表 XLSX", type=["xlsx"], accept_multiple_files=False)
+    try:
+        process_operational_sales_upload(operational_file)
+    except Exception as exc:
+        st.error(f"运营原始表保存失败：{exc}")
+    render_operational_sales_source_record()
 
 
 def render_config_center(metric_config_df, records):
@@ -776,6 +937,8 @@ def main():
 
     if page == "首页":
         render_home_page(data, metric_config_df, metric_lookup, commission_config_df, department_fee_config_df)
+    elif page == "销量看板":
+        render_sales_dashboard_page()
     elif page == "上传中心":
         render_upload_center(records)
     else:
