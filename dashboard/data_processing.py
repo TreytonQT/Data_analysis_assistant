@@ -16,6 +16,20 @@ CONFIG_DIR = ROOT / "configs"
 METRIC_COLUMNS = ["指标名称", "显示分组", "公式", "格式", "排序", "是否启用"]
 STORE_COLUMNS = ["店铺名", "店铺类型", "是否计数", "店铺所属部门"]
 TARGET_COLUMNS = ["开发员", "目标业绩", "目标毛利率"]
+COMMISSION_COLUMNS = ["月份", "开发员", "费用率", "库存计提", "弃置", "职位提点"]
+COMMISSION_OUTPUT_COLUMNS = [
+    "月份",
+    "开发员",
+    "营业额",
+    "毛利润",
+    "毛利率",
+    "费用率",
+    "库存计提",
+    "弃置",
+    "职位提点",
+    "提成预估",
+    "配置状态",
+]
 
 
 def read_upload_table(uploaded_file, fallback_path: Path | None = None) -> pd.DataFrame:
@@ -73,6 +87,10 @@ def load_business_config(
     return normalize_store_config(store_config), normalize_target_config(target_config)
 
 
+def load_commission_config(uploaded_file=None) -> pd.DataFrame:
+    return normalize_commission_config(read_upload_table(uploaded_file, CONFIG_DIR / "commission_config.csv"))
+
+
 def normalize_store_config(store_config: pd.DataFrame) -> pd.DataFrame:
     store_config = store_config.copy()
     aliases = {
@@ -109,6 +127,36 @@ def normalize_target_config(target_config: pd.DataFrame) -> pd.DataFrame:
     target_config = target_config[TARGET_COLUMNS].copy()
     target_config = target_config[target_config["开发员"].notna()].drop_duplicates(subset=["开发员"], keep="first")
     return target_config
+
+
+def normalize_commission_config(commission_config: pd.DataFrame) -> pd.DataFrame:
+    commission_config = commission_config.copy()
+    aliases = {
+        "销售专员": "开发员",
+        "月份": "月份",
+        "费率": "费用率",
+        "库存": "库存计提",
+        "提点": "职位提点",
+        "职位提成点": "职位提点",
+    }
+    commission_config = commission_config.rename(
+        columns={old: new for old, new in aliases.items() if old in commission_config.columns}
+    )
+    if commission_config.empty:
+        commission_config = pd.DataFrame(columns=COMMISSION_COLUMNS)
+    for col in COMMISSION_COLUMNS:
+        if col not in commission_config.columns:
+            commission_config[col] = None
+    commission_config = commission_config[COMMISSION_COLUMNS].copy()
+    commission_config["月份"] = commission_config["月份"].map(normalize_month)
+    commission_config = commission_config[
+        commission_config["月份"].notna() & commission_config["开发员"].notna()
+    ].drop_duplicates(subset=["月份", "开发员"], keep="first")
+    commission_config["费用率"] = normalize_rate(commission_config["费用率"])
+    commission_config["职位提点"] = normalize_rate(commission_config["职位提点"])
+    commission_config["库存计提"] = normalize_config_number(commission_config["库存计提"])
+    commission_config["弃置"] = normalize_config_number(commission_config["弃置"])
+    return commission_config.reset_index(drop=True)
 
 
 def load_reports(files: Iterable) -> pd.DataFrame:
@@ -215,10 +263,85 @@ def merge_business_config(df: pd.DataFrame, store_config: pd.DataFrame, target_c
 
 
 def normalize_rate(series: pd.Series) -> pd.Series:
-    numeric = maybe_numeric(series)
-    if not hasattr(numeric, "where"):
-        return numeric
+    numeric = normalize_config_number(series, percent_to_decimal=True)
     return numeric.where(numeric <= 1, numeric / 100)
+
+
+def normalize_config_number(series: pd.Series, percent_to_decimal: bool = False) -> pd.Series:
+    text = series.astype(str).str.strip()
+    text = text.mask(text.isin(["", "nan", "None", "NaN"]))
+    percent_mask = text.str.endswith("%", na=False)
+    cleaned = text.str.replace(",", "", regex=False).str.replace("%", "", regex=False)
+    numeric = pd.to_numeric(cleaned, errors="coerce").astype("float64")
+    if percent_to_decimal:
+        numeric.loc[percent_mask] = numeric.loc[percent_mask] / 100
+    return numeric
+
+
+def build_discovered_commission_config(reports: pd.DataFrame | None) -> pd.DataFrame:
+    if reports is None or reports.empty:
+        return normalize_commission_config(pd.DataFrame()).fillna("")
+    commission = (
+        reports[["月份", "销售专员"]]
+        .dropna()
+        .drop_duplicates()
+        .rename(columns={"销售专员": "开发员"})
+        .sort_values(["月份", "开发员"])
+    )
+    commission["费用率"] = ""
+    commission["库存计提"] = ""
+    commission["弃置"] = ""
+    commission["职位提点"] = ""
+    return normalize_commission_config(commission).fillna("")
+
+
+def select_metric_config(metric_config: pd.DataFrame, metric_names: list[str]) -> pd.DataFrame:
+    if metric_config.empty:
+        raise ValueError("指标配置为空，无法计算提成")
+    group_rank = {"开发员分析": 0, "总览": 1, "全部": 2, "趋势": 3, "店铺分析": 4, "开发员店铺分析": 5}
+    selected = metric_config[metric_config["指标名称"].isin(metric_names)].copy()
+    selected["_metric_order"] = selected["指标名称"].map({name: idx for idx, name in enumerate(metric_names)})
+    selected["_group_rank"] = selected["显示分组"].map(group_rank).fillna(99)
+    selected = selected.sort_values(["_metric_order", "_group_rank"]).drop_duplicates("指标名称", keep="first")
+    missing = [name for name in metric_names if name not in set(selected["指标名称"])]
+    if missing:
+        raise ValueError(f"提成计算缺少指标公式：{', '.join(missing)}")
+    return selected.drop(columns=["_metric_order", "_group_rank"])
+
+
+def compute_commission_table(
+    df: pd.DataFrame, metric_config: pd.DataFrame, commission_config: pd.DataFrame
+) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame(columns=COMMISSION_OUTPUT_COLUMNS)
+
+    metrics = select_metric_config(metric_config, ["销售额", "毛利润", "毛利率"])
+    base = compute_metric_table(df, metrics, ["月份", "销售专员"]).rename(
+        columns={"销售专员": "开发员", "销售额": "营业额"}
+    )
+    if base.empty:
+        return pd.DataFrame(columns=COMMISSION_OUTPUT_COLUMNS)
+
+    config = normalize_commission_config(commission_config).copy()
+    config["__has_commission_config"] = True
+    merged = base.merge(config, on=["月份", "开发员"], how="left")
+    if "__has_commission_config" not in merged.columns:
+        merged["__has_commission_config"] = False
+    merged["__has_commission_config"] = merged["__has_commission_config"].fillna(False)
+
+    param_cols = ["费用率", "库存计提", "弃置", "职位提点"]
+    has_all_params = merged["__has_commission_config"] & merged[param_cols].notna().all(axis=1)
+    merged["配置状态"] = has_all_params.map(lambda value: "已配置" if value else "缺配置")
+    merged["提成预估"] = pd.NA
+    merged.loc[has_all_params, "提成预估"] = (
+        (
+            merged.loc[has_all_params, "营业额"] * (merged.loc[has_all_params, "毛利率"] - merged.loc[has_all_params, "费用率"])
+            - merged.loc[has_all_params, "库存计提"]
+            - merged.loc[has_all_params, "弃置"]
+        )
+        * merged.loc[has_all_params, "职位提点"]
+    )
+    return merged[COMMISSION_OUTPUT_COLUMNS].sort_values(["月份", "开发员"]).reset_index(drop=True)
 
 
 def compute_metric_table(df: pd.DataFrame, metric_config: pd.DataFrame, group_cols: list[str]) -> pd.DataFrame:
