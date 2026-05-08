@@ -13,8 +13,12 @@ from dashboard.data_processing import normalize_month, normalize_report, read_cs
 ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = ROOT / "data"
 REPORTS_DIR = DATA_DIR / "reports"
+SOURCES_DIR = DATA_DIR / "sources"
 INDEX_PATH = DATA_DIR / "upload_records.csv"
 INDEX_COLUMNS = ["月份", "原始文件名", "保存文件名", "上传时间", "文件大小"]
+OPERATIONAL_SALES_FILE = "operational_sales.xlsx"
+OPERATIONAL_SALES_INDEX_PATH = SOURCES_DIR / "operational_sales_source.csv"
+SOURCE_INDEX_COLUMNS = ["数据源", "原始文件名", "保存文件名", "上传时间", "文件大小"]
 
 
 @dataclass(frozen=True)
@@ -30,6 +34,13 @@ def ensure_storage(data_dir: Path = DATA_DIR) -> tuple[Path, Path]:
     index_path = data_dir / "upload_records.csv"
     reports_dir.mkdir(parents=True, exist_ok=True)
     return reports_dir, index_path
+
+
+def ensure_sources_storage(data_dir: Path = DATA_DIR) -> tuple[Path, Path]:
+    sources_dir = data_dir / "sources"
+    index_path = sources_dir / "operational_sales_source.csv"
+    sources_dir.mkdir(parents=True, exist_ok=True)
+    return sources_dir, index_path
 
 
 def load_upload_records(data_dir: Path = DATA_DIR) -> pd.DataFrame:
@@ -51,6 +62,44 @@ def save_upload_records(records: pd.DataFrame, data_dir: Path = DATA_DIR) -> Non
             clean[col] = ""
     clean = clean[INDEX_COLUMNS].sort_values("月份").reset_index(drop=True)
     clean.to_csv(index_path, index=False, encoding="utf-8-sig")
+
+
+def load_operational_sales_source_record(data_dir: Path = DATA_DIR) -> pd.DataFrame:
+    _, index_path = ensure_sources_storage(data_dir)
+    if not index_path.exists():
+        return pd.DataFrame(columns=SOURCE_INDEX_COLUMNS)
+    records = pd.read_csv(index_path, encoding="utf-8-sig", dtype=str).fillna("")
+    for col in SOURCE_INDEX_COLUMNS:
+        if col not in records.columns:
+            records[col] = ""
+    return records[SOURCE_INDEX_COLUMNS].reset_index(drop=True)
+
+
+def get_operational_sales_source_path(data_dir: Path = DATA_DIR) -> Path | None:
+    sources_dir, _ = ensure_sources_storage(data_dir)
+    path = sources_dir / OPERATIONAL_SALES_FILE
+    return path if path.exists() else None
+
+
+def persist_operational_sales_source(uploaded_file, data_dir: Path = DATA_DIR) -> Path:
+    sources_dir, index_path = ensure_sources_storage(data_dir)
+    data = uploaded_file.getvalue()
+    saved_path = sources_dir / OPERATIONAL_SALES_FILE
+    saved_path.write_bytes(data)
+    records = pd.DataFrame(
+        [
+            {
+                "数据源": "运营原始表",
+                "原始文件名": uploaded_file.name,
+                "保存文件名": OPERATIONAL_SALES_FILE,
+                "上传时间": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "文件大小": str(len(data)),
+            }
+        ],
+        columns=SOURCE_INDEX_COLUMNS,
+    )
+    records.to_csv(index_path, index=False, encoding="utf-8-sig")
+    return saved_path
 
 
 def detect_report_month(data: bytes) -> str:

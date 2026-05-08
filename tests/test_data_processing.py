@@ -3,14 +3,17 @@ import unittest
 import pandas as pd
 
 from dashboard.data_processing import (
+    build_sales_dashboard_tables,
     compute_commission_table,
     compute_metric_table,
     compute_stopped_commission_table,
     merge_business_config,
     normalize_commission_config,
     normalize_department_fee_config,
+    normalize_operational_sales,
     normalize_report,
     normalize_store_config,
+    product_level_for_daily_sales,
     select_metric_config,
     split_counted_and_stopped_data,
 )
@@ -341,6 +344,131 @@ class DataProcessingTests(unittest.TestCase):
 
         self.assertEqual(result.iloc[0]["配置状态"], "缺配置")
         self.assertTrue(pd.isna(result.iloc[0]["缺提成预估"]))
+
+    def test_operational_sales_requires_expected_columns(self):
+        with self.assertRaisesRegex(ValueError, "运营原始表缺少列"):
+            normalize_operational_sales(pd.DataFrame({"MSKU": ["A"]}))
+
+    def test_operational_sales_normalizes_numbers_and_store_codes(self):
+        source = pd.DataFrame(
+            {
+                "MSKU": ["SKU1"],
+                "店铺名称": ["6-ZXU 德国,7-YIP 本土法国"],
+                "7天销量": ["1,400"],
+                "30天销量": ["60"],
+                "可售": ["10"],
+                "本地库存": [""],
+                "昨天销量": ["3"],
+                "前天销量": ["2"],
+                "上前销量": ["1"],
+                "开发员": ["运营二十部-陈千潼-26"],
+                "ASIN": ["B001"],
+            }
+        )
+
+        result = normalize_operational_sales(source).sort_values("店铺编码").reset_index(drop=True)
+
+        self.assertEqual(result["店铺编码"].tolist(), ["YIP", "ZXU"])
+        self.assertTrue(result["是否多店铺编码"].all())
+        self.assertEqual(result.loc[0, "7天销量"], 1400)
+        self.assertEqual(result.loc[0, "本地库存"], 0)
+        self.assertTrue(result.loc[0, "是否-26"])
+
+    def test_sales_dashboard_store_summary_uses_confirmed_rules(self):
+        source = pd.DataFrame(
+            {
+                "MSKU": ["SKU1", "SKU2", "SKU3"],
+                "店铺名称": ["6-ZXU 德国", "6-ZXU 法国", "7-YIP 本土法国"],
+                "7天销量": [14, 7, 21],
+                "30天销量": [60, 0, 15],
+                "可售": [10, 0, 5],
+                "本地库存": [1, 2, 3],
+                "昨天销量": [3, 2, 1],
+                "前天销量": [2, 1, 0],
+                "上前销量": [1, 0, 0],
+                "开发员": ["运营二十部-陈千潼-26", "运营二十部-陈千潼", "运营二十部-李四"],
+                "ASIN": ["B001", "B002", "B003"],
+            }
+        )
+        store_config = pd.DataFrame(
+            {
+                "店铺名": ["ZXU", "YIP"],
+                "店铺类型": ["中企", "本土"],
+                "停提款时间": ["", ""],
+                "店铺所属部门": ["联合部门", "联合部门"],
+            }
+        )
+
+        stores = build_sales_dashboard_tables(source, store_config)["stores"].set_index("店铺编码")
+
+        self.assertEqual(stores.loc["ZXU", "在售个数"], 1)
+        self.assertEqual(stores.loc["ZXU", "产品数占比"], 0.5)
+        self.assertEqual(stores.loc["ZXU", "昨日订单"], 5)
+        self.assertEqual(stores.loc["ZXU", "-26订单"], 3)
+        self.assertAlmostEqual(stores.loc["ZXU", "7天日均"], 3)
+        self.assertAlmostEqual(stores.loc["ZXU", "30天日均"], 2)
+        self.assertEqual(stores.loc["ZXU", "总库存"], 10)
+        self.assertEqual(stores.loc["ZXU", "昨日D值"], 5)
+        self.assertEqual(stores.loc["ZXU", "7天D值"], 3)
+
+    def test_sales_dashboard_does_not_expand_normalized_data_twice(self):
+        source = pd.DataFrame(
+            {
+                "MSKU": ["SKU1"],
+                "店铺名称": ["6-ZXU 德国,7-YIP 本土法国"],
+                "7天销量": [7],
+                "30天销量": [30],
+                "可售": [1],
+                "本地库存": [0],
+                "昨天销量": [1],
+                "前天销量": [0],
+                "上前销量": [0],
+                "开发员": ["A"],
+                "ASIN": ["B001"],
+            }
+        )
+        normalized = normalize_operational_sales(source)
+
+        stores = build_sales_dashboard_tables(normalized, pd.DataFrame())["stores"].set_index("店铺编码")
+
+        self.assertEqual(stores.loc["ZXU", "昨日订单"], 1)
+        self.assertEqual(stores.loc["YIP", "昨日订单"], 1)
+        self.assertEqual(stores["昨日订单"].sum(), 2)
+
+    def test_product_level_boundaries_and_summary(self):
+        self.assertEqual(product_level_for_daily_sales(0), "0单")
+        self.assertEqual(product_level_for_daily_sales(0.2), "0.2单以下")
+        self.assertEqual(product_level_for_daily_sales(0.5), "0.2-0.5单")
+        self.assertEqual(product_level_for_daily_sales(1), "0.5-1单")
+        self.assertEqual(product_level_for_daily_sales(2), "1-2单")
+        self.assertEqual(product_level_for_daily_sales(3), "2-3单")
+        self.assertEqual(product_level_for_daily_sales(5), "3-5单")
+        self.assertEqual(product_level_for_daily_sales(5.01), "5单以上")
+
+        source = pd.DataFrame(
+            {
+                "MSKU": ["SKU1", "SKU2", "SKU3"],
+                "店铺名称": ["6-ZXU 德国", "6-ZXU 法国", "7-YIP 本土法国"],
+                "7天销量": [14, 7, 21],
+                "30天销量": [60, 0, 15],
+                "可售": [10, 0, 5],
+                "本地库存": [1, 2, 3],
+                "昨天销量": [3, 2, 1],
+                "前天销量": [2, 1, 0],
+                "上前销量": [1, 0, 0],
+                "开发员": ["A", "B", "C"],
+                "ASIN": ["B001", "B002", "B003"],
+            }
+        )
+
+        levels = build_sales_dashboard_tables(source, pd.DataFrame())["levels"].set_index("产品等级")
+
+        self.assertEqual(levels.loc["0单", "在售个数"], 0)
+        self.assertEqual(levels.loc["0单", "昨日订单"], 2)
+        self.assertEqual(levels.loc["0.2-0.5单", "在售个数"], 1)
+        self.assertEqual(levels.loc["1-2单", "在售个数"], 1)
+        self.assertEqual(levels.loc["总计", "在售个数"], 2)
+        self.assertAlmostEqual(levels.loc["总计", "30天贡献占比"], 1)
 
 
 if __name__ == "__main__":
