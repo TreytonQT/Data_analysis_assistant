@@ -43,6 +43,26 @@ OPERATIONAL_SALES_NORMALIZED_COLUMNS = OPERATIONAL_SALES_REQUIRED_COLUMNS + [
     "是否在售",
     "是否-26",
 ]
+AGING_STOCK_COLUMNS = [
+    "91-180天库存数",
+    "181-330天库存数",
+    "331-365天库存数",
+    "366-455天库存数",
+    "456天以上库存数",
+]
+AGING_CAPITAL_COLUMNS = [
+    "91-180天占用资金",
+    "181-330天占用资金",
+    "331-365天占用资金",
+    "366-455天占用资金",
+    "456天占用资金",
+]
+OPERATIONAL_AGING_REQUIRED_COLUMNS = ["MSKU", "开发员", "ASIN"] + AGING_STOCK_COLUMNS + AGING_CAPITAL_COLUMNS
+DISCARD_THRESHOLD_SEGMENTS = {
+    "90天以上": ["91-180", "181-330", "331-365", "366-455", "456天以上"],
+    "180天以上": ["181-330", "331-365", "366-455", "456天以上"],
+    "365天以上": ["366-455", "456天以上"],
+}
 PRODUCT_LEVELS = [
     ("0单", lambda value: value == 0),
     ("0.2单以下", lambda value: 0 < value <= 0.2),
@@ -95,12 +115,16 @@ def read_upload_table(uploaded_file, fallback_path: Path | None = None) -> pd.Da
     data = uploaded_file.getvalue()
     if name.endswith(".xlsx"):
         return pd.read_excel(io.BytesIO(data))
+    if name.endswith(".xls"):
+        return pd.read_excel(io.BytesIO(data), engine="xlrd", engine_kwargs={"ignore_workbook_corruption": True})
     return read_csv_bytes(data)
 
 
 def read_local_table(path: Path) -> pd.DataFrame:
     if path.suffix.lower() == ".xlsx":
         return pd.read_excel(path)
+    if path.suffix.lower() == ".xls":
+        return pd.read_excel(path, engine="xlrd", engine_kwargs={"ignore_workbook_corruption": True})
     return read_csv_bytes(path.read_bytes())
 
 
@@ -492,6 +516,93 @@ def build_sales_dashboard_tables(df: pd.DataFrame, store_config: pd.DataFrame) -
         "date_compare": date_compare,
         "source": data,
     }
+
+
+def normalize_operational_aging(df: pd.DataFrame) -> pd.DataFrame:
+    missing = [col for col in OPERATIONAL_AGING_REQUIRED_COLUMNS if col not in df.columns]
+    if missing:
+        raise ValueError(f"运营原始表缺少库龄列：{', '.join(missing)}")
+
+    result = df[OPERATIONAL_AGING_REQUIRED_COLUMNS].copy()
+    for col in ["MSKU", "开发员", "ASIN"]:
+        result[col] = result[col].fillna("").astype(str).str.strip()
+    for col in AGING_STOCK_COLUMNS + AGING_CAPITAL_COLUMNS:
+        result[col] = normalize_config_number(result[col]).fillna(0)
+    return result
+
+
+def build_slow_moving_inventory_table(df: pd.DataFrame, discard_threshold: str = "90天以上") -> pd.DataFrame:
+    if discard_threshold not in DISCARD_THRESHOLD_SEGMENTS:
+        raise ValueError(f"未知弃置费阈值：{discard_threshold}")
+
+    data = normalize_operational_aging(df)
+    if data.empty:
+        return pd.DataFrame()
+
+    agg = {col: (col, "sum") for col in AGING_STOCK_COLUMNS + AGING_CAPITAL_COLUMNS}
+    base = data.groupby("MSKU", dropna=False, as_index=False).agg(
+        开发员=("开发员", lambda values: "；".join(sorted({str(value) for value in values if str(value).strip()}))),
+        ASIN=("ASIN", lambda values: "；".join(sorted({str(value) for value in values if str(value).strip()}))),
+        **agg,
+    )
+
+    stock_90_plus = base[AGING_STOCK_COLUMNS].sum(axis=1)
+    capital_90_plus = base[AGING_CAPITAL_COLUMNS].sum(axis=1)
+    base = base[stock_90_plus.gt(0)].copy()
+    if base.empty:
+        return pd.DataFrame(columns=slow_moving_inventory_columns())
+
+    base["90天以上库存数合计"] = base[AGING_STOCK_COLUMNS].sum(axis=1)
+    base["90天以上占用资金合计"] = base[AGING_CAPITAL_COLUMNS].sum(axis=1)
+    base["库存计提"] = (
+        base["91-180天占用资金"] * 0.05
+        + (base["181-330天占用资金"] + base["331-365天占用资金"]) * 0.08
+        + (base["366-455天占用资金"] + base["456天占用资金"]) * 0.12
+    )
+
+    segment_to_stock = {
+        "91-180": "91-180天库存数",
+        "181-330": "181-330天库存数",
+        "331-365": "331-365天库存数",
+        "366-455": "366-455天库存数",
+        "456天以上": "456天以上库存数",
+    }
+    segment_to_capital = {
+        "91-180": "91-180天占用资金",
+        "181-330": "181-330天占用资金",
+        "331-365": "331-365天占用资金",
+        "366-455": "366-455天占用资金",
+        "456天以上": "456天占用资金",
+    }
+    segments = DISCARD_THRESHOLD_SEGMENTS[discard_threshold]
+    discard_stock = base[[segment_to_stock[segment] for segment in segments]].sum(axis=1)
+    discard_capital = base[[segment_to_capital[segment] for segment in segments]].sum(axis=1)
+    base["弃置费"] = discard_stock * 6 + discard_capital * 1.5
+
+    base = base.rename(columns={"MSKU": "SKU"})
+    return base[slow_moving_inventory_columns()].sort_values("90天以上占用资金合计", ascending=False).reset_index(drop=True)
+
+
+def slow_moving_inventory_columns() -> list[str]:
+    return [
+        "SKU",
+        "开发员",
+        "ASIN",
+        "90天以上库存数合计",
+        "90天以上占用资金合计",
+        "库存计提",
+        "弃置费",
+        "91-180天库存数",
+        "181-330天库存数",
+        "331-365天库存数",
+        "366-455天库存数",
+        "456天以上库存数",
+        "91-180天占用资金",
+        "181-330天占用资金",
+        "331-365天占用资金",
+        "366-455天占用资金",
+        "456天占用资金",
+    ]
 
 
 def maybe_numeric(series: pd.Series) -> pd.Series:

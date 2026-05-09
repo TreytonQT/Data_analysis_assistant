@@ -16,7 +16,7 @@ REPORTS_DIR = DATA_DIR / "reports"
 SOURCES_DIR = DATA_DIR / "sources"
 INDEX_PATH = DATA_DIR / "upload_records.csv"
 INDEX_COLUMNS = ["月份", "原始文件名", "保存文件名", "上传时间", "文件大小"]
-OPERATIONAL_SALES_FILE = "operational_sales.xlsx"
+OPERATIONAL_SALES_BASENAME = "operational_sales"
 OPERATIONAL_SALES_INDEX_PATH = SOURCES_DIR / "operational_sales_source.csv"
 SOURCE_INDEX_COLUMNS = ["数据源", "原始文件名", "保存文件名", "上传时间", "文件大小"]
 
@@ -77,21 +77,37 @@ def load_operational_sales_source_record(data_dir: Path = DATA_DIR) -> pd.DataFr
 
 def get_operational_sales_source_path(data_dir: Path = DATA_DIR) -> Path | None:
     sources_dir, _ = ensure_sources_storage(data_dir)
-    path = sources_dir / OPERATIONAL_SALES_FILE
-    return path if path.exists() else None
+    records = load_operational_sales_source_record(data_dir)
+    if not records.empty:
+        saved_name = str(records.iloc[-1]["保存文件名"])
+        path = sources_dir / saved_name
+        if path.exists():
+            return path
+    for suffix in (".xlsx", ".xls"):
+        path = sources_dir / f"{OPERATIONAL_SALES_BASENAME}{suffix}"
+        if path.exists():
+            return path
+    return None
 
 
 def persist_operational_sales_source(uploaded_file, data_dir: Path = DATA_DIR) -> Path:
     sources_dir, index_path = ensure_sources_storage(data_dir)
     data = uploaded_file.getvalue()
-    saved_path = sources_dir / OPERATIONAL_SALES_FILE
+    suffix = Path(uploaded_file.name).suffix.lower()
+    if suffix not in {".xlsx", ".xls"}:
+        suffix = ".xlsx"
+    for old_path in sources_dir.glob(f"{OPERATIONAL_SALES_BASENAME}.*"):
+        if old_path.is_file():
+            old_path.unlink()
+    saved_name = f"{OPERATIONAL_SALES_BASENAME}{suffix}"
+    saved_path = sources_dir / saved_name
     saved_path.write_bytes(data)
     records = pd.DataFrame(
         [
             {
                 "数据源": "运营原始表",
                 "原始文件名": uploaded_file.name,
-                "保存文件名": OPERATIONAL_SALES_FILE,
+                "保存文件名": saved_name,
                 "上传时间": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "文件大小": str(len(data)),
             }

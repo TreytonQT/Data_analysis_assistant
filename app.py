@@ -12,6 +12,7 @@ from dashboard.data_processing import (
     build_discovered_department_fee_config,
     build_alerts,
     build_sales_dashboard_tables,
+    build_slow_moving_inventory_table,
     compute_commission_table,
     compute_metric_table,
     compute_stopped_commission_table,
@@ -56,6 +57,7 @@ DEPARTMENT_FEE_CONFIG_PATH = CONFIG_DIR / "department_fee_config.csv"
 NAV_ITEMS = {
     "首页": "📊 首页",
     "销量看板": "📦 销量看板",
+    "滞销提醒": "⏳ 滞销提醒",
     "上传中心": "⬆️ 上传中心",
     "配置中心": "⚙️ 配置中心",
 }
@@ -251,6 +253,45 @@ def sales_metric_lookup():
         "本土单量": {"格式": "数字"},
         "总计": {"格式": "数字"},
     }
+
+
+def slow_moving_metric_lookup():
+    result = {
+        "滞销SKU数": {"格式": "整数"},
+        "90天以上库存数合计": {"格式": "整数"},
+        "90天以上占用资金合计": {"格式": "数字"},
+        "库存计提": {"格式": "数字"},
+        "弃置费": {"格式": "数字"},
+    }
+    for col in ["91-180天库存数", "181-330天库存数", "331-365天库存数", "366-455天库存数", "456天以上库存数"]:
+        result[col] = {"格式": "整数"}
+    for col in ["91-180天占用资金", "181-330天占用资金", "331-365天占用资金", "366-455天占用资金", "456天占用资金"]:
+        result[col] = {"格式": "数字"}
+    return result
+
+
+def slow_moving_column_config():
+    stock_columns = [
+        "91-180天库存数",
+        "181-330天库存数",
+        "331-365天库存数",
+        "366-455天库存数",
+        "456天以上库存数",
+        "90天以上库存数合计",
+    ]
+    amount_columns = [
+        "91-180天占用资金",
+        "181-330天占用资金",
+        "331-365天占用资金",
+        "366-455天占用资金",
+        "456天占用资金",
+        "90天以上占用资金合计",
+        "库存计提",
+        "弃置费",
+    ]
+    config = {col: st.column_config.NumberColumn(col, format="%d") for col in stock_columns}
+    config.update({col: st.column_config.NumberColumn(col, format="%.2f") for col in amount_columns})
+    return config
 
 
 def plot_sales_bar(df, x, y, title):
@@ -771,7 +812,7 @@ def render_sales_dashboard_page():
     st.title("销量看板")
     source_path = get_operational_sales_source_path()
     if source_path is None:
-        st.info("暂无可分析的运营原始表，请先到“上传中心”上传运营原始表 XLSX。")
+        st.info("暂无可分析的运营原始表，请先到“上传中心”上传运营原始表 XLS/XLSX。")
         return
 
     try:
@@ -855,6 +896,73 @@ def render_sales_dashboard_page():
     )
 
 
+def render_slow_moving_inventory_page():
+    st.title("滞销提醒")
+    source_path = get_operational_sales_source_path()
+    if source_path is None:
+        st.info("暂无可分析的运营原始表，请先到“上传中心”上传运营原始表 XLS/XLSX。")
+        return
+
+    try:
+        operational_data = read_local_table(source_path)
+    except Exception as exc:
+        st.error(f"运营原始表读取失败：{exc}")
+        return
+
+    developer_options = sorted(
+        operational_data.loc[operational_data["开发员"].astype(str).str.strip().ne(""), "开发员"]
+        .dropna()
+        .astype(str)
+        .unique()
+        .tolist()
+    ) if "开发员" in operational_data.columns else []
+
+    with st.container(key="slow_moving_filter_bar"):
+        col1, col2 = st.columns([2, 1])
+        selected_developers = col1.multiselect("开发员", developer_options, default=developer_options)
+        discard_threshold = col2.selectbox("弃置费阈值", ["90天以上", "180天以上", "365天以上"], index=0)
+
+    if developer_options and not selected_developers:
+        st.warning("请选择至少一个开发员。")
+        return
+    if selected_developers:
+        operational_data = operational_data[operational_data["开发员"].astype(str).isin(selected_developers)].copy()
+
+    try:
+        detail = build_slow_moving_inventory_table(operational_data, discard_threshold)
+    except Exception as exc:
+        st.error(f"滞销提醒无法计算：{exc}")
+        return
+
+    if detail.empty:
+        st.info("当前筛选条件下没有 90 天以上库龄库存的 SKU。")
+        return
+
+    metric_lookup = slow_moving_metric_lookup()
+    kpi_cols = st.columns(5)
+    kpi_cols[0].metric("滞销SKU数", f"{len(detail):,.0f}")
+    kpi_cols[1].metric("90天以上库存数", f"{detail['90天以上库存数合计'].sum():,.0f}")
+    kpi_cols[2].metric("90天以上占用资金", f"{detail['90天以上占用资金合计'].sum():,.2f}")
+    kpi_cols[3].metric("库存计提", f"{detail['库存计提'].sum():,.2f}")
+    kpi_cols[4].metric("弃置费", f"{detail['弃置费'].sum():,.2f}")
+
+    st.subheader("滞销 SKU 明细")
+    st.dataframe(
+        detail,
+        use_container_width=True,
+        hide_index=True,
+        column_config=slow_moving_column_config(),
+    )
+
+    csv = detail.to_csv(index=False, encoding="utf-8-sig")
+    st.download_button(
+        "导出滞销SKU表格 CSV",
+        data=csv,
+        file_name=f"slow_moving_inventory_{discard_threshold}.csv",
+        mime="text/csv",
+    )
+
+
 def render_upload_center(records):
     st.title("上传中心")
     report_files = st.file_uploader("业绩报表 CSV", type=["csv"], accept_multiple_files=True)
@@ -865,7 +973,7 @@ def render_upload_center(records):
     render_upload_records(load_upload_records())
 
     st.divider()
-    operational_file = st.file_uploader("运营原始表 XLSX", type=["xlsx"], accept_multiple_files=False)
+    operational_file = st.file_uploader("运营原始表 XLS/XLSX", type=["xls", "xlsx"], accept_multiple_files=False)
     try:
         process_operational_sales_upload(operational_file)
     except Exception as exc:
@@ -939,6 +1047,8 @@ def main():
         render_home_page(data, metric_config_df, metric_lookup, commission_config_df, department_fee_config_df)
     elif page == "销量看板":
         render_sales_dashboard_page()
+    elif page == "滞销提醒":
+        render_slow_moving_inventory_page()
     elif page == "上传中心":
         render_upload_center(records)
     else:
