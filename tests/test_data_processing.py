@@ -4,12 +4,14 @@ import pandas as pd
 
 from dashboard.data_processing import (
     build_sales_dashboard_tables,
+    build_slow_moving_inventory_table,
     compute_commission_table,
     compute_metric_table,
     compute_stopped_commission_table,
     merge_business_config,
     normalize_commission_config,
     normalize_department_fee_config,
+    normalize_operational_aging,
     normalize_operational_sales,
     normalize_report,
     normalize_store_config,
@@ -469,6 +471,55 @@ class DataProcessingTests(unittest.TestCase):
         self.assertEqual(levels.loc["1-2单", "在售个数"], 1)
         self.assertEqual(levels.loc["总计", "在售个数"], 2)
         self.assertAlmostEqual(levels.loc["总计", "30天贡献占比"], 1)
+
+    def aging_source(self):
+        return pd.DataFrame(
+            {
+                "MSKU": ["SKU1", "SKU1", "SKU2"],
+                "开发员": ["运营二十部-陈千潼", "运营二十部-陈千潼", "运营二十部-李四"],
+                "ASIN": ["B001", "B001", "B002"],
+                "91-180天库存数": ["10", "1", "0"],
+                "181-330天库存数": [20, 0, 0],
+                "331-365天库存数": [30, 0, 0],
+                "366-455天库存数": [40, 0, 0],
+                "456天以上库存数": [50, 0, 0],
+                "91-180天占用资金": ["100", "10", "1,000"],
+                "181-330天占用资金": [200, "", 0],
+                "331-365天占用资金": [300, 0, 0],
+                "366-455天占用资金": [400, 0, 0],
+                "456天占用资金": [500, 0, 0],
+            }
+        )
+
+    def test_operational_aging_requires_expected_columns(self):
+        with self.assertRaisesRegex(ValueError, "运营原始表缺少库龄列"):
+            normalize_operational_aging(pd.DataFrame({"MSKU": ["SKU1"]}))
+
+    def test_operational_aging_normalizes_number_columns(self):
+        result = normalize_operational_aging(self.aging_source())
+
+        self.assertEqual(result.loc[0, "91-180天库存数"], 10)
+        self.assertEqual(result.loc[1, "181-330天占用资金"], 0)
+        self.assertEqual(result.loc[2, "91-180天占用资金"], 1000)
+
+    def test_slow_moving_inventory_calculates_accrual_and_discard_thresholds(self):
+        ninety = build_slow_moving_inventory_table(self.aging_source(), "90天以上")
+        one_eighty = build_slow_moving_inventory_table(self.aging_source(), "180天以上")
+        three_sixty_five = build_slow_moving_inventory_table(self.aging_source(), "365天以上")
+
+        self.assertEqual(ninety["SKU"].tolist(), ["SKU1"])
+        row = ninety.iloc[0]
+        self.assertEqual(row["91-180天库存数"], 11)
+        self.assertEqual(row["90天以上库存数合计"], 151)
+        self.assertEqual(row["90天以上占用资金合计"], 1510)
+        self.assertAlmostEqual(row["库存计提"], 153.5)
+        self.assertAlmostEqual(row["弃置费"], 3171)
+        self.assertAlmostEqual(one_eighty.iloc[0]["弃置费"], 2940)
+        self.assertAlmostEqual(three_sixty_five.iloc[0]["弃置费"], 1890)
+
+    def test_slow_moving_inventory_rejects_unknown_discard_threshold(self):
+        with self.assertRaisesRegex(ValueError, "未知弃置费阈值"):
+            build_slow_moving_inventory_table(self.aging_source(), "未知")
 
 
 if __name__ == "__main__":
