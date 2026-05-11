@@ -3,6 +3,7 @@ import unittest
 import pandas as pd
 
 from dashboard.data_processing import (
+    build_product_management_table,
     build_sales_dashboard_tables,
     build_slow_moving_inventory_table,
     compute_commission_table,
@@ -11,12 +12,14 @@ from dashboard.data_processing import (
     merge_business_config,
     normalize_commission_config,
     normalize_department_fee_config,
+    normalize_product_operational,
     normalize_operational_aging,
     normalize_operational_sales,
     normalize_report,
     normalize_store_config,
     product_level_for_daily_sales,
     select_metric_config,
+    sort_product_management_table,
     split_counted_and_stopped_data,
 )
 
@@ -471,6 +474,95 @@ class DataProcessingTests(unittest.TestCase):
         self.assertEqual(levels.loc["1-2单", "在售个数"], 1)
         self.assertEqual(levels.loc["总计", "在售个数"], 2)
         self.assertAlmostEqual(levels.loc["总计", "30天贡献占比"], 1)
+
+    def product_operational_source(self):
+        return pd.DataFrame(
+            {
+                "ASIN": ["B001", "B001", "B002"],
+                "MSKU": ["SKU1", "SKU2", "SKU3"],
+                "可售": [10, 20, 0],
+                "可售天数": [5, 10, 0],
+                "日均销量": [2, 3, 0],
+                "昨天销量": [1, 2, 0],
+                "前天销量": [3, 4, 0],
+                "上前销量": [5, 6, 0],
+                "7天销量": [14, 21, 0],
+                "14天销量": [28, 42, 0],
+                "30天销量": [60, 90, 0],
+                "90天销量": [180, 270, 0],
+            }
+        )
+
+    def gross_profit_source(self):
+        return pd.DataFrame(
+            {
+                "ASIN": ["B001", "B001", "B001", "B002"],
+                "MSKU": ["SKU1", "SKU2", "SKU1", "SKU3"],
+                "国家": ["德国", "法国", "美国", "德国"],
+                "销量--FBA销量": [1, 2, 3, 4],
+                "销量--FBM销量": [10, 20, 30, 40],
+                "销量--多渠道销量": [100, 200, 300, 400],
+                "销售额--FBA销售额": [100, 200, 300, 0],
+                "销售额--FBM销售额": [10, 20, 30, 0],
+                "COD": [0, 0, 0, 0],
+                "毛利润": [55, 44, 33, 0],
+                "广告费-SD广告": [-5, -4, -3, 0],
+                "广告费-SP广告": [-4, -3, -2, 0],
+                "广告费-SB广告": [-3, -2, -1, 0],
+                "广告费-SBV广告": [-2, -1, 0, 0],
+                "广告费--差异分摊": [-1, 0, 0, 0],
+            }
+        )
+
+    def rating_source(self):
+        return pd.DataFrame(
+            {
+                "ASIN": ["B001", "B001", "B001", "B002"],
+                "国家": ["德国", "德国", "法国", "德国"],
+                "Rating总数": [170, 173, 88, 0],
+                "评分": [4.1, 4.3, 3.8, ""],
+            }
+        )
+
+    def test_product_operational_requires_expected_columns(self):
+        with self.assertRaisesRegex(ValueError, "运营原始表缺少产品管理列"):
+            normalize_product_operational(pd.DataFrame({"MSKU": ["SKU1"]}))
+
+    def test_product_management_builds_sku_rows_without_asin_summary(self):
+        result = build_product_management_table(self.product_operational_source(), self.gross_profit_source(), self.rating_source())
+
+        self.assertEqual(result.columns[:2].tolist(), ["SKU", "ASIN"])
+        self.assertEqual(result["SKU"].tolist(), ["SKU1", "SKU2", "SKU3"])
+        self.assertEqual(result["ASIN"].tolist(), ["B001", "B001", "B002"])
+        self.assertNotIn("行类型", result.columns)
+        self.assertEqual(result.loc[0, "可售数量"], 10)
+        self.assertEqual(result.loc[0, "可售天数"], 5)
+        self.assertEqual(result.loc[1, "30天销量"], 90)
+
+    def test_product_management_gross_profit_and_rating_metrics(self):
+        result = build_product_management_table(self.product_operational_source(), self.gross_profit_source(), self.rating_source())
+        sku1 = result[result["SKU"].eq("SKU1")].iloc[0]
+        sku2 = result[result["SKU"].eq("SKU2")].iloc[0]
+
+        self.assertEqual(sku1["德国销量"], 111)
+        self.assertAlmostEqual(sku1["德国毛利率"], 55 / 110)
+        self.assertAlmostEqual(sku1["德国广告费占比"], 15 / 110)
+        self.assertAlmostEqual(sku1["销售额"], 440)
+        self.assertAlmostEqual(sku1["毛利润"], 88)
+        self.assertAlmostEqual(sku1["毛利率"], 88 / 440)
+        self.assertEqual(sku1["德国Rating"], "173(4.2)")
+        self.assertEqual(sku2["德国Rating"], "173(4.2)")
+        self.assertEqual(sku2["法国销量"], 222)
+        self.assertAlmostEqual(sku2["销售额"], 220)
+        self.assertAlmostEqual(sku2["毛利润"], 44)
+        self.assertAlmostEqual(sku2["毛利率"], 44 / 220)
+
+    def test_product_management_sort_uses_sku_table_fields(self):
+        result = build_product_management_table(self.product_operational_source(), self.gross_profit_source(), self.rating_source())
+        sorted_result = sort_product_management_table(result, "可售数量", ascending=True)
+
+        self.assertEqual(sorted_result["SKU"].tolist(), ["SKU3", "SKU1", "SKU2"])
+        self.assertEqual(sorted_result["ASIN"].tolist(), ["B002", "B001", "B001"])
 
     def aging_source(self):
         return pd.DataFrame(
