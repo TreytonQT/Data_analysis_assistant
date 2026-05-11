@@ -63,6 +63,49 @@ DISCARD_THRESHOLD_SEGMENTS = {
     "180天以上": ["181-330", "331-365", "366-455", "456天以上"],
     "365天以上": ["366-455", "456天以上"],
 }
+PRODUCT_COUNTRIES = ["德国", "法国", "西班牙", "意大利"]
+PRODUCT_OPERATIONAL_REQUIRED_COLUMNS = [
+    "ASIN",
+    "MSKU",
+    "可售",
+    "可售天数",
+    "日均销量",
+    "昨天销量",
+    "前天销量",
+    "上前销量",
+    "7天销量",
+    "14天销量",
+    "30天销量",
+    "90天销量",
+]
+PRODUCT_OPERATIONAL_SUM_COLUMNS = [
+    "可售数量",
+    "日均销量",
+    "昨天销量",
+    "前天销量",
+    "上前销量",
+    "7天销量",
+    "14天销量",
+    "30天销量",
+    "90天销量",
+]
+GROSS_PROFIT_VOLUME_COLUMNS = ["销量--FBA销量", "销量--FBM销量", "销量--多渠道销量"]
+GROSS_PROFIT_AD_COLUMNS = [
+    "广告费-SD广告",
+    "广告费-SP广告",
+    "广告费-SB广告",
+    "广告费-SBV广告",
+    "广告费--差异分摊",
+]
+GROSS_PROFIT_REQUIRED_COLUMNS = [
+    "ASIN",
+    "MSKU",
+    "国家",
+    "销售额--FBA销售额",
+    "COD",
+    "毛利润",
+] + GROSS_PROFIT_VOLUME_COLUMNS + GROSS_PROFIT_AD_COLUMNS
+RATING_REQUIRED_COLUMNS = ["ASIN", "国家", "Rating总数", "评分"]
 PRODUCT_LEVELS = [
     ("0单", lambda value: value == 0),
     ("0.2单以下", lambda value: 0 < value <= 0.2),
@@ -603,6 +646,245 @@ def slow_moving_inventory_columns() -> list[str]:
         "366-455天占用资金",
         "456天占用资金",
     ]
+
+
+def normalize_product_operational(df: pd.DataFrame) -> pd.DataFrame:
+    missing = [col for col in PRODUCT_OPERATIONAL_REQUIRED_COLUMNS if col not in df.columns]
+    if missing:
+        raise ValueError(f"运营原始表缺少产品管理列：{', '.join(missing)}")
+
+    base = df[PRODUCT_OPERATIONAL_REQUIRED_COLUMNS].copy()
+    for col in ["ASIN", "MSKU"]:
+        base[col] = base[col].fillna("").astype(str).str.strip()
+    base = base[base["MSKU"].ne("")].copy()
+    for col in PRODUCT_OPERATIONAL_REQUIRED_COLUMNS:
+        if col in {"ASIN", "MSKU"}:
+            continue
+        base[col] = normalize_config_number(base[col]).fillna(0)
+    base = base.rename(columns={"MSKU": "SKU", "可售": "可售数量"})
+    if base.empty:
+        return pd.DataFrame(columns=["ASIN", "SKU", "可售天数"] + PRODUCT_OPERATIONAL_SUM_COLUMNS)
+
+    grouped = (
+        base.groupby(["ASIN", "SKU"], dropna=False, sort=False)
+        .agg(
+            可售数量=("可售数量", "sum"),
+            可售天数=("可售天数", "first"),
+            日均销量=("日均销量", "sum"),
+            昨天销量=("昨天销量", "sum"),
+            前天销量=("前天销量", "sum"),
+            上前销量=("上前销量", "sum"),
+            **{
+                "7天销量": ("7天销量", "sum"),
+                "14天销量": ("14天销量", "sum"),
+                "30天销量": ("30天销量", "sum"),
+                "90天销量": ("90天销量", "sum"),
+            },
+        )
+        .reset_index()
+    )
+    return grouped[["ASIN", "SKU", "可售数量", "可售天数"] + [col for col in PRODUCT_OPERATIONAL_SUM_COLUMNS if col != "可售数量"]]
+
+
+def normalize_gross_profit_source(df: pd.DataFrame) -> pd.DataFrame:
+    missing = [col for col in GROSS_PROFIT_REQUIRED_COLUMNS if col not in df.columns]
+    if missing:
+        raise ValueError(f"毛利原始表缺少列：{', '.join(missing)}")
+    sales_columns = columns_between(df, "销售额--FBA销售额", "COD")
+
+    base = df[["ASIN", "MSKU", "国家", "毛利润"] + GROSS_PROFIT_VOLUME_COLUMNS + GROSS_PROFIT_AD_COLUMNS + sales_columns].copy()
+    for col in ["ASIN", "MSKU", "国家"]:
+        base[col] = base[col].fillna("").astype(str).str.strip()
+    for col in set(["毛利润"] + GROSS_PROFIT_VOLUME_COLUMNS + GROSS_PROFIT_AD_COLUMNS + sales_columns):
+        base[col] = normalize_config_number(base[col]).fillna(0)
+    base["销量"] = base[GROSS_PROFIT_VOLUME_COLUMNS].sum(axis=1)
+    base["销售额"] = base[sales_columns].sum(axis=1)
+    base["广告支出净额"] = base[GROSS_PROFIT_AD_COLUMNS].sum(axis=1)
+    return base[["ASIN", "MSKU", "国家", "销量", "销售额", "毛利润", "广告支出净额"]]
+
+
+def normalize_rating_source(df: pd.DataFrame) -> pd.DataFrame:
+    missing = [col for col in RATING_REQUIRED_COLUMNS if col not in df.columns]
+    if missing:
+        raise ValueError(f"Rating缺少列：{', '.join(missing)}")
+    base = df[RATING_REQUIRED_COLUMNS].copy()
+    for col in ["ASIN", "国家"]:
+        base[col] = base[col].fillna("").astype(str).str.strip()
+    base["Rating总数"] = normalize_config_number(base["Rating总数"]).fillna(0)
+    base["评分"] = normalize_config_number(base["评分"])
+    return base
+
+
+def build_product_management_table(
+    operational_df: pd.DataFrame, gross_profit_df: pd.DataFrame, rating_df: pd.DataFrame
+) -> pd.DataFrame:
+    operational = normalize_product_operational(operational_df)
+    gross_profit = normalize_gross_profit_source(gross_profit_df)
+    rating = normalize_rating_source(rating_df)
+    if operational.empty:
+        return pd.DataFrame(columns=product_management_all_columns())
+
+    result = operational.copy()
+    result["_sort_order"] = range(len(result))
+    sku_gross = build_product_gross_columns(gross_profit, ["ASIN", "MSKU"]).rename(columns={"MSKU": "SKU"})
+    rating_wide = build_product_rating_columns(rating)
+
+    result = result.merge(sku_gross, on=["ASIN", "SKU"], how="left").merge(rating_wide, on="ASIN", how="left")
+    for col in product_management_all_columns():
+        if col not in result.columns:
+            result[col] = pd.NA
+    return result[product_management_all_columns()].sort_values("_sort_order", kind="stable").reset_index(drop=True)
+
+
+def sort_product_management_table(df: pd.DataFrame, sort_column: str | None = None, ascending: bool = True) -> pd.DataFrame:
+    if df.empty:
+        return df.copy()
+    result = df.copy()
+    if not sort_column or sort_column == "默认排序" or sort_column not in result.columns:
+        if "_sort_order" in result.columns:
+            return result.sort_values("_sort_order", kind="stable").reset_index(drop=True)
+        return result.reset_index(drop=True)
+    order_col = "_sort_order" if "_sort_order" in result.columns else sort_column
+    return result.sort_values([sort_column, order_col], ascending=[ascending, True], na_position="last", kind="stable").reset_index(drop=True)
+
+
+def build_product_gross_columns(gross_profit: pd.DataFrame, group_cols: list[str]) -> pd.DataFrame:
+    if gross_profit.empty:
+        return pd.DataFrame(columns=group_cols + product_gross_columns())
+
+    totals = (
+        gross_profit.groupby(group_cols, dropna=False, sort=False)
+        .agg(销售额=("销售额", "sum"), 毛利润=("毛利润", "sum"))
+        .reset_index()
+    )
+    totals["毛利率"] = totals.apply(lambda row: safe_blank_ratio(row["毛利润"], row["销售额"]), axis=1)
+
+    country_data = gross_profit[gross_profit["国家"].isin(PRODUCT_COUNTRIES)].copy()
+    if country_data.empty:
+        for col in product_country_gross_columns():
+            totals[col] = pd.NA
+        return totals[group_cols + product_gross_columns()]
+
+    country_grouped = (
+        country_data.groupby(group_cols + ["国家"], dropna=False, sort=False)
+        .agg(销量=("销量", "sum"), 销售额=("销售额", "sum"), 毛利润=("毛利润", "sum"), 广告支出净额=("广告支出净额", "sum"))
+        .reset_index()
+    )
+    country_grouped["毛利率"] = country_grouped.apply(lambda row: safe_blank_ratio(row["毛利润"], row["销售额"]), axis=1)
+    country_grouped["广告费占比"] = country_grouped.apply(
+        lambda row: safe_blank_ratio(abs(row["广告支出净额"]), row["销售额"]),
+        axis=1,
+    )
+
+    wide = totals
+    for country in PRODUCT_COUNTRIES:
+        subset = country_grouped[country_grouped["国家"].eq(country)][group_cols + ["销量", "毛利率", "广告费占比"]].copy()
+        subset = subset.rename(
+            columns={
+                "销量": f"{country}销量",
+                "毛利率": f"{country}毛利率",
+                "广告费占比": f"{country}广告费占比",
+            }
+        )
+        wide = wide.merge(subset, on=group_cols, how="left")
+    for col in product_gross_columns():
+        if col not in wide.columns:
+            wide[col] = pd.NA
+    return wide[group_cols + product_gross_columns()]
+
+
+def build_product_rating_columns(rating: pd.DataFrame) -> pd.DataFrame:
+    if rating.empty:
+        return pd.DataFrame(columns=["ASIN"] + product_rating_columns())
+    base = rating[rating["国家"].isin(PRODUCT_COUNTRIES)].copy()
+    if base.empty:
+        return pd.DataFrame(columns=["ASIN"] + product_rating_columns())
+    grouped = (
+        base.groupby(["ASIN", "国家"], dropna=False, sort=False)
+        .agg(Rating总数=("Rating总数", "max"), 评分=("评分", "mean"))
+        .reset_index()
+    )
+    result = grouped[["ASIN"]].drop_duplicates().copy()
+    for country in PRODUCT_COUNTRIES:
+        subset = grouped[grouped["国家"].eq(country)][["ASIN", "Rating总数", "评分"]].copy()
+        subset[f"{country}Rating"] = subset.apply(format_product_rating, axis=1)
+        result = result.merge(subset[["ASIN", f"{country}Rating"]], on="ASIN", how="left")
+    for col in product_rating_columns():
+        if col not in result.columns:
+            result[col] = ""
+    return result[["ASIN"] + product_rating_columns()]
+
+
+def columns_between(df: pd.DataFrame, start: str, end: str) -> list[str]:
+    columns = list(df.columns)
+    if start not in columns or end not in columns:
+        missing = [col for col in [start, end] if col not in columns]
+        raise ValueError(f"毛利原始表缺少销售额区间列：{', '.join(missing)}")
+    start_index = columns.index(start)
+    end_index = columns.index(end)
+    if start_index > end_index:
+        raise ValueError(f"毛利原始表销售额区间列顺序异常：{start} 在 {end} 之后")
+    return columns[start_index : end_index + 1]
+
+
+def safe_blank_ratio(numerator, denominator):
+    return numerator / denominator if pd.notna(denominator) and denominator else pd.NA
+
+
+def format_product_rating(row) -> str:
+    count = row["Rating总数"]
+    score = row["评分"]
+    if pd.isna(count):
+        return ""
+    count_text = str(int(round(float(count))))
+    if pd.isna(score):
+        return count_text
+    return f"{count_text}({float(score):.1f})"
+
+
+def product_country_gross_columns() -> list[str]:
+    columns = []
+    for country in PRODUCT_COUNTRIES:
+        columns.extend([f"{country}销量", f"{country}毛利率", f"{country}广告费占比"])
+    return columns
+
+
+def product_gross_columns() -> list[str]:
+    return product_country_gross_columns() + ["销售额", "毛利润", "毛利率"]
+
+
+def product_rating_columns() -> list[str]:
+    return [f"{country}Rating" for country in PRODUCT_COUNTRIES]
+
+
+def product_management_columns() -> list[str]:
+    return [
+        "SKU",
+        "ASIN",
+        "可售数量",
+        "可售天数",
+        "日均销量",
+        "昨天销量",
+        "前天销量",
+        "上前销量",
+        "7天销量",
+        "14天销量",
+        "30天销量",
+        "90天销量",
+    ] + product_gross_columns() + product_rating_columns()
+
+
+def product_management_internal_columns() -> list[str]:
+    return ["_sort_order"]
+
+
+def product_management_all_columns() -> list[str]:
+    return product_management_columns() + product_management_internal_columns()
+
+
+def product_management_display_table(df: pd.DataFrame) -> pd.DataFrame:
+    display_columns = [col for col in product_management_columns() if col in df.columns]
+    return df[display_columns].copy()
 
 
 def maybe_numeric(series: pd.Series) -> pd.Series:

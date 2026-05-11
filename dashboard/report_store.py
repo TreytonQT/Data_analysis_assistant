@@ -19,6 +19,11 @@ INDEX_COLUMNS = ["月份", "原始文件名", "保存文件名", "上传时间",
 OPERATIONAL_SALES_BASENAME = "operational_sales"
 OPERATIONAL_SALES_INDEX_PATH = SOURCES_DIR / "operational_sales_source.csv"
 SOURCE_INDEX_COLUMNS = ["数据源", "原始文件名", "保存文件名", "上传时间", "文件大小"]
+LATEST_SOURCE_DISPLAY_NAMES = {
+    "operational_sales": "运营原始表",
+    "gross_profit": "毛利原始表",
+    "rating": "Rating",
+}
 
 
 @dataclass(frozen=True)
@@ -43,6 +48,12 @@ def ensure_sources_storage(data_dir: Path = DATA_DIR) -> tuple[Path, Path]:
     return sources_dir, index_path
 
 
+def latest_source_index_path(source_key: str, data_dir: Path = DATA_DIR) -> Path:
+    sources_dir = data_dir / "sources"
+    sources_dir.mkdir(parents=True, exist_ok=True)
+    return sources_dir / f"{source_key}_source.csv"
+
+
 def load_upload_records(data_dir: Path = DATA_DIR) -> pd.DataFrame:
     _, index_path = ensure_storage(data_dir)
     if not index_path.exists():
@@ -65,7 +76,11 @@ def save_upload_records(records: pd.DataFrame, data_dir: Path = DATA_DIR) -> Non
 
 
 def load_operational_sales_source_record(data_dir: Path = DATA_DIR) -> pd.DataFrame:
-    _, index_path = ensure_sources_storage(data_dir)
+    return load_latest_source_record("operational_sales", data_dir)
+
+
+def load_latest_source_record(source_key: str, data_dir: Path = DATA_DIR) -> pd.DataFrame:
+    index_path = latest_source_index_path(source_key, data_dir)
     if not index_path.exists():
         return pd.DataFrame(columns=SOURCE_INDEX_COLUMNS)
     records = pd.read_csv(index_path, encoding="utf-8-sig", dtype=str).fillna("")
@@ -76,36 +91,47 @@ def load_operational_sales_source_record(data_dir: Path = DATA_DIR) -> pd.DataFr
 
 
 def get_operational_sales_source_path(data_dir: Path = DATA_DIR) -> Path | None:
-    sources_dir, _ = ensure_sources_storage(data_dir)
-    records = load_operational_sales_source_record(data_dir)
+    return get_latest_source_path("operational_sales", data_dir)
+
+
+def get_latest_source_path(source_key: str, data_dir: Path = DATA_DIR) -> Path | None:
+    sources_dir = data_dir / "sources"
+    sources_dir.mkdir(parents=True, exist_ok=True)
+    records = load_latest_source_record(source_key, data_dir)
     if not records.empty:
         saved_name = str(records.iloc[-1]["保存文件名"])
         path = sources_dir / saved_name
         if path.exists():
             return path
-    for suffix in (".xlsx", ".xls"):
-        path = sources_dir / f"{OPERATIONAL_SALES_BASENAME}{suffix}"
+    for suffix in (".xlsx", ".xls", ".csv"):
+        path = sources_dir / f"{source_key}{suffix}"
         if path.exists():
             return path
     return None
 
 
 def persist_operational_sales_source(uploaded_file, data_dir: Path = DATA_DIR) -> Path:
-    sources_dir, index_path = ensure_sources_storage(data_dir)
+    return persist_latest_source(uploaded_file, "operational_sales", LATEST_SOURCE_DISPLAY_NAMES["operational_sales"], data_dir)
+
+
+def persist_latest_source(uploaded_file, source_key: str, display_name: str | None = None, data_dir: Path = DATA_DIR) -> Path:
+    sources_dir = data_dir / "sources"
+    sources_dir.mkdir(parents=True, exist_ok=True)
+    index_path = latest_source_index_path(source_key, data_dir)
     data = uploaded_file.getvalue()
     suffix = Path(uploaded_file.name).suffix.lower()
-    if suffix not in {".xlsx", ".xls"}:
+    if suffix not in {".xlsx", ".xls", ".csv"}:
         suffix = ".xlsx"
-    for old_path in sources_dir.glob(f"{OPERATIONAL_SALES_BASENAME}.*"):
+    for old_path in sources_dir.glob(f"{source_key}.*"):
         if old_path.is_file():
             old_path.unlink()
-    saved_name = f"{OPERATIONAL_SALES_BASENAME}{suffix}"
+    saved_name = f"{source_key}{suffix}"
     saved_path = sources_dir / saved_name
     saved_path.write_bytes(data)
     records = pd.DataFrame(
         [
             {
-                "数据源": "运营原始表",
+                "数据源": display_name or LATEST_SOURCE_DISPLAY_NAMES.get(source_key, source_key),
                 "原始文件名": uploaded_file.name,
                 "保存文件名": saved_name,
                 "上传时间": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),

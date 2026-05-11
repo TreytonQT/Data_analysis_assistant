@@ -4,10 +4,13 @@ from pathlib import Path
 
 from dashboard.report_store import (
     delete_upload_record,
+    get_latest_source_path,
     get_operational_sales_source_path,
+    load_latest_source_record,
     load_operational_sales_source_record,
     load_reports_from_records,
     load_upload_records,
+    persist_latest_source,
     persist_operational_sales_source,
     persist_uploaded_reports,
 )
@@ -83,6 +86,32 @@ class ReportStoreTests(unittest.TestCase):
         self.assertEqual(source_path, latest_path)
         self.assertFalse((data_dir / "sources" / "operational_sales.xlsx").exists())
         self.assertEqual(latest_path.read_bytes(), b"new-data")
+
+    def test_generic_latest_source_keeps_latest_upload_only(self):
+        data_dir = self.temporary_data_dir()
+        persist_latest_source(FakeUpload("gross_old.xlsx", b"old-data"), "gross_profit", "毛利原始表", data_dir)
+        latest_path = persist_latest_source(FakeUpload("gross_new.xls", b"new-data"), "gross_profit", "毛利原始表", data_dir)
+
+        records = load_latest_source_record("gross_profit", data_dir)
+        source_path = get_latest_source_path("gross_profit", data_dir)
+
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records.loc[0, "数据源"], "毛利原始表")
+        self.assertEqual(records.loc[0, "原始文件名"], "gross_new.xls")
+        self.assertEqual(records.loc[0, "保存文件名"], "gross_profit.xls")
+        self.assertEqual(latest_path.name, "gross_profit.xls")
+        self.assertEqual(source_path, latest_path)
+        self.assertFalse((data_dir / "sources" / "gross_profit.xlsx").exists())
+        self.assertEqual(latest_path.read_bytes(), b"new-data")
+
+    def test_generic_latest_source_accepts_csv_suffix(self):
+        data_dir = self.temporary_data_dir()
+        latest_path = persist_latest_source(FakeUpload("gross.csv", b"csv-data"), "gross_profit", "毛利原始表", data_dir)
+        records = load_latest_source_record("gross_profit", data_dir)
+
+        self.assertEqual(latest_path.name, "gross_profit.csv")
+        self.assertEqual(records.loc[0, "保存文件名"], "gross_profit.csv")
+        self.assertEqual(get_latest_source_path("gross_profit", data_dir), latest_path)
 
 
 if __name__ == "__main__":

@@ -11,6 +11,7 @@ from dashboard.data_processing import (
     build_discovered_commission_config,
     build_discovered_department_fee_config,
     build_alerts,
+    build_product_management_table,
     build_sales_dashboard_tables,
     build_slow_moving_inventory_table,
     compute_commission_table,
@@ -25,8 +26,13 @@ from dashboard.data_processing import (
     merge_business_config,
     normalize_commission_config,
     normalize_department_fee_config,
+    normalize_gross_profit_source,
+    normalize_rating_source,
     normalize_store_config,
     normalize_target_config,
+    product_management_columns,
+    product_management_display_table,
+    read_upload_table,
     read_local_table,
     select_metric_config,
     split_counted_and_stopped_data,
@@ -35,10 +41,13 @@ from dashboard.display import SIDEBAR_BANNER_PATH, month_label
 from dashboard.filters import apply_home_filters
 from dashboard.report_store import (
     delete_upload_record,
+    get_latest_source_path,
     get_operational_sales_source_path,
+    load_latest_source_record,
     load_operational_sales_source_record,
     load_reports_from_records,
     load_upload_records,
+    persist_latest_source,
     persist_operational_sales_source,
     persist_uploaded_reports,
 )
@@ -58,6 +67,7 @@ NAV_ITEMS = {
     "首页": "📊 首页",
     "销量看板": "📦 销量看板",
     "滞销提醒": "⏳ 滞销提醒",
+    "产品管理": "🧾 产品管理",
     "上传中心": "⬆️ 上传中心",
     "配置中心": "⚙️ 配置中心",
 }
@@ -221,6 +231,11 @@ def format_display_value(value, fmt: str) -> str:
         return f"{float(value):,.2f}"
     except (TypeError, ValueError):
         return str(value)
+
+
+def default_chen_developers(options: list[str]) -> list[str]:
+    matched = [option for option in options if "陈千潼" in str(option)]
+    return matched or options
 
 
 def chart_if_available(df, x, y, color=None, title=None, kind="bar"):
@@ -625,11 +640,28 @@ def process_operational_sales_upload(uploaded_file):
     st.success(f"已保存运营原始表：{uploaded_file.name}")
 
 
+def process_latest_source_upload(uploaded_file, source_key: str, display_name: str, validator):
+    if uploaded_file is None:
+        return
+    data = uploaded_file.getvalue()
+    fingerprint = f"{uploaded_file.name}:{len(data)}:{hashlib.sha256(data).hexdigest()}"
+    state_key = f"processed_{source_key}_upload"
+    if st.session_state.get(state_key) == fingerprint:
+        return
+    validator(read_upload_table(uploaded_file))
+    persist_latest_source(uploaded_file, source_key, display_name)
+    st.session_state[state_key] = fingerprint
+    st.success(f"已保存{display_name}：{uploaded_file.name}")
+
+
 def render_operational_sales_source_record():
-    st.subheader("已上传运营原始表")
-    record = load_operational_sales_source_record()
+    render_latest_source_record("运营原始表", load_operational_sales_source_record())
+
+
+def render_latest_source_record(title: str, record: pd.DataFrame):
+    st.subheader(f"已上传{title}")
     if record.empty:
-        st.info("暂无已保存的运营原始表。上传 XLSX 后刷新或重新打开也会保留。")
+        st.info(f"暂无已保存的{title}。上传 XLS/XLSX 后刷新或重新打开也会保留。")
         return
 
     display = record.copy()
@@ -706,7 +738,7 @@ def render_home_filters(data):
         store_types = sorted(data["店铺类型"].dropna().unique().tolist()) if "店铺类型" in data.columns else []
 
         selected_months = col1.multiselect("月份", months, default=[], format_func=month_label)
-        selected_developers = col2.multiselect("开发员", developers, default=[])
+        selected_developers = col2.multiselect("开发员", developers, default=default_chen_developers(developers))
         selected_departments = col3.multiselect("店铺所属部门", departments, default=departments)
         selected_store_types = col4.multiselect("店铺类型", store_types, default=store_types)
 
@@ -832,7 +864,7 @@ def render_sales_dashboard_page():
     )
     if developer_options:
         with st.container(key="sales_filter_bar"):
-            selected_developers = st.multiselect("开发员", developer_options, default=developer_options)
+            selected_developers = st.multiselect("开发员", developer_options, default=default_chen_developers(developer_options))
         if not selected_developers:
             st.warning("请选择至少一个开发员。")
             return
@@ -919,7 +951,7 @@ def render_slow_moving_inventory_page():
 
     with st.container(key="slow_moving_filter_bar"):
         col1, col2 = st.columns([2, 1])
-        selected_developers = col1.multiselect("开发员", developer_options, default=developer_options)
+        selected_developers = col1.multiselect("开发员", developer_options, default=default_chen_developers(developer_options))
         discard_threshold = col2.selectbox("弃置费阈值", ["90天以上", "180天以上", "365天以上"], index=0)
 
     if developer_options and not selected_developers:
@@ -963,6 +995,81 @@ def render_slow_moving_inventory_page():
     )
 
 
+def product_management_column_config():
+    int_columns = ["可售数量", "昨天销量", "前天销量", "上前销量", "7天销量", "14天销量", "30天销量", "90天销量"]
+    decimal_columns = ["可售天数", "日均销量", "销售额", "毛利润"]
+    percent_columns = ["毛利率"] + [f"{country}{name}" for country in ["德国", "法国", "西班牙", "意大利"] for name in ["毛利率", "广告费占比"]]
+    country_volume_columns = [f"{country}销量" for country in ["德国", "法国", "西班牙", "意大利"]]
+    config = {col: st.column_config.NumberColumn(col, format="%d") for col in int_columns + country_volume_columns}
+    config.update({col: st.column_config.NumberColumn(col, format="%.2f") for col in decimal_columns})
+    config.update({col: st.column_config.NumberColumn(col, format="%.4f") for col in percent_columns})
+    return config
+
+
+def render_product_management_page():
+    st.title("产品管理")
+    source_paths = {
+        "运营原始表": get_latest_source_path("operational_sales"),
+        "毛利原始表": get_latest_source_path("gross_profit"),
+        "Rating": get_latest_source_path("rating"),
+    }
+    missing = [name for name, path in source_paths.items() if path is None]
+    if missing:
+        st.info("请先到“上传中心”上传：" + "、".join(missing))
+        return
+
+    try:
+        operational_data = read_local_table(source_paths["运营原始表"])
+        gross_profit_data = read_local_table(source_paths["毛利原始表"])
+        rating_data = read_local_table(source_paths["Rating"])
+        if "开发员" in operational_data.columns:
+            developer_series = operational_data["开发员"].fillna("").astype(str).str.strip()
+            developer_options = sorted(developer_series[developer_series.ne("")].drop_duplicates().tolist())
+            with st.container(key="product_management_filter_bar"):
+                selected_developers = st.multiselect("开发员", developer_options, default=default_chen_developers(developer_options))
+            if developer_options and not selected_developers:
+                st.warning("请选择至少一个开发员。")
+                return
+            if selected_developers:
+                operational_data = operational_data[developer_series.isin(selected_developers)].copy()
+        else:
+            st.warning("运营原始表缺少“开发员”列，当前产品管理表无法按开发员筛选。")
+        product_table = build_product_management_table(operational_data, gross_profit_data, rating_data)
+    except Exception as exc:
+        st.error(f"产品管理表无法读取或计算：{exc}")
+        return
+
+    if product_table.empty:
+        st.warning("当前数据源没有可展示的产品管理数据。")
+        return
+
+    display_table = product_management_display_table(product_table)
+
+    asin_count = display_table["ASIN"].nunique()
+    sku_count = len(display_table)
+    kpi_cols = st.columns(4)
+    kpi_cols[0].metric("ASIN数", f"{asin_count:,.0f}")
+    kpi_cols[1].metric("SKU数", f"{sku_count:,.0f}")
+    kpi_cols[2].metric("可售数量", f"{pd.to_numeric(display_table['可售数量'], errors='coerce').sum():,.0f}")
+    kpi_cols[3].metric("30天销量", f"{pd.to_numeric(display_table['30天销量'], errors='coerce').sum():,.0f}")
+
+    st.subheader("产品管理明细")
+    st.dataframe(
+        display_table,
+        use_container_width=True,
+        hide_index=True,
+        column_config=product_management_column_config(),
+    )
+
+    csv = display_table.to_csv(index=False, encoding="utf-8-sig")
+    st.download_button(
+        "导出产品管理表 CSV",
+        data=csv,
+        file_name="product_management.csv",
+        mime="text/csv",
+    )
+
+
 def render_upload_center(records):
     st.title("上传中心")
     report_files = st.file_uploader("业绩报表 CSV", type=["csv"], accept_multiple_files=True)
@@ -979,6 +1086,22 @@ def render_upload_center(records):
     except Exception as exc:
         st.error(f"运营原始表保存失败：{exc}")
     render_operational_sales_source_record()
+
+    st.divider()
+    gross_profit_file = st.file_uploader("毛利原始表 CSV/XLS/XLSX", type=["csv", "xls", "xlsx"], accept_multiple_files=False, key="gross_profit_upload")
+    try:
+        process_latest_source_upload(gross_profit_file, "gross_profit", "毛利原始表", normalize_gross_profit_source)
+    except Exception as exc:
+        st.error(f"毛利原始表保存失败：{exc}")
+    render_latest_source_record("毛利原始表", load_latest_source_record("gross_profit"))
+
+    st.divider()
+    rating_file = st.file_uploader("Rating XLS/XLSX", type=["xls", "xlsx"], accept_multiple_files=False, key="rating_upload")
+    try:
+        process_latest_source_upload(rating_file, "rating", "Rating", normalize_rating_source)
+    except Exception as exc:
+        st.error(f"Rating保存失败：{exc}")
+    render_latest_source_record("Rating", load_latest_source_record("rating"))
 
 
 def render_config_center(metric_config_df, records):
@@ -1049,6 +1172,8 @@ def main():
         render_sales_dashboard_page()
     elif page == "滞销提醒":
         render_slow_moving_inventory_page()
+    elif page == "产品管理":
+        render_product_management_page()
     elif page == "上传中心":
         render_upload_center(records)
     else:
