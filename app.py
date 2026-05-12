@@ -11,6 +11,7 @@ from dashboard.data_processing import (
     build_discovered_commission_config,
     build_discovered_department_fee_config,
     build_alerts,
+    build_low_margin_product_table,
     build_product_management_table,
     build_sales_dashboard_tables,
     build_slow_moving_inventory_table,
@@ -998,12 +999,52 @@ def render_slow_moving_inventory_page():
 def product_management_column_config():
     int_columns = ["可售数量", "昨天销量", "前天销量", "上前销量", "7天销量", "14天销量", "30天销量", "90天销量"]
     decimal_columns = ["可售天数", "日均销量", "销售额", "毛利润"]
-    percent_columns = ["毛利率"] + [f"{country}{name}" for country in ["德国", "法国", "西班牙", "意大利"] for name in ["毛利率", "广告费占比"]]
     country_volume_columns = [f"{country}销量" for country in ["德国", "法国", "西班牙", "意大利"]]
     config = {col: st.column_config.NumberColumn(col, format="%d") for col in int_columns + country_volume_columns}
     config.update({col: st.column_config.NumberColumn(col, format="%.2f") for col in decimal_columns})
-    config.update({col: st.column_config.NumberColumn(col, format="%.4f") for col in percent_columns})
     return config
+
+
+def low_margin_product_column_config():
+    return {
+        "销量": st.column_config.NumberColumn("销量", format="%d"),
+        "销售额": st.column_config.NumberColumn("销售额", format="%.2f"),
+        "毛利润": st.column_config.NumberColumn("毛利润", format="%.2f"),
+    }
+
+
+def product_management_percent_columns(df: pd.DataFrame) -> tuple[list[str], list[str]]:
+    margin_columns = [col for col in df.columns if "毛利率" in str(col)]
+    ad_columns = [col for col in df.columns if "广告费占比" in str(col)]
+    return margin_columns, ad_columns
+
+
+def product_management_percent_styler(df: pd.DataFrame):
+    margin_columns, ad_columns = product_management_percent_columns(df)
+    percent_columns = margin_columns + ad_columns
+
+    def format_percent(value):
+        if pd.isna(value):
+            return ""
+        try:
+            return f"{float(value):.2%}"
+        except (TypeError, ValueError):
+            return str(value)
+
+    def style_percent_cells(data: pd.DataFrame):
+        styles = pd.DataFrame("", index=data.index, columns=data.columns)
+        for col in margin_columns:
+            numeric = pd.to_numeric(data[col], errors="coerce")
+            styles.loc[numeric < 0.12, col] = "background-color: #fee2e2; color: #991b1b;"
+            styles.loc[(numeric >= 0.12) & (numeric <= 0.20), col] = "background-color: #fef3c7; color: #92400e;"
+            styles.loc[numeric > 0.20, col] = "background-color: #dcfce7; color: #166534;"
+        for col in ad_columns:
+            numeric = pd.to_numeric(data[col], errors="coerce")
+            styles.loc[numeric > 0.10, col] = "background-color: #fee2e2; color: #991b1b;"
+        return styles
+
+    formatters = {col: format_percent for col in percent_columns}
+    return df.style.format(formatters, na_rep="").apply(style_percent_cells, axis=None)
 
 
 def render_product_management_page():
@@ -1035,6 +1076,7 @@ def render_product_management_page():
         else:
             st.warning("运营原始表缺少“开发员”列，当前产品管理表无法按开发员筛选。")
         product_table = build_product_management_table(operational_data, gross_profit_data, rating_data)
+        low_margin_table = build_low_margin_product_table(gross_profit_data)
     except Exception as exc:
         st.error(f"产品管理表无法读取或计算：{exc}")
         return
@@ -1047,15 +1089,42 @@ def render_product_management_page():
 
     asin_count = display_table["ASIN"].nunique()
     sku_count = len(display_table)
-    kpi_cols = st.columns(4)
+    kpi_cols = st.columns(5)
     kpi_cols[0].metric("ASIN数", f"{asin_count:,.0f}")
     kpi_cols[1].metric("SKU数", f"{sku_count:,.0f}")
     kpi_cols[2].metric("可售数量", f"{pd.to_numeric(display_table['可售数量'], errors='coerce').sum():,.0f}")
-    kpi_cols[3].metric("30天销量", f"{pd.to_numeric(display_table['30天销量'], errors='coerce').sum():,.0f}")
+    kpi_cols[3].metric("日均销量", f"{pd.to_numeric(display_table['日均销量'], errors='coerce').sum():,.2f}")
+    kpi_cols[4].metric("30天销量", f"{pd.to_numeric(display_table['30天销量'], errors='coerce').sum():,.0f}")
+
+    st.subheader("低毛利率 SKU")
+    if low_margin_table.empty:
+        st.info("当前毛利原始表中没有毛利率低于 15% 且出单数不少于 5 单的 SKU。")
+    else:
+        low_margin_sales = pd.to_numeric(low_margin_table["销售额"], errors="coerce").sum()
+        low_margin_profit = pd.to_numeric(low_margin_table["毛利润"], errors="coerce").sum()
+        low_margin_rate = low_margin_profit / low_margin_sales if low_margin_sales else pd.NA
+        low_margin_kpis = st.columns(3)
+        low_margin_kpis[0].metric("合计销售额", f"{low_margin_sales:,.2f}")
+        low_margin_kpis[1].metric("合计毛利润", f"{low_margin_profit:,.2f}")
+        low_margin_kpis[2].metric("合计毛利率", "-" if pd.isna(low_margin_rate) else f"{low_margin_rate:.2%}")
+
+        st.dataframe(
+            product_management_percent_styler(low_margin_table),
+            use_container_width=True,
+            hide_index=True,
+            column_config=low_margin_product_column_config(),
+        )
+        low_margin_csv = low_margin_table.to_csv(index=False, encoding="utf-8-sig")
+        st.download_button(
+            "导出低毛利率表格 CSV",
+            data=low_margin_csv,
+            file_name="low_margin_products.csv",
+            mime="text/csv",
+        )
 
     st.subheader("产品管理明细")
     st.dataframe(
-        display_table,
+        product_management_percent_styler(display_table),
         use_container_width=True,
         hide_index=True,
         column_config=product_management_column_config(),

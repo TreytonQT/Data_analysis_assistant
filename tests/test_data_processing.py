@@ -3,6 +3,7 @@ import unittest
 import pandas as pd
 
 from dashboard.data_processing import (
+    build_low_margin_product_table,
     build_product_management_table,
     build_sales_dashboard_tables,
     build_slow_moving_inventory_table,
@@ -490,27 +491,29 @@ class DataProcessingTests(unittest.TestCase):
                 "14天销量": [28, 42, 0],
                 "30天销量": [60, 90, 0],
                 "90天销量": [180, 270, 0],
+                "开发员": ["A", "B", "C"],
             }
         )
 
     def gross_profit_source(self):
         return pd.DataFrame(
             {
-                "ASIN": ["B001", "B001", "B001", "B002"],
-                "MSKU": ["SKU1", "SKU2", "SKU1", "SKU3"],
-                "国家": ["德国", "法国", "美国", "德国"],
-                "销量--FBA销量": [1, 2, 3, 4],
-                "销量--FBM销量": [10, 20, 30, 40],
-                "销量--多渠道销量": [100, 200, 300, 400],
-                "销售额--FBA销售额": [100, 200, 300, 0],
-                "销售额--FBM销售额": [10, 20, 30, 0],
-                "COD": [0, 0, 0, 0],
-                "毛利润": [55, 44, 33, 0],
-                "广告费-SD广告": [-5, -4, -3, 0],
-                "广告费-SP广告": [-4, -3, -2, 0],
-                "广告费-SB广告": [-3, -2, -1, 0],
-                "广告费-SBV广告": [-2, -1, 0, 0],
-                "广告费--差异分摊": [-1, 0, 0, 0],
+                "ASIN": ["B001", "B001", "B001", "B002", "B003"],
+                "MSKU": ["SKU1", "SKU2", "SKU1", "SKU3", "SKU4"],
+                "国家": ["德国", "法国", "美国", "德国", "法国"],
+                "开发员": ["A", "B", "A", "C", "D"],
+                "销量--FBA销量": [1, 2, 3, 4, 4],
+                "销量--FBM销量": [10, 20, 30, 40, 0],
+                "销量--多渠道销量": [100, 200, 300, 400, 0],
+                "销售额--FBA销售额": [100, 200, 300, 0, 100],
+                "销售额--FBM销售额": [10, 20, 30, 0, 0],
+                "COD": [0, 0, 0, 0, 0],
+                "毛利润": [55, 44, 33, 0, 1],
+                "广告费-SD广告": [-5, -4, -3, 0, 0],
+                "广告费-SP广告": [-4, -3, -2, 0, 0],
+                "广告费-SB广告": [-3, -2, -1, 0, 0],
+                "广告费-SBV广告": [-2, -1, 0, 0, 0],
+                "广告费--差异分摊": [-1, 0, 0, 0, 0],
             }
         )
 
@@ -556,6 +559,20 @@ class DataProcessingTests(unittest.TestCase):
         self.assertAlmostEqual(sku2["销售额"], 220)
         self.assertAlmostEqual(sku2["毛利润"], 44)
         self.assertAlmostEqual(sku2["毛利率"], 44 / 220)
+
+    def test_low_margin_product_table_filters_below_threshold(self):
+        result = build_low_margin_product_table(self.gross_profit_source())
+
+        self.assertEqual(result.columns.tolist(), ["SKU", "ASIN", "国家", "开发员", "销量", "销售额", "毛利润", "毛利率"])
+        self.assertEqual(result["SKU"].tolist(), ["SKU1"])
+        row = result.iloc[0]
+        self.assertEqual(row["ASIN"], "B001")
+        self.assertEqual(row["国家"], "美国")
+        self.assertEqual(row["开发员"], "A")
+        self.assertEqual(row["销量"], 333)
+        self.assertEqual(row["销售额"], 330)
+        self.assertEqual(row["毛利润"], 33)
+        self.assertAlmostEqual(row["毛利率"], 33 / 330)
 
     def test_product_management_sort_uses_sku_table_fields(self):
         result = build_product_management_table(self.product_operational_source(), self.gross_profit_source(), self.rating_source())
