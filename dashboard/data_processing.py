@@ -116,6 +116,10 @@ PRODUCT_LEVELS = [
     ("3-5单", lambda value: 3 < value <= 5),
     ("5单以上", lambda value: value > 5),
 ]
+LOW_MARGIN_PRODUCT_THRESHOLD = 0.15
+LOW_MARGIN_PRODUCT_MIN_SALES = 5
+LOW_MARGIN_PRODUCT_COLUMNS = ["SKU", "ASIN", "国家", "开发员", "销量", "销售额", "毛利润", "毛利率"]
+GROSS_PROFIT_DEVELOPER_COLUMNS = ["开发员", "开发人员", "销售专员", "销售"]
 COMMISSION_OUTPUT_COLUMNS = [
     "月份",
     "开发员",
@@ -734,6 +738,61 @@ def build_product_management_table(
         if col not in result.columns:
             result[col] = pd.NA
     return result[product_management_all_columns()].sort_values("_sort_order", kind="stable").reset_index(drop=True)
+
+
+def build_low_margin_product_table(
+    gross_profit_df: pd.DataFrame,
+    threshold: float = LOW_MARGIN_PRODUCT_THRESHOLD,
+    min_sales: float = LOW_MARGIN_PRODUCT_MIN_SALES,
+) -> pd.DataFrame:
+    gross_profit = normalize_low_margin_gross_profit_source(gross_profit_df)
+    if gross_profit.empty:
+        return pd.DataFrame(columns=LOW_MARGIN_PRODUCT_COLUMNS)
+
+    grouped = (
+        gross_profit.rename(columns={"MSKU": "SKU"})
+        .groupby(["ASIN", "SKU", "国家"], dropna=False, sort=False)
+        .agg(
+            开发员=("开发员", join_non_empty_values),
+            销量=("销量", "sum"),
+            销售额=("销售额", "sum"),
+            毛利润=("毛利润", "sum"),
+        )
+        .reset_index()
+    )
+    grouped["毛利率"] = grouped.apply(lambda row: safe_blank_ratio(row["毛利润"], row["销售额"]), axis=1)
+    grouped = grouped[
+        (pd.to_numeric(grouped["销量"], errors="coerce") >= min_sales)
+        & (pd.to_numeric(grouped["毛利率"], errors="coerce") < threshold)
+    ].copy()
+
+    if grouped.empty:
+        return pd.DataFrame(columns=LOW_MARGIN_PRODUCT_COLUMNS)
+
+    grouped = grouped.sort_values(["毛利率", "SKU", "国家"], ascending=[False, True, True], kind="stable")
+    return grouped[LOW_MARGIN_PRODUCT_COLUMNS].reset_index(drop=True)
+
+
+def normalize_low_margin_gross_profit_source(df: pd.DataFrame) -> pd.DataFrame:
+    gross_profit = normalize_gross_profit_source(df)
+    developer_col = first_existing_column(df, GROSS_PROFIT_DEVELOPER_COLUMNS)
+    if developer_col is None:
+        gross_profit["开发员"] = ""
+        return gross_profit
+
+    gross_profit["开发员"] = df[developer_col].fillna("").astype(str).str.strip().reset_index(drop=True)
+    return gross_profit
+
+
+def first_existing_column(df: pd.DataFrame, candidates: list[str]) -> str | None:
+    for col in candidates:
+        if col in df.columns:
+            return col
+    return None
+
+
+def join_non_empty_values(values: pd.Series) -> str:
+    return "；".join(sorted({str(value).strip() for value in values if str(value).strip()}))
 
 
 def sort_product_management_table(df: pd.DataFrame, sort_column: str | None = None, ascending: bool = True) -> pd.DataFrame:
