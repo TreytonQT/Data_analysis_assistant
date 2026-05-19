@@ -31,8 +31,17 @@ OPERATIONAL_SALES_REQUIRED_COLUMNS = [
     "开发员",
     "ASIN",
 ]
-OPERATIONAL_SALES_NUMERIC_COLUMNS = ["7天销量", "30天销量", "可售", "本地库存", "昨天销量", "前天销量", "上前销量"]
-OPERATIONAL_SALES_NORMALIZED_COLUMNS = OPERATIONAL_SALES_REQUIRED_COLUMNS + [
+OPERATIONAL_SALES_NUMERIC_COLUMNS = [
+    "7天销量",
+    "30天销量",
+    "可售",
+    "本地库存",
+    "昨天销量",
+    "前天销量",
+    "上前销量",
+]
+OPERATIONAL_SALES_DERIVED_COLUMNS = ["占用资金"]
+OPERATIONAL_SALES_NORMALIZED_COLUMNS = OPERATIONAL_SALES_REQUIRED_COLUMNS + OPERATIONAL_SALES_DERIVED_COLUMNS + [
     "店铺编码",
     "店铺名称原始",
     "店铺名称展开",
@@ -411,6 +420,10 @@ def normalize_operational_sales(df: pd.DataFrame) -> pd.DataFrame:
         raise ValueError(f"运营原始表缺少列：{', '.join(missing)}")
 
     base = df[OPERATIONAL_SALES_REQUIRED_COLUMNS].copy()
+    capital_cols = operational_sales_capital_columns(df)
+    for col in capital_cols:
+        base[col] = normalize_config_number(df[col]).fillna(0)
+    base["占用资金"] = base[capital_cols].sum(axis=1) if capital_cols else 0
     for col in ["MSKU", "店铺名称", "开发员", "ASIN"]:
         base[col] = base[col].fillna("").astype(str).str.strip()
     for col in OPERATIONAL_SALES_NUMERIC_COLUMNS:
@@ -435,6 +448,14 @@ def normalize_operational_sales(df: pd.DataFrame) -> pd.DataFrame:
     if not rows:
         return pd.DataFrame(columns=OPERATIONAL_SALES_NORMALIZED_COLUMNS)
     return pd.DataFrame(rows)
+
+
+def operational_sales_capital_columns(df: pd.DataFrame) -> list[str]:
+    return [
+        col
+        for col in df.columns
+        if re.fullmatch(r"\d+(?:-\d+)?天(?:以上)?占用资金", str(col).strip())
+    ]
 
 
 def ensure_operational_sales_normalized(df: pd.DataFrame) -> pd.DataFrame:
@@ -492,6 +513,7 @@ def build_sales_dashboard_tables(df: pd.DataFrame, store_config: pd.DataFrame) -
             **{"7天日均": ("7天日均", "sum")},
             **{"30天日均": ("30天日均", "sum")},
             总库存=("可售", "sum"),
+            占用资金=("占用资金", "sum"),
         )
     )
     store_summary["产品数占比"] = store_summary["在售个数"].map(lambda value: safe_ratio(value, total_onsale))
@@ -501,7 +523,20 @@ def build_sales_dashboard_tables(df: pd.DataFrame, store_config: pd.DataFrame) -
     store_summary["_排序"] = store_summary["店铺编码"].map(order_lookup).fillna(len(order_lookup) + 999)
     store_summary = store_summary.sort_values(["_排序", "店铺编码"]).drop(columns=["_排序"]).reset_index(drop=True)
     store_summary = store_summary[
-        ["店铺编码", "店铺类型", "在售个数", "产品数占比", "昨日D值", "7天D值", "昨日订单", "-26订单", "7天日均", "30天日均", "总库存"]
+        [
+            "店铺编码",
+            "店铺类型",
+            "在售个数",
+            "产品数占比",
+            "昨日D值",
+            "7天D值",
+            "昨日订单",
+            "-26订单",
+            "7天日均",
+            "30天日均",
+            "总库存",
+            "占用资金",
+        ]
     ]
 
     level_summary = (
