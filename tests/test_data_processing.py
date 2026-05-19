@@ -389,6 +389,9 @@ class DataProcessingTests(unittest.TestCase):
                 "30天销量": [60, 0, 15],
                 "可售": [10, 0, 5],
                 "本地库存": [1, 2, 3],
+                "0-60天占用资金": ["1,200.5", "300", "50"],
+                "61-90天占用资金": [10, 20, 30],
+                "465天占用资金": [100, 200, 300],
                 "昨天销量": [3, 2, 1],
                 "前天销量": [2, 1, 0],
                 "上前销量": [1, 0, 0],
@@ -414,6 +417,7 @@ class DataProcessingTests(unittest.TestCase):
         self.assertAlmostEqual(stores.loc["ZXU", "7天日均"], 3)
         self.assertAlmostEqual(stores.loc["ZXU", "30天日均"], 2)
         self.assertEqual(stores.loc["ZXU", "总库存"], 10)
+        self.assertEqual(stores.loc["ZXU", "占用资金"], 1830.5)
         self.assertEqual(stores.loc["ZXU", "昨日D值"], 5)
         self.assertEqual(stores.loc["ZXU", "7天D值"], 3)
 
