@@ -8,17 +8,18 @@ import plotly.express as px
 import streamlit as st
 
 from dashboard.data_processing import (
+    DEFAULT_REPLENISHMENT_TARGET_DAYS,
     build_discovered_commission_config,
     build_discovered_department_fee_config,
     build_alerts,
     build_low_margin_product_table,
     build_product_management_table,
+    build_replenishment_management_tables,
     build_sales_dashboard_tables,
     build_slow_moving_inventory_table,
     compute_commission_table,
     compute_metric_table,
     compute_stopped_commission_table,
-    format_display_table,
     load_commission_config,
     load_department_fee_config,
     load_business_config,
@@ -29,6 +30,7 @@ from dashboard.data_processing import (
     normalize_department_fee_config,
     normalize_gross_profit_source,
     normalize_rating_source,
+    normalize_replenishment_targets,
     normalize_store_config,
     normalize_target_config,
     product_management_columns,
@@ -62,6 +64,7 @@ STORE_CONFIG_PATH = CONFIG_DIR / "store_config.csv"
 TARGET_CONFIG_PATH = CONFIG_DIR / "monthly_targets.csv"
 COMMISSION_CONFIG_PATH = CONFIG_DIR / "commission_config.csv"
 DEPARTMENT_FEE_CONFIG_PATH = CONFIG_DIR / "department_fee_config.csv"
+REPLENISHMENT_TARGET_PATH = CONFIG_DIR / "replenishment_targets.csv"
 
 
 NAV_ITEMS = {
@@ -69,6 +72,7 @@ NAV_ITEMS = {
     "销量看板": "📦 销量看板",
     "滞销提醒": "⏳ 滞销提醒",
     "产品管理": "🧾 产品管理",
+    "补货管理": "🚚 补货管理",
     "上传中心": "⬆️ 上传中心",
     "配置中心": "⚙️ 配置中心",
 }
@@ -234,6 +238,30 @@ def format_display_value(value, fmt: str) -> str:
         return str(value)
 
 
+def metric_column_config(metric_lookup: dict, columns) -> dict:
+    config = {}
+    for col in columns:
+        fmt = metric_lookup.get(col, {}).get("格式")
+        if fmt == "金额":
+            config[col] = st.column_config.NumberColumn(col, format="%.2f")
+        elif fmt == "整数":
+            config[col] = st.column_config.NumberColumn(col, format="%d")
+        elif fmt == "百分比":
+            config[col] = st.column_config.NumberColumn(col, format="percent")
+        elif fmt:
+            config[col] = st.column_config.NumberColumn(col, format="%.2f")
+    return config
+
+
+def render_metric_dataframe(df: pd.DataFrame, metric_lookup: dict):
+    st.dataframe(
+        df,
+        use_container_width=True,
+        hide_index=True,
+        column_config=metric_column_config(metric_lookup, df.columns),
+    )
+
+
 def default_chen_developers(options: list[str]) -> list[str]:
     matched = [option for option in options if "陈千潼" in str(option)]
     return matched or options
@@ -386,11 +414,11 @@ def render_commission_dashboard(counted, stopped, metric_config_df, commission_c
         chart_data = summary.dropna(subset=["提成预估"])
         if not chart_data.empty:
             chart_if_available(chart_data, "开发员", "提成预估", title="开发员提成预估")
-        st.dataframe(format_display_table(summary, commission_lookup), use_container_width=True, hide_index=True)
+        render_metric_dataframe(summary, commission_lookup)
 
         detail_display = detail.copy()
         detail_display["月份"] = detail_display["月份"].map(month_label)
-        st.dataframe(format_display_table(detail_display, commission_lookup), use_container_width=True, hide_index=True)
+        render_metric_dataframe(detail_display, commission_lookup)
 
     st.markdown("**停提款店铺缺提成**")
     try:
@@ -409,7 +437,7 @@ def render_commission_dashboard(counted, stopped, metric_config_df, commission_c
     stopped_display = stopped_detail.copy()
     stopped_display["月份"] = stopped_display["月份"].map(month_label)
     stopped_display["停提款时间"] = stopped_display["停提款时间"].map(month_label)
-    st.dataframe(format_display_table(stopped_display, commission_lookup), use_container_width=True, hide_index=True)
+    render_metric_dataframe(stopped_display, commission_lookup)
 
 
 def render_developer_store_type_pies(filtered, metric_config_df):
@@ -785,12 +813,12 @@ def render_home_page(data, metric_config_df, metric_lookup, commission_config_df
     trend = compute_metric_table(counted, trend_metrics, ["月份"])
     trend = trend.sort_values("月份") if "月份" in trend.columns else trend
     trend_chart = add_month_display(trend)
-    trend_display = format_display_table(trend_chart.drop(columns=["月份"], errors="ignore"), metric_lookup)
+    trend_display = trend_chart.drop(columns=["月份"], errors="ignore")
 
     st.subheader("月度趋势")
     if "销售额" in trend.columns:
         chart_if_available(trend_chart, "月份显示", "销售额", title="月度销售额趋势", kind="line")
-    st.dataframe(trend_display, use_container_width=True, hide_index=True)
+    render_metric_dataframe(trend_display, metric_lookup)
 
     developer_metrics = metrics_for_group(metric_config_df, "开发员分析")
     developer_table = compute_metric_table(counted, developer_metrics, ["销售专员"])
@@ -800,7 +828,7 @@ def render_home_page(data, metric_config_df, metric_lookup, commission_config_df
     if "销售额" in developer_table.columns:
         chart_if_available(developer_table.head(15), "销售专员", "销售额", title="开发员销售额排行")
     render_developer_store_type_pies(counted, metric_config_df)
-    st.dataframe(format_display_table(developer_table, metric_lookup), use_container_width=True, hide_index=True)
+    render_metric_dataframe(developer_table, metric_lookup)
 
     render_commission_dashboard(counted, stopped, metric_config_df, commission_config_df, department_fee_config_df, metric_lookup)
 
@@ -811,7 +839,7 @@ def render_home_page(data, metric_config_df, metric_lookup, commission_config_df
     st.subheader("店铺分析")
     if "销售额" in store_table.columns:
         chart_if_available(store_table.head(20), "店铺编码", "销售额", color="部门", title="店铺销售额排行")
-    st.dataframe(format_display_table(store_table, metric_lookup), use_container_width=True, hide_index=True)
+    render_metric_dataframe(store_table, metric_lookup)
 
     developer_store_metrics = metrics_for_group(metric_config_df, "开发员店铺分析")
     developer_store_table = compute_metric_table(counted, developer_store_metrics, ["店铺编码", "店铺类型"])
@@ -824,14 +852,14 @@ def render_home_page(data, metric_config_df, metric_lookup, commission_config_df
     st.subheader("开发员 + 店铺分析")
     if "销售额" in developer_store_table.columns:
         chart_if_available(developer_store_table.head(20), "店铺编码", "销售额", color="店铺类型", title="所选范围店铺销售额排行")
-    st.dataframe(format_display_table(developer_store_table, metric_lookup), use_container_width=True, hide_index=True)
+    render_metric_dataframe(developer_store_table, metric_lookup)
 
     alerts = build_alerts(developer_store_table)
     st.subheader("异常预警")
     if alerts.empty:
         st.success("当前筛选范围内未发现默认预警项。")
     else:
-        st.dataframe(format_display_table(alerts, metric_lookup), use_container_width=True, hide_index=True)
+        render_metric_dataframe(alerts, metric_lookup)
 
     csv = developer_store_table.to_csv(index=False, encoding="utf-8-sig")
     st.download_button(
@@ -914,12 +942,12 @@ def render_sales_dashboard_page():
     table_cols = st.columns([1.15, 0.85])
     with table_cols[0]:
         st.subheader("店铺明细")
-        st.dataframe(format_display_table(stores, metric_lookup), use_container_width=True, hide_index=True)
+        render_metric_dataframe(stores, metric_lookup)
     with table_cols[1]:
         st.subheader("产品等级")
-        st.dataframe(format_display_table(levels, metric_lookup), use_container_width=True, hide_index=True)
+        render_metric_dataframe(levels, metric_lookup)
         st.subheader("日期对比")
-        st.dataframe(format_display_table(date_compare, metric_lookup), use_container_width=True, hide_index=True)
+        render_metric_dataframe(date_compare, metric_lookup)
 
     csv = stores.to_csv(index=False, encoding="utf-8-sig")
     st.download_button(
@@ -1048,6 +1076,169 @@ def product_management_percent_styler(df: pd.DataFrame):
     return df.style.format(formatters, na_rep="").apply(style_percent_cells, axis=None)
 
 
+def load_replenishment_target_config() -> pd.DataFrame:
+    if not REPLENISHMENT_TARGET_PATH.exists():
+        return normalize_replenishment_targets(pd.DataFrame())
+    return normalize_replenishment_targets(read_local_table(REPLENISHMENT_TARGET_PATH))
+
+
+def save_replenishment_target_config(targets: pd.DataFrame):
+    normalized = normalize_replenishment_targets(targets)
+    REPLENISHMENT_TARGET_PATH.parent.mkdir(parents=True, exist_ok=True)
+    normalized.to_csv(REPLENISHMENT_TARGET_PATH, index=False, encoding="utf-8-sig")
+
+
+def merge_replenishment_target_config(base: pd.DataFrame, overrides: pd.DataFrame | None) -> pd.DataFrame:
+    frames = [normalize_replenishment_targets(base)]
+    if overrides is not None and not overrides.empty:
+        frames.append(normalize_replenishment_targets(overrides))
+    return normalize_replenishment_targets(pd.concat(frames, ignore_index=True))
+
+
+def replenishment_targets_from_detail(detail: pd.DataFrame) -> pd.DataFrame:
+    if detail.empty or "ASIN" not in detail.columns or "目标可售天数" not in detail.columns:
+        return normalize_replenishment_targets(pd.DataFrame())
+    return normalize_replenishment_targets(detail[["ASIN", "目标可售天数"]])
+
+
+def replenishment_targets_changed(previous: pd.DataFrame, current: pd.DataFrame) -> bool:
+    previous_targets = replenishment_targets_from_detail(previous).set_index("ASIN")
+    current_targets = replenishment_targets_from_detail(current).set_index("ASIN")
+    if set(previous_targets.index) != set(current_targets.index):
+        return True
+    if previous_targets.empty and current_targets.empty:
+        return False
+    aligned_previous = previous_targets.sort_index()["目标可售天数"]
+    aligned_current = current_targets.sort_index()["目标可售天数"]
+    return not aligned_previous.equals(aligned_current)
+
+
+def replenishment_column_config(editable: bool = False):
+    int_columns = ["目标可售天数", "亚马逊可售库存数量", "总库存数量", "库龄超90天库存数"]
+    decimal_columns = ["日均销量", "重量", "建议补货数量"]
+    country_volume_columns = [f"{country}单量" for country in ["德国", "法国", "西班牙", "意大利"]]
+    margin_columns = [f"{country}毛利率" for country in ["德国", "法国", "西班牙", "意大利"]]
+    config = {col: st.column_config.NumberColumn(col, format="%d") for col in int_columns + country_volume_columns}
+    config.update({col: st.column_config.NumberColumn(col, format="%.2f") for col in decimal_columns})
+    config.update({col: st.column_config.NumberColumn(col, format="percent") for col in margin_columns})
+    if editable:
+        config["目标可售天数"] = st.column_config.NumberColumn(
+            "目标可售天数",
+            min_value=0,
+            step=1,
+            format="%d",
+            help=f"缺失时默认 {DEFAULT_REPLENISHMENT_TARGET_DAYS} 天。",
+        )
+    return config
+
+
+def replenishment_margin_styler(df: pd.DataFrame):
+    margin_columns = [col for col in df.columns if "毛利率" in str(col)]
+
+    def style_margin_cells(data: pd.DataFrame):
+        styles = pd.DataFrame("", index=data.index, columns=data.columns)
+        for col in margin_columns:
+            numeric = pd.to_numeric(data[col], errors="coerce")
+            styles.loc[numeric > 0.20, col] = "background-color: #dcfce7; color: #166534;"
+            styles.loc[(numeric > 0.13) & (numeric < 0.20), col] = "background-color: #fef3c7; color: #92400e;"
+            styles.loc[numeric < 0.13, col] = "background-color: #fee2e2; color: #991b1b;"
+        return styles
+
+    return df.style.apply(style_margin_cells, axis=None)
+
+
+def render_replenishment_management_page():
+    st.title("补货管理")
+    source_paths = {
+        "运营原始表": get_latest_source_path("operational_sales"),
+        "毛利原始表": get_latest_source_path("gross_profit"),
+        "Rating": get_latest_source_path("rating"),
+    }
+    missing = [name for name, path in source_paths.items() if path is None]
+    if missing:
+        st.info("请先到“上传中心”上传：" + "、".join(missing))
+        return
+
+    try:
+        operational_data = read_local_table(source_paths["运营原始表"])
+        gross_profit_data = read_local_table(source_paths["毛利原始表"])
+        rating_data = read_local_table(source_paths["Rating"])
+        saved_targets = load_replenishment_target_config()
+        session_targets = st.session_state.get("replenishment_target_overrides")
+        target_config = merge_replenishment_target_config(saved_targets, session_targets)
+
+        if "开发员" in operational_data.columns:
+            developer_series = operational_data["开发员"].fillna("").astype(str).str.strip()
+            developer_options = sorted(developer_series[developer_series.ne("")].drop_duplicates().tolist())
+            with st.container(key="replenishment_filter_bar"):
+                selected_developers = st.multiselect("开发员", developer_options, default=default_chen_developers(developer_options))
+            if developer_options and not selected_developers:
+                st.warning("请选择至少一个开发员。")
+                return
+            if selected_developers:
+                operational_data = operational_data[developer_series.isin(selected_developers)].copy()
+        else:
+            st.warning("运营原始表缺少“开发员”列，当前补货管理表无法按开发员筛选。")
+
+        tables = build_replenishment_management_tables(operational_data, gross_profit_data, rating_data, target_config)
+    except Exception as exc:
+        st.error(f"补货管理无法读取或计算：{exc}")
+        return
+
+    detail = tables["detail"]
+    store_distribution = tables["store_distribution"]
+    if detail.empty:
+        st.info("当前筛选条件下没有需要补货的 ASIN。")
+        return
+
+    total_replenishment = pd.to_numeric(detail["建议补货数量"], errors="coerce").fillna(0).sum()
+    kpi_cols = st.columns(3)
+    kpi_cols[0].metric("需补货ASIN数", f"{detail['ASIN'].nunique():,.0f}")
+    kpi_cols[1].metric("预计补货总库存数", f"{total_replenishment:,.2f}")
+    kpi_cols[2].metric("涉及店铺数", f"{store_distribution['店铺编码'].nunique() if not store_distribution.empty else 0:,.0f}")
+
+    if not store_distribution.empty:
+        plot_sales_bar(store_distribution, "店铺编码", "需补货ASIN数", "需补货 ASIN 店铺分布")
+        st.dataframe(
+            store_distribution,
+            use_container_width=True,
+            hide_index=True,
+            column_config={"需补货ASIN数": st.column_config.NumberColumn("需补货ASIN数", format="%d")},
+        )
+
+    st.subheader("补货明细")
+    disabled_columns = [col for col in detail.columns if col != "目标可售天数"]
+    edited_detail = st.data_editor(
+        replenishment_margin_styler(detail),
+        use_container_width=True,
+        hide_index=True,
+        disabled=disabled_columns,
+        column_config=replenishment_column_config(editable=True),
+        key="replenishment_target_editor",
+    )
+    if replenishment_targets_changed(detail, edited_detail):
+        st.session_state["replenishment_target_overrides"] = merge_replenishment_target_config(
+            target_config,
+            replenishment_targets_from_detail(edited_detail),
+        )
+        st.rerun()
+
+    save_cols = st.columns([1, 4])
+    if save_cols[0].button("保存目标可售天数", use_container_width=True):
+        save_replenishment_target_config(target_config)
+        st.session_state.pop("replenishment_target_overrides", None)
+        st.success("目标可售天数已保存。")
+        st.rerun()
+
+    csv = detail.to_csv(index=False, encoding="utf-8-sig")
+    st.download_button(
+        "导出补货管理表 CSV",
+        data=csv,
+        file_name="replenishment_management.csv",
+        mime="text/csv",
+    )
+
+
 def render_product_management_page():
     st.title("产品管理")
     source_paths = {
@@ -1064,6 +1255,7 @@ def render_product_management_page():
         operational_data = read_local_table(source_paths["运营原始表"])
         gross_profit_data = read_local_table(source_paths["毛利原始表"])
         rating_data = read_local_table(source_paths["Rating"])
+        selected_developers = None
         if "开发员" in operational_data.columns:
             developer_series = operational_data["开发员"].fillna("").astype(str).str.strip()
             developer_options = sorted(developer_series[developer_series.ne("")].drop_duplicates().tolist())
@@ -1077,7 +1269,7 @@ def render_product_management_page():
         else:
             st.warning("运营原始表缺少“开发员”列，当前产品管理表无法按开发员筛选。")
         product_table = build_product_management_table(operational_data, gross_profit_data, rating_data)
-        low_margin_table = build_low_margin_product_table(gross_profit_data)
+        low_margin_table = build_low_margin_product_table(gross_profit_data, developers=selected_developers)
     except Exception as exc:
         st.error(f"产品管理表无法读取或计算：{exc}")
         return
@@ -1244,6 +1436,8 @@ def main():
         render_slow_moving_inventory_page()
     elif page == "产品管理":
         render_product_management_page()
+    elif page == "补货管理":
+        render_replenishment_management_page()
     elif page == "上传中心":
         render_upload_center(records)
     else:
