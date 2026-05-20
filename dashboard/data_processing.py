@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import re
+import unicodedata
 from pathlib import Path
 from typing import Iterable
 
@@ -18,6 +19,8 @@ STORE_COLUMNS = ["店铺名", "店铺类型", "停提款时间", "店铺所属�
 TARGET_COLUMNS = ["开发员", "目标业绩", "目标毛利率"]
 COMMISSION_COLUMNS = ["月份", "开发员", "库存计提", "弃置", "职位提点"]
 DEPARTMENT_FEE_COLUMNS = ["月份", "部门", "费用率"]
+REPLENISHMENT_TARGET_COLUMNS = ["ASIN", "目标可售天数"]
+DEFAULT_REPLENISHMENT_TARGET_DAYS = 70
 OPERATIONAL_SALES_REQUIRED_COLUMNS = [
     "MSKU",
     "店铺名称",
@@ -67,6 +70,15 @@ AGING_CAPITAL_COLUMNS = [
     "456天占用资金",
 ]
 OPERATIONAL_AGING_REQUIRED_COLUMNS = ["MSKU", "开发员", "ASIN"] + AGING_STOCK_COLUMNS + AGING_CAPITAL_COLUMNS
+REPLENISHMENT_STOCK_COMPONENT_COLUMNS = ["可售", "待入库", "采购在途", "本地库存", "在途", "计划入库"]
+REPLENISHMENT_OPERATIONAL_REQUIRED_COLUMNS = [
+    "ASIN",
+    "MSKU",
+    "店铺名称",
+    "开发员",
+    "日均销量",
+    "单品重量(g)",
+] + REPLENISHMENT_STOCK_COMPONENT_COLUMNS + AGING_STOCK_COLUMNS
 DISCARD_THRESHOLD_SEGMENTS = {
     "90天以上": ["91-180", "181-330", "331-365", "366-455", "456天以上"],
     "180天以上": ["181-330", "331-365", "366-455", "456天以上"],
@@ -99,6 +111,15 @@ PRODUCT_OPERATIONAL_SUM_COLUMNS = [
     "90天销量",
 ]
 GROSS_PROFIT_VOLUME_COLUMNS = ["销量--FBA销量", "销量--FBM销量", "销量--多渠道销量"]
+REPLENISHMENT_GROSS_RATIO_COLUMNS = ["广告费占比", "退款占比", "FBA发货费占比"]
+REPLENISHMENT_GROSS_REQUIRED_COLUMNS = [
+    "ASIN",
+    "MSKU",
+    "国家",
+    "销售额--FBA销售额",
+    "COD",
+    "毛利润",
+] + GROSS_PROFIT_VOLUME_COLUMNS + REPLENISHMENT_GROSS_RATIO_COLUMNS
 GROSS_PROFIT_AD_COLUMNS = [
     "广告费-SD广告",
     "广告费-SP广告",
@@ -687,6 +708,279 @@ def slow_moving_inventory_columns() -> list[str]:
     ]
 
 
+def normalize_replenishment_targets(targets: pd.DataFrame | None) -> pd.DataFrame:
+    if targets is None or targets.empty:
+        return pd.DataFrame(columns=REPLENISHMENT_TARGET_COLUMNS)
+
+    data = targets.copy()
+    for col in REPLENISHMENT_TARGET_COLUMNS:
+        if col not in data.columns:
+            data[col] = pd.NA
+    data = data[REPLENISHMENT_TARGET_COLUMNS].copy()
+    data["ASIN"] = data["ASIN"].fillna("").astype(str).str.strip()
+    data["目标可售天数"] = normalize_config_number(data["目标可售天数"]).round()
+    data = data[data["ASIN"].ne("") & data["目标可售天数"].notna()].copy()
+    data["目标可售天数"] = data["目标可售天数"].clip(lower=0).astype(int)
+    return data.drop_duplicates(subset=["ASIN"], keep="last").reset_index(drop=True)
+
+
+def normalize_replenishment_operational(df: pd.DataFrame) -> pd.DataFrame:
+    missing = [col for col in REPLENISHMENT_OPERATIONAL_REQUIRED_COLUMNS if col not in df.columns]
+    if missing:
+        raise ValueError(f"运营原始表缺少补货管理列：{', '.join(missing)}")
+
+    base = df[REPLENISHMENT_OPERATIONAL_REQUIRED_COLUMNS].copy()
+    for col in ["ASIN", "MSKU", "店铺名称", "开发员"]:
+        base[col] = base[col].fillna("").astype(str).str.strip()
+    base = base[base["ASIN"].ne("")].copy()
+    for col in REPLENISHMENT_STOCK_COMPONENT_COLUMNS + AGING_STOCK_COLUMNS + ["日均销量", "单品重量(g)"]:
+        base[col] = normalize_config_number(base[col]).fillna(0)
+    return base
+
+
+def build_replenishment_operational_summary(df: pd.DataFrame) -> pd.DataFrame:
+    operational = normalize_replenishment_operational(df)
+    if operational.empty:
+        return pd.DataFrame(columns=replenishment_operational_columns())
+
+    grouped = (
+        operational.groupby("ASIN", dropna=False, sort=False)
+        .agg(
+            MSKU=("MSKU", join_non_empty_values),
+            店铺编码=("店铺名称", join_operational_store_codes),
+            开发员=("开发员", join_non_empty_values),
+            **{"亚马逊可售库存数量": ("可售", "sum")},
+            待入库=("待入库", "sum"),
+            采购在途=("采购在途", "sum"),
+            本地库存=("本地库存", "sum"),
+            在途=("在途", "sum"),
+            计划入库=("计划入库", "sum"),
+            **{"库龄超90天库存数": (AGING_STOCK_COLUMNS[0], "sum")},
+            日均销量=("日均销量", "sum"),
+            重量=("单品重量(g)", "max"),
+        )
+        .reset_index()
+    )
+    grouped["库龄超90天库存数"] = operational.groupby("ASIN", sort=False)[AGING_STOCK_COLUMNS].sum().sum(axis=1).to_numpy()
+    grouped["总库存数量"] = grouped[
+        ["亚马逊可售库存数量", "待入库", "采购在途", "本地库存", "在途", "计划入库"]
+    ].sum(axis=1)
+    grouped["建议补货方式"] = grouped["重量"].map(lambda value: "卡航" if value > 100 else "空运")
+    return grouped[replenishment_operational_columns()].reset_index(drop=True)
+
+
+def join_operational_store_codes(values: pd.Series) -> str:
+    codes = []
+    seen = set()
+    for value in values:
+        for code, _ in extract_operational_store_codes(value):
+            if code and code not in seen:
+                codes.append(code)
+                seen.add(code)
+    return "；".join(codes)
+
+
+def replenishment_operational_columns() -> list[str]:
+    return [
+        "ASIN",
+        "MSKU",
+        "店铺编码",
+        "开发员",
+        "亚马逊可售库存数量",
+        "总库存数量",
+        "库龄超90天库存数",
+        "日均销量",
+        "重量",
+        "建议补货方式",
+    ]
+
+
+def normalize_replenishment_gross_profit_source(df: pd.DataFrame) -> pd.DataFrame:
+    missing = [col for col in REPLENISHMENT_GROSS_REQUIRED_COLUMNS if col not in df.columns]
+    if missing:
+        raise ValueError(f"毛利原始表缺少补货管理列：{', '.join(missing)}")
+    sales_columns = columns_between(df, "销售额--FBA销售额", "COD")
+
+    base = df[["ASIN", "MSKU", "国家", "毛利润"] + GROSS_PROFIT_VOLUME_COLUMNS + sales_columns + REPLENISHMENT_GROSS_RATIO_COLUMNS].copy()
+    for col in ["ASIN", "MSKU", "国家"]:
+        base[col] = base[col].fillna("").astype(str).str.strip()
+    for col in set(["毛利润"] + GROSS_PROFIT_VOLUME_COLUMNS + sales_columns):
+        base[col] = normalize_config_number(base[col]).fillna(0)
+    for col in REPLENISHMENT_GROSS_RATIO_COLUMNS:
+        base[col] = normalize_rate(base[col]).fillna(0)
+    base["销量"] = base[GROSS_PROFIT_VOLUME_COLUMNS].sum(axis=1)
+    base["销售额"] = base[sales_columns].sum(axis=1)
+    return base[
+        ["ASIN", "MSKU", "国家", "销量", "销售额", "毛利润"] + REPLENISHMENT_GROSS_RATIO_COLUMNS
+    ]
+
+
+def build_replenishment_gross_summary(df: pd.DataFrame) -> pd.DataFrame:
+    gross_profit = normalize_replenishment_gross_profit_source(df)
+    if gross_profit.empty:
+        return pd.DataFrame(columns=["ASIN"] + replenishment_gross_columns())
+
+    country_data = gross_profit[gross_profit["国家"].isin(PRODUCT_COUNTRIES)].copy()
+    if country_data.empty:
+        return pd.DataFrame(columns=["ASIN"] + replenishment_gross_columns())
+
+    grouped = (
+        country_data.groupby(["ASIN", "国家"], dropna=False, sort=False)
+        .agg(单量=("销量", "sum"), 销售额=("销售额", "sum"), 毛利润=("毛利润", "sum"))
+        .reset_index()
+    )
+    grouped["毛利率"] = grouped.apply(lambda row: safe_blank_ratio(row["毛利润"], row["销售额"]), axis=1)
+    result = grouped[["ASIN"]].drop_duplicates().copy()
+
+    for country in PRODUCT_COUNTRIES:
+        subset = grouped[grouped["国家"].eq(country)][["ASIN", "单量", "毛利率"]].copy()
+        subset = subset.rename(columns={"单量": f"{country}单量", "毛利率": f"{country}毛利率"})
+        result = result.merge(subset, on="ASIN", how="left")
+
+    reason_wide = build_replenishment_reason_columns(country_data)
+    result = result.merge(reason_wide, on="ASIN", how="left")
+    for col in replenishment_gross_columns():
+        if col not in result.columns:
+            result[col] = pd.NA if not col.endswith("原因") else ""
+    return result[["ASIN"] + replenishment_gross_columns()]
+
+
+def build_replenishment_reason_columns(gross_profit: pd.DataFrame) -> pd.DataFrame:
+    if gross_profit.empty:
+        return pd.DataFrame(columns=["ASIN"] + replenishment_reason_columns())
+
+    rows = []
+    grouped = gross_profit.groupby(["ASIN", "国家", "MSKU"], dropna=False, sort=False)
+    for (asin, country, msku), group in grouped:
+        if country not in PRODUCT_COUNTRIES or not str(msku).strip():
+            continue
+        reasons = []
+        if group["广告费占比"].max() > 0.15:
+            reasons.append("广告炸")
+        if group["退款占比"].max() > 0.08:
+            reasons.append("退货多")
+        if group["FBA发货费占比"].max() > 0.60:
+            reasons.append("FBA配送费炸")
+        if reasons:
+            rows.append({"ASIN": asin, "国家": country, "MSKU原因": f"{msku}: {'、'.join(reasons)}"})
+
+    if not rows:
+        return pd.DataFrame(columns=["ASIN"] + replenishment_reason_columns())
+
+    reason_data = pd.DataFrame(rows)
+    grouped_reasons = (
+        reason_data.groupby(["ASIN", "国家"], dropna=False, sort=False)
+        .agg(原因=("MSKU原因", lambda values: "；".join(values)))
+        .reset_index()
+    )
+    result = grouped_reasons[["ASIN"]].drop_duplicates().copy()
+    for country in PRODUCT_COUNTRIES:
+        subset = grouped_reasons[grouped_reasons["国家"].eq(country)][["ASIN", "原因"]].copy()
+        subset = subset.rename(columns={"原因": f"{country}原因"})
+        result = result.merge(subset, on="ASIN", how="left")
+    for col in replenishment_reason_columns():
+        if col not in result.columns:
+            result[col] = ""
+    return result[["ASIN"] + replenishment_reason_columns()]
+
+
+def replenishment_gross_columns() -> list[str]:
+    columns = []
+    for country in PRODUCT_COUNTRIES:
+        columns.extend([f"{country}单量", f"{country}毛利率", f"{country}原因"])
+    return columns
+
+
+def replenishment_reason_columns() -> list[str]:
+    return [f"{country}原因" for country in PRODUCT_COUNTRIES]
+
+
+def build_replenishment_rating_summary(df: pd.DataFrame) -> pd.DataFrame:
+    rating = normalize_rating_source(df)
+    if rating.empty:
+        return pd.DataFrame(columns=["ASIN", "产品评分"])
+
+    data = rating[rating["国家"].isin(PRODUCT_COUNTRIES)].copy()
+    if data.empty:
+        return pd.DataFrame(columns=["ASIN", "产品评分"])
+    country_order = {country: index for index, country in enumerate(PRODUCT_COUNTRIES)}
+    data["_国家排序"] = data["国家"].map(country_order).fillna(len(country_order))
+    data = data.sort_values(["ASIN", "Rating总数", "_国家排序"], ascending=[True, False, True], kind="stable")
+    best = data.drop_duplicates(subset=["ASIN"], keep="first").copy()
+    best["产品评分"] = best.apply(format_product_rating, axis=1)
+    return best[["ASIN", "产品评分"]].reset_index(drop=True)
+
+
+def build_replenishment_management_tables(
+    operational_df: pd.DataFrame,
+    gross_profit_df: pd.DataFrame,
+    rating_df: pd.DataFrame,
+    target_config: pd.DataFrame | None = None,
+    only_needed: bool = True,
+) -> dict[str, pd.DataFrame]:
+    operational = build_replenishment_operational_summary(operational_df)
+    gross_profit = build_replenishment_gross_summary(gross_profit_df)
+    rating = build_replenishment_rating_summary(rating_df)
+    targets = normalize_replenishment_targets(target_config)
+
+    if operational.empty:
+        empty_detail = pd.DataFrame(columns=replenishment_management_columns())
+        return {"detail": empty_detail, "store_distribution": pd.DataFrame(columns=["店铺编码", "需补货ASIN数"])}
+
+    result = operational.merge(targets, on="ASIN", how="left")
+    result["目标可售天数"] = result["目标可售天数"].fillna(DEFAULT_REPLENISHMENT_TARGET_DAYS).astype(int)
+    raw_replenishment_quantity = (
+        result["日均销量"] * result["目标可售天数"] - result["总库存数量"]
+    ).clip(lower=0)
+    result["建议补货数量"] = (raw_replenishment_quantity // 10) * 10
+    result = result.merge(gross_profit, on="ASIN", how="left").merge(rating, on="ASIN", how="left")
+    for col in replenishment_management_columns():
+        if col not in result.columns:
+            result[col] = pd.NA
+
+    result = result[replenishment_management_columns()].copy()
+    if only_needed:
+        result = result[pd.to_numeric(result["建议补货数量"], errors="coerce").fillna(0).gt(0)].copy()
+    result = result.sort_values(["建议补货数量", "ASIN"], ascending=[False, True], kind="stable").reset_index(drop=True)
+    return {"detail": result, "store_distribution": build_replenishment_store_distribution(result)}
+
+
+def build_replenishment_store_distribution(detail: pd.DataFrame) -> pd.DataFrame:
+    if detail.empty or "店铺编码" not in detail.columns:
+        return pd.DataFrame(columns=["店铺编码", "需补货ASIN数"])
+    rows = []
+    for _, row in detail.iterrows():
+        asin = str(row.get("ASIN", "")).strip()
+        for store_code in [code.strip() for code in str(row.get("店铺编码", "")).split("；") if code.strip()]:
+            rows.append({"ASIN": asin, "店铺编码": store_code})
+    if not rows:
+        return pd.DataFrame(columns=["店铺编码", "需补货ASIN数"])
+    data = pd.DataFrame(rows).drop_duplicates(subset=["ASIN", "店铺编码"])
+    return (
+        data.groupby("店铺编码", dropna=False, as_index=False)
+        .agg(需补货ASIN数=("ASIN", "nunique"))
+        .sort_values(["需补货ASIN数", "店铺编码"], ascending=[False, True], kind="stable")
+        .reset_index(drop=True)
+    )
+
+
+def replenishment_management_columns() -> list[str]:
+    base_columns = [
+        "ASIN",
+        "MSKU",
+        "店铺编码",
+        "目标可售天数",
+        "亚马逊可售库存数量",
+        "总库存数量",
+        "库龄超90天库存数",
+        "日均销量",
+        "重量",
+        "建议补货方式",
+        "建议补货数量",
+    ]
+    return base_columns + replenishment_gross_columns() + ["产品评分"]
+
+
 def normalize_product_operational(df: pd.DataFrame) -> pd.DataFrame:
     missing = [col for col in PRODUCT_OPERATIONAL_REQUIRED_COLUMNS if col not in df.columns]
     if missing:
@@ -779,8 +1073,12 @@ def build_low_margin_product_table(
     gross_profit_df: pd.DataFrame,
     threshold: float = LOW_MARGIN_PRODUCT_THRESHOLD,
     min_sales: float = LOW_MARGIN_PRODUCT_MIN_SALES,
+    developers: Iterable[str] | None = None,
 ) -> pd.DataFrame:
     gross_profit = normalize_low_margin_gross_profit_source(gross_profit_df)
+    if developers:
+        selected_developers = {str(developer).strip() for developer in developers if str(developer).strip()}
+        gross_profit = gross_profit[gross_profit["开发员"].isin(selected_developers)].copy()
     if gross_profit.empty:
         return pd.DataFrame(columns=LOW_MARGIN_PRODUCT_COLUMNS)
 
@@ -830,6 +1128,20 @@ def join_non_empty_values(values: pd.Series) -> str:
     return "；".join(sorted({str(value).strip() for value in values if str(value).strip()}))
 
 
+def sort_key_series(series: pd.Series) -> pd.Series:
+    non_empty = series.notna() & series.astype(str).str.strip().ne("")
+    numeric = normalize_config_number(series)
+    if non_empty.any() and numeric.notna().sum() / non_empty.sum() >= 0.8:
+        return numeric
+    return series.map(normalize_sort_text)
+
+
+def normalize_sort_text(value) -> str:
+    if pd.isna(value):
+        return ""
+    return unicodedata.normalize("NFKC", str(value)).strip().casefold()
+
+
 def sort_product_management_table(df: pd.DataFrame, sort_column: str | None = None, ascending: bool = True) -> pd.DataFrame:
     if df.empty:
         return df.copy()
@@ -839,7 +1151,13 @@ def sort_product_management_table(df: pd.DataFrame, sort_column: str | None = No
             return result.sort_values("_sort_order", kind="stable").reset_index(drop=True)
         return result.reset_index(drop=True)
     order_col = "_sort_order" if "_sort_order" in result.columns else sort_column
-    return result.sort_values([sort_column, order_col], ascending=[ascending, True], na_position="last", kind="stable").reset_index(drop=True)
+    return result.sort_values(
+        [sort_column, order_col],
+        ascending=[ascending, True],
+        na_position="last",
+        kind="stable",
+        key=sort_key_series,
+    ).reset_index(drop=True)
 
 
 def build_product_gross_columns(gross_profit: pd.DataFrame, group_cols: list[str]) -> pd.DataFrame:
@@ -984,11 +1302,11 @@ def product_management_display_table(df: pd.DataFrame) -> pd.DataFrame:
 def maybe_numeric(series: pd.Series) -> pd.Series:
     if series.dtype.kind in "biufc":
         return series
-    text = series.astype(str).str.strip()
-    percent_mask = text.str.endswith("%")
-    cleaned = text.str.replace(",", "", regex=False).str.replace("%", "", regex=False)
+    text = normalized_numeric_text(series)
+    percent_mask = text.str.endswith("%", na=False)
+    cleaned = text.str.replace("%", "", regex=False)
     numeric = pd.to_numeric(cleaned, errors="coerce").astype("float64")
-    non_empty = text.ne("").sum()
+    non_empty = (text.notna() & text.ne("")).sum()
     parsed = numeric.notna().sum()
     if non_empty and parsed / non_empty >= 0.8:
         numeric.loc[percent_mask] = numeric.loc[percent_mask] / 100
@@ -1051,14 +1369,53 @@ def normalize_rate(series: pd.Series) -> pd.Series:
 
 
 def normalize_config_number(series: pd.Series, percent_to_decimal: bool = False) -> pd.Series:
-    text = series.astype(str).str.strip()
-    text = text.mask(text.isin(["", "nan", "None", "NaN"]))
+    text = normalized_numeric_text(series)
     percent_mask = text.str.endswith("%", na=False)
-    cleaned = text.str.replace(",", "", regex=False).str.replace("%", "", regex=False)
+    cleaned = text.str.replace("%", "", regex=False)
     numeric = pd.to_numeric(cleaned, errors="coerce").astype("float64")
     if percent_to_decimal:
         numeric.loc[percent_mask] = numeric.loc[percent_mask] / 100
     return numeric
+
+
+def normalized_numeric_text(series: pd.Series) -> pd.Series:
+    return series.map(clean_numeric_text)
+
+
+def clean_numeric_text(value) -> str | None:
+    if pd.isna(value):
+        return None
+    text = unicodedata.normalize("NFKC", str(value)).strip()
+    if text.lower() in {"", "nan", "none", "null", "nat", "-", "--", "—", "–", "未配置"}:
+        return None
+
+    is_parenthesized_negative = text.startswith("(") and text.endswith(")")
+    if is_parenthesized_negative:
+        text = text[1:-1].strip()
+
+    text = (
+        text.replace("\u00a0", "")
+        .replace("\u2007", "")
+        .replace("\u202f", "")
+        .replace("\u3000", "")
+        .replace(" ", "")
+        .replace("\t", "")
+        .replace(",", "")
+        .replace("，", "")
+        .replace("￥", "")
+        .replace("¥", "")
+        .replace("$", "")
+        .replace("€", "")
+        .replace("£", "")
+    )
+    text = text.replace("−", "-").replace("–", "-").replace("—", "-")
+    if is_parenthesized_negative and text and not text.startswith("-"):
+        text = "-" + text
+    if not re.fullmatch(r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)%?", text):
+        match = re.match(r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)%?", text)
+        if match:
+            text = match.group(0)
+    return text
 
 
 def build_discovered_commission_config(reports: pd.DataFrame | None) -> pd.DataFrame:
@@ -1273,7 +1630,7 @@ def compute_metrics_for_frame(df: pd.DataFrame, metric_config: pd.DataFrame) -> 
     def get_field(name: str):
         if name not in df.columns:
             raise FormulaError(f"字段不存在：{name}")
-        return df[name]
+        return maybe_numeric(df[name])
 
     def get_range_sum(start: str, end: str):
         columns = list(df.columns)
@@ -1285,7 +1642,7 @@ def compute_metrics_for_frame(df: pd.DataFrame, metric_config: pd.DataFrame) -> 
         end_idx = columns.index(end)
         if start_idx > end_idx:
             raise FormulaError(f"range_sum() 起始字段不能在结束字段之后：{start} > {end}")
-        numeric_range = df.loc[:, columns[start_idx : end_idx + 1]].apply(pd.to_numeric, errors="coerce")
+        numeric_range = df.loc[:, columns[start_idx : end_idx + 1]].apply(normalize_config_number)
         return numeric_range.sum().sum()
 
     context = FormulaContext(field_getter=get_field, range_sum_getter=get_range_sum)
@@ -1293,7 +1650,7 @@ def compute_metrics_for_frame(df: pd.DataFrame, metric_config: pd.DataFrame) -> 
     for _, metric in metric_config.iterrows():
         value = evaluate_formula(metric["公式"], context)
         if isinstance(value, pd.Series):
-            value = pd.to_numeric(value, errors="coerce").sum()
+            value = normalize_config_number(value).sum()
         row[metric["指标名称"]] = value
     return row
 

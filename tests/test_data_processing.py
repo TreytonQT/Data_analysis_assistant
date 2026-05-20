@@ -5,6 +5,7 @@ import pandas as pd
 from dashboard.data_processing import (
     build_low_margin_product_table,
     build_product_management_table,
+    build_replenishment_management_tables,
     build_sales_dashboard_tables,
     build_slow_moving_inventory_table,
     compute_commission_table,
@@ -12,11 +13,13 @@ from dashboard.data_processing import (
     compute_stopped_commission_table,
     merge_business_config,
     normalize_commission_config,
+    normalize_config_number,
     normalize_department_fee_config,
     normalize_product_operational,
     normalize_operational_aging,
     normalize_operational_sales,
     normalize_report,
+    normalize_replenishment_targets,
     normalize_store_config,
     product_level_for_daily_sales,
     select_metric_config,
@@ -84,6 +87,24 @@ class DataProcessingTests(unittest.TestCase):
         self.assertAlmostEqual(result.loc["A", "毛利率"], 50 / 300)
         self.assertEqual(result.loc["B", "低毛利标记"], 1)
 
+    def test_grouped_metrics_sum_dirty_numeric_text(self):
+        data = pd.DataFrame(
+            {
+                "销售专员": ["A", "A"],
+                "月份": ["2026-01", "2026-01"],
+                "店铺": ["6-ZXU 德国", "6-ZXU 德国"],
+                "销售额--FBA销售额": ["１，２００.50", "\u00a0￥300元"],
+                "COD": ["0", "0"],
+            }
+        )
+        metrics = pd.DataFrame(
+            [{"指标名称": "销售额", "显示分组": "开发员分析", "公式": 'range_sum("销售额--FBA销售额", "COD")'}]
+        )
+
+        result = compute_metric_table(normalize_report(data), metrics, ["销售专员"]).set_index("销售专员")
+
+        self.assertEqual(result.loc["A", "销售额"], 1500.5)
+
     def test_web_target_config_accepts_percent_number(self):
         report = normalize_report(
             pd.DataFrame(
@@ -146,6 +167,15 @@ class DataProcessingTests(unittest.TestCase):
         )
 
         self.assertTrue((config["费用率"].round(4) == 0.08).all())
+
+    def test_config_number_accepts_excel_and_copy_variants(self):
+        result = normalize_config_number(pd.Series(["１，２００.50", "\u00a0￥300元", "(45.5)", "—", "D1"]))
+
+        self.assertEqual(result.iloc[0], 1200.5)
+        self.assertEqual(result.iloc[1], 300)
+        self.assertEqual(result.iloc[2], -45.5)
+        self.assertTrue(pd.isna(result.iloc[3]))
+        self.assertTrue(pd.isna(result.iloc[4]))
 
     def test_commission_config_keeps_developer_costs_without_fee_rate(self):
         config = normalize_commission_config(
@@ -531,6 +561,119 @@ class DataProcessingTests(unittest.TestCase):
             }
         )
 
+    def replenishment_operational_source(self):
+        return pd.DataFrame(
+            {
+                "ASIN": ["B001", "B001", "B002", "B003"],
+                "MSKU": ["SKU1", "SKU2", "SKU3", "SKU4"],
+                "店铺名称": ["6-ZXU 德国,7-YIP 本土法国", "6-ZXU 德国", "7-YIP 法国", "8-TIS 意大利"],
+                "开发员": ["A", "A", "A", "A"],
+                "可售": [10, 5, 100, 0],
+                "待入库": [1, 0, 0, 0],
+                "采购在途": [2, 1, 0, 0],
+                "本地库存": [3, 0, 0, 0],
+                "在途": [4, 0, 0, 0],
+                "计划入库": [5, 0, 0, 0],
+                "91-180天库存数": [1, 0, 0, 0],
+                "181-330天库存数": [2, 0, 0, 0],
+                "331-365天库存数": [3, 0, 0, 0],
+                "366-455天库存数": [4, 0, 0, 0],
+                "456天以上库存数": [5, 0, 0, 0],
+                "日均销量": [2, 1, 1, 1],
+                "单品重量(g)": [80, 120, 50, 20],
+            }
+        )
+
+    def replenishment_gross_source(self):
+        return pd.DataFrame(
+            {
+                "ASIN": ["B001", "B001", "B001", "B003"],
+                "MSKU": ["SKU1", "SKU2", "SKU2", "SKU4"],
+                "国家": ["德国", "德国", "法国", "意大利"],
+                "销量--FBA销量": [1, 4, 3, 1],
+                "销量--FBM销量": [2, 0, 0, 0],
+                "销量--多渠道销量": [3, 0, 0, 0],
+                "销售额--FBA销售额": [100, 50, 80, 10],
+                "销售额--FBM销售额": [50, 0, 20, 0],
+                "COD": [0, 0, 0, 0],
+                "毛利润": [30, 10, 30, 1],
+                "广告费占比": [0.20, 0.01, 0.02, 0],
+                "退款占比": [0.09, 0.01, 0.02, 0],
+                "FBA发货费占比": [0.61, 0.20, 0.70, 0],
+            }
+        )
+
+    def replenishment_rating_source(self):
+        return pd.DataFrame(
+            {
+                "ASIN": ["B001", "B001", "B001", "B003"],
+                "国家": ["德国", "法国", "西班牙", "意大利"],
+                "Rating总数": [100, 230, 230, 8],
+                "评分": [4.0, 4.5, 4.1, 3.9],
+            }
+        )
+
+    def test_replenishment_targets_normalize_and_dedupe(self):
+        result = normalize_replenishment_targets(
+            pd.DataFrame({"ASIN": ["B001", "B001", ""], "目标可售天数": ["60", "２１", "70"]})
+        )
+
+        self.assertEqual(result.to_dict(orient="records"), [{"ASIN": "B001", "目标可售天数": 21}])
+
+    def test_replenishment_management_calculates_asin_inventory_and_filters_needed(self):
+        tables = build_replenishment_management_tables(
+            self.replenishment_operational_source(),
+            self.replenishment_gross_source(),
+            self.replenishment_rating_source(),
+            pd.DataFrame({"ASIN": ["B001"], "目标可售天数": [20]}),
+        )
+        detail = tables["detail"].set_index("ASIN")
+
+        self.assertEqual(detail.index.tolist(), ["B003", "B001"])
+        self.assertEqual(detail.loc["B001", "MSKU"], "SKU1；SKU2")
+        self.assertEqual(detail.loc["B001", "店铺编码"], "ZXU；YIP")
+        self.assertEqual(detail.loc["B001", "亚马逊可售库存数量"], 15)
+        self.assertEqual(detail.loc["B001", "总库存数量"], 31)
+        self.assertEqual(detail.loc["B001", "库龄超90天库存数"], 15)
+        self.assertEqual(detail.loc["B001", "重量"], 120)
+        self.assertEqual(detail.loc["B001", "建议补货方式"], "卡航")
+        self.assertEqual(detail.loc["B001", "目标可售天数"], 20)
+        self.assertEqual(detail.loc["B001", "建议补货数量"], 20)
+        self.assertEqual(detail.loc["B003", "目标可售天数"], 70)
+        self.assertEqual(detail.loc["B003", "建议补货方式"], "空运")
+        self.assertNotIn("B002", detail.index)
+
+    def test_replenishment_management_builds_store_distribution_without_stock_duplication(self):
+        tables = build_replenishment_management_tables(
+            self.replenishment_operational_source(),
+            self.replenishment_gross_source(),
+            self.replenishment_rating_source(),
+            pd.DataFrame({"ASIN": ["B001"], "目标可售天数": [20]}),
+        )
+        distribution = tables["store_distribution"].set_index("店铺编码")
+
+        self.assertEqual(distribution.loc["ZXU", "需补货ASIN数"], 1)
+        self.assertEqual(distribution.loc["YIP", "需补货ASIN数"], 1)
+        self.assertEqual(distribution.loc["TIS", "需补货ASIN数"], 1)
+        self.assertEqual(tables["detail"].set_index("ASIN").loc["B001", "总库存数量"], 31)
+
+    def test_replenishment_management_merges_gross_reasons_by_msku_and_best_rating(self):
+        tables = build_replenishment_management_tables(
+            self.replenishment_operational_source(),
+            self.replenishment_gross_source(),
+            self.replenishment_rating_source(),
+            pd.DataFrame({"ASIN": ["B001"], "目标可售天数": [20]}),
+        )
+        row = tables["detail"].set_index("ASIN").loc["B001"]
+
+        self.assertEqual(row["德国单量"], 10)
+        self.assertAlmostEqual(row["德国毛利率"], 40 / 200)
+        self.assertEqual(row["德国原因"], "SKU1: 广告炸、退货多、FBA配送费炸")
+        self.assertEqual(row["法国单量"], 3)
+        self.assertAlmostEqual(row["法国毛利率"], 30 / 100)
+        self.assertEqual(row["法国原因"], "SKU2: FBA配送费炸")
+        self.assertEqual(row["产品评分"], "230(4.5)")
+
     def test_product_operational_requires_expected_columns(self):
         with self.assertRaisesRegex(ValueError, "运营原始表缺少产品管理列"):
             normalize_product_operational(pd.DataFrame({"MSKU": ["SKU1"]}))
@@ -578,12 +721,26 @@ class DataProcessingTests(unittest.TestCase):
         self.assertEqual(row["毛利润"], 33)
         self.assertAlmostEqual(row["毛利率"], 33 / 330)
 
+    def test_low_margin_product_table_filters_by_developer(self):
+        matched = build_low_margin_product_table(self.gross_profit_source(), developers=["A"])
+        unmatched = build_low_margin_product_table(self.gross_profit_source(), developers=["B"])
+
+        self.assertEqual(matched["SKU"].tolist(), ["SKU1"])
+        self.assertTrue(unmatched.empty)
+
     def test_product_management_sort_uses_sku_table_fields(self):
         result = build_product_management_table(self.product_operational_source(), self.gross_profit_source(), self.rating_source())
         sorted_result = sort_product_management_table(result, "可售数量", ascending=True)
 
         self.assertEqual(sorted_result["SKU"].tolist(), ["SKU3", "SKU1", "SKU2"])
         self.assertEqual(sorted_result["ASIN"].tolist(), ["B002", "B001", "B001"])
+
+    def test_product_management_sort_normalizes_dirty_numeric_text(self):
+        result = build_product_management_table(self.product_operational_source(), self.gross_profit_source(), self.rating_source())
+        result["可售数量"] = ["10", "２", "1,000"]
+        sorted_result = sort_product_management_table(result, "可售数量", ascending=True)
+
+        self.assertEqual(sorted_result["SKU"].tolist(), ["SKU2", "SKU1", "SKU3"])
 
     def aging_source(self):
         return pd.DataFrame(
