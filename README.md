@@ -44,6 +44,7 @@ python -m unittest discover -s tests
 - `commission_config.csv`：提成配置，字段为 `月份`、`开发员`、`库存计提`、`弃置`、`职位提点`。
 - `department_fee_config.csv`：部门费用率配置，字段为 `月份`、`部门`、`费用率`。
 - `replenishment_targets.csv`：补货目标配置，字段为 `ASIN`、`目标可售天数`；缺失 ASIN 默认按 70 天计算。
+- `replenishment_column_order.csv`：补货明细列顺序配置，字段为 `列名`、`排序`；页面内可拖拽列名调整顺序并保存。
 
 `停提款时间` 为空表示店铺一直计入首页常规看板；填写月份后，从该月份开始含当月的数据不计入常规看板，只在提成预估中的“停提款店铺缺提成”单独展示。
 

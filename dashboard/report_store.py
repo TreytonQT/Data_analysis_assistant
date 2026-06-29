@@ -23,6 +23,8 @@ LATEST_SOURCE_DISPLAY_NAMES = {
     "operational_sales": "运营原始表",
     "gross_profit": "毛利原始表",
     "rating": "Rating",
+    "sales_volume_detail": "销量明细",
+    "sales_amount_detail": "销售额明细",
 }
 
 

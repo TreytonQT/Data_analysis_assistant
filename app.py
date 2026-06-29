@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 import hashlib
+import html
 from pathlib import Path
 
 import pandas as pd
 import plotly.express as px
 import streamlit as st
+import streamlit.components.v1 as components
 
 from dashboard.data_processing import (
     DEFAULT_REPLENISHMENT_TARGET_DAYS,
+    build_available_inventory_monitor_table,
+    build_department_performance_tables,
     build_discovered_commission_config,
     build_discovered_department_fee_config,
     build_alerts,
@@ -31,6 +35,8 @@ from dashboard.data_processing import (
     normalize_gross_profit_source,
     normalize_rating_source,
     normalize_replenishment_targets,
+    normalize_sales_amount_detail,
+    normalize_sales_volume_detail,
     normalize_store_config,
     normalize_target_config,
     product_management_columns,
@@ -59,12 +65,18 @@ from dashboard.report_store import (
 st.set_page_config(page_title="开发员销售数据看板", layout="wide")
 
 CONFIG_DIR = Path(__file__).resolve().parent / "configs"
+COMPONENT_DIR = Path(__file__).resolve().parent / "dashboard" / "components"
 METRIC_CONFIG_PATH = CONFIG_DIR / "metrics_config.csv"
 STORE_CONFIG_PATH = CONFIG_DIR / "store_config.csv"
 TARGET_CONFIG_PATH = CONFIG_DIR / "monthly_targets.csv"
 COMMISSION_CONFIG_PATH = CONFIG_DIR / "commission_config.csv"
 DEPARTMENT_FEE_CONFIG_PATH = CONFIG_DIR / "department_fee_config.csv"
 REPLENISHMENT_TARGET_PATH = CONFIG_DIR / "replenishment_targets.csv"
+REPLENISHMENT_COLUMN_ORDER_PATH = CONFIG_DIR / "replenishment_column_order.csv"
+replenishment_column_order_component = components.declare_component(
+    "replenishment_column_order",
+    path=str(COMPONENT_DIR / "column_order"),
+)
 
 
 NAV_ITEMS = {
@@ -72,6 +84,7 @@ NAV_ITEMS = {
     "销量看板": "📦 销量看板",
     "滞销提醒": "⏳ 滞销提醒",
     "产品管理": "🧾 产品管理",
+    "部门监控": "📍 部门监控",
     "补货管理": "🚚 补货管理",
     "上传中心": "⬆️ 上传中心",
     "配置中心": "⚙️ 配置中心",
@@ -339,6 +352,188 @@ def slow_moving_column_config():
     return config
 
 
+def available_inventory_monitor_column_config(df: pd.DataFrame):
+    return {
+        "库存总数": st.column_config.NumberColumn("库存总数", format="%.2f"),
+        "日均订单": st.column_config.NumberColumn("日均订单", format="%.2f"),
+        "总可售天数": st.column_config.NumberColumn("总可售天数", format="%.2f"),
+    }
+
+
+def available_inventory_monitor_styler(df: pd.DataFrame):
+    def style_row(row):
+        styles = []
+        for col, value in row.items():
+            style = ""
+            if col == "总可售天数":
+                numeric = pd.to_numeric(value, errors="coerce")
+                if pd.notna(numeric) and numeric > 120:
+                    style = "background-color: #fecaca; color: #7f1d1d; font-weight: 700;"
+                elif pd.notna(numeric) and numeric > 90:
+                    style = "background-color: #fef3c7; color: #78350f; font-weight: 700;"
+            styles.append(style)
+        return styles
+
+    return df.style.apply(style_row, axis=1)
+
+
+def department_performance_column_config(df: pd.DataFrame):
+    config = {
+        "在售产品数": st.column_config.NumberColumn("在售产品数", format="%d"),
+        "销售额贡献占比": st.column_config.NumberColumn("销售额贡献占比", format="percent"),
+        "近7天日均订单": st.column_config.NumberColumn("近7天日均订单", format="%.2f"),
+        "近7天日均销售额（元）": st.column_config.NumberColumn("近7天日均销售额（元）", format="%.2f"),
+        "预估本月销售额（元）": st.column_config.NumberColumn("预估本月销售额（元）", format="%.2f"),
+    }
+    for col in df.columns:
+        if col.endswith("销量"):
+            config[col] = st.column_config.NumberColumn(col, format="%d")
+        elif col.endswith("销售额（元）"):
+            config[col] = st.column_config.NumberColumn(col, format="%.2f")
+    return config
+
+
+def department_performance_styler(df: pd.DataFrame):
+    numeric_formats = {}
+    for col in df.columns:
+        if col == "销售额贡献占比":
+            numeric_formats[col] = "{:.2%}"
+        elif col == "在售产品数" or col.endswith("销量"):
+            numeric_formats[col] = "{:.0f}"
+        elif col in {"近7天日均订单", "近7天日均销售额（元）", "预估本月销售额（元）"} or col.endswith("销售额（元）"):
+            numeric_formats[col] = "{:.2f}"
+
+    def highlight_summary(row):
+        if row.name == 0:
+            return ["background-color: #fde68a; color: #111827; font-weight: 700;" for _ in row]
+        return ["" for _ in row]
+
+    return df.style.format(numeric_formats, na_rep="").apply(highlight_summary, axis=1)
+
+
+def compact_amount(value) -> str:
+    numeric = pd.to_numeric(value, errors="coerce")
+    if pd.isna(numeric):
+        return ""
+    if abs(numeric) >= 10000:
+        return f"{numeric / 10000:.1f}万"
+    return f"{numeric:.0f}" if float(numeric).is_integer() else f"{numeric:.1f}"
+
+
+def compact_number(value, decimals: int = 0) -> str:
+    numeric = pd.to_numeric(value, errors="coerce")
+    if pd.isna(numeric):
+        return ""
+    if decimals:
+        return f"{numeric:.{decimals}f}"
+    return f"{numeric:.0f}"
+
+
+def compact_percent(value) -> str:
+    numeric = pd.to_numeric(value, errors="coerce")
+    if pd.isna(numeric):
+        return ""
+    if abs(numeric - 1) < 0.000001:
+        return "100%"
+    return f"{numeric:.1%}"
+
+
+def department_performance_compact_html(title: str, df: pd.DataFrame) -> str:
+    date_labels = []
+    for col in df.columns:
+        if col.endswith("销量") and "月" in col:
+            label = col.removesuffix("销量")
+            amount_col = f"{label}销售额（元）"
+            if amount_col in df.columns:
+                date_labels.append(label)
+
+    fixed_headers = [
+        ("开发员", "开发员"),
+        ("在售产品数", "在售<br>产品数"),
+        ("销售额贡献占比", "销售额<br>贡献占比"),
+        ("近7天日均订单", "近7天<br>日均订单"),
+        ("近7天日均销售额（元）", "近7天日均<br>销售额"),
+        ("预估本月销售额（元）", "预估本月<br>销售额"),
+    ]
+    colspan = len(fixed_headers) + len(date_labels) * 2
+    parts = [
+        """
+        <style>
+        .dept-perf-table {
+            width: 100%;
+            border-collapse: collapse;
+            table-layout: fixed;
+            margin: 0.25rem 0 1rem 0;
+            font-size: 0.76rem;
+            line-height: 1.15;
+            background: #f8fafc;
+            color: #050505;
+        }
+        .dept-perf-table th,
+        .dept-perf-table td {
+            border: 1px solid #1f2937;
+            padding: 0.22rem 0.25rem;
+            text-align: center;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: clip;
+        }
+        .dept-perf-table .title {
+            background: #c7ece9;
+            font-size: 1.05rem;
+            font-weight: 800;
+            padding: 0.38rem;
+        }
+        .dept-perf-table .fixed-head,
+        .dept-perf-table .date-head,
+        .dept-perf-table .sub-head {
+            background: #d8f1ef;
+            font-weight: 800;
+        }
+        .dept-perf-table .summary td {
+            background: #fff200;
+            font-weight: 800;
+        }
+        .dept-perf-table .metric {
+            background: #fff7d6;
+        }
+        .dept-perf-table .name-col { width: 5.6%; }
+        .dept-perf-table .small-col { width: 5.1%; }
+        .dept-perf-table .mid-col { width: 6.1%; }
+        .dept-perf-table .daily-col { width: 4.45%; }
+        </style>
+        """,
+        '<table class="dept-perf-table">',
+        f'<thead><tr><th class="title" colspan="{colspan}">{html.escape(title)}业绩排行榜</th></tr>',
+        "<tr>",
+    ]
+    for idx, (_, label) in enumerate(fixed_headers):
+        cls = "name-col" if idx == 0 else ("mid-col" if idx >= 3 else "small-col")
+        parts.append(f'<th class="fixed-head {cls}" rowspan="2">{label}</th>')
+    for label in date_labels:
+        parts.append(f'<th class="date-head" colspan="2">{html.escape(label)}</th>')
+    parts.append("</tr><tr>")
+    for _ in date_labels:
+        parts.append('<th class="sub-head daily-col">销量</th><th class="sub-head daily-col">销售额</th>')
+    parts.append("</tr></thead><tbody>")
+
+    for row_index, row in df.iterrows():
+        row_class = ' class="summary"' if row_index == 0 else ""
+        parts.append(f"<tr{row_class}>")
+        parts.append(f"<td>{html.escape(str(row['开发员']))}</td>")
+        parts.append(f"<td class=\"metric\">{compact_number(row.get('在售产品数'))}</td>")
+        parts.append(f"<td class=\"metric\">{compact_percent(row.get('销售额贡献占比'))}</td>")
+        parts.append(f"<td class=\"metric\">{compact_number(row.get('近7天日均订单'), 0)}</td>")
+        parts.append(f"<td class=\"metric\">{compact_amount(row.get('近7天日均销售额（元）'))}</td>")
+        parts.append(f"<td class=\"metric\">{compact_amount(row.get('预估本月销售额（元）'))}</td>")
+        for label in date_labels:
+            parts.append(f"<td>{compact_number(row.get(f'{label}销量'))}</td>")
+            parts.append(f"<td>{compact_amount(row.get(f'{label}销售额（元）'))}</td>")
+        parts.append("</tr>")
+    parts.append("</tbody></table>")
+    return "".join(parts)
+
+
 def plot_sales_bar(df, x, y, title):
     if df.empty or x not in df.columns or y not in df.columns:
         return
@@ -512,6 +707,54 @@ def merge_config_rows_by_keys(existing, discovered, key_cols):
     return combined.drop_duplicates(subset=key_cols, keep="first").reset_index(drop=True)
 
 
+def prepare_commission_editor_df(commission_config):
+    editor_df = commission_config.copy()
+    for col in ["月份", "开发员", "库存计提", "弃置", "职位提点"]:
+        if col in editor_df.columns:
+            editor_df[col] = editor_df[col].fillna("").astype(str)
+    return editor_df
+
+
+def commission_editor_column_config(reports):
+    month_options = [""] + sorted(reports["月份"].dropna().unique().tolist()) if reports is not None and not reports.empty else [""]
+    return {
+        "月份": st.column_config.SelectboxColumn(
+            "月份",
+            options=month_options,
+            format_func=lambda value: "" if not value else month_label(value),
+            required=True,
+        ),
+        "开发员": st.column_config.TextColumn("开发员", required=True),
+        "库存计提": st.column_config.TextColumn("库存计提"),
+        "弃置": st.column_config.TextColumn("弃置"),
+        "职位提点": st.column_config.TextColumn("职位提点", help="可填 8%、0.08 或 8。"),
+    }
+
+
+def prepare_department_fee_editor_df(department_fee_config):
+    editor_df = department_fee_config.copy()
+    for col in ["月份", "部门", "费用率"]:
+        if col in editor_df.columns:
+            editor_df[col] = editor_df[col].fillna("").astype(str)
+    return editor_df
+
+
+def prepare_target_editor_df(target_config):
+    editor_df = target_config.copy()
+    for col in ["开发员", "目标业绩", "目标毛利率"]:
+        if col in editor_df.columns:
+            editor_df[col] = editor_df[col].fillna("").astype(str)
+    return editor_df
+
+
+def target_editor_column_config():
+    return {
+        "开发员": st.column_config.TextColumn("开发员", required=True),
+        "目标业绩": st.column_config.TextColumn("目标业绩"),
+        "目标毛利率": st.column_config.TextColumn("目标毛利率", help="可填 22%、0.22 或 22。"),
+    }
+
+
 def build_discovered_store_config(reports):
     if reports is None or reports.empty:
         return normalize_store_config(pd.DataFrame()).fillna("")
@@ -584,11 +827,12 @@ def render_business_config_editors(reports=None):
 
     st.markdown("**目标配置**")
     edited_target = st.data_editor(
-        target_config,
+        prepare_target_editor_df(target_config),
         num_rows="dynamic",
         use_container_width=True,
         hide_index=True,
         key="target_config_editor",
+        column_config=target_editor_column_config(),
     )
     if st.button("保存目标配置", use_container_width=True):
         saved = normalize_target_config(edited_target).fillna("")
@@ -598,7 +842,7 @@ def render_business_config_editors(reports=None):
     st.markdown("**部门费用率配置**")
     st.caption("按月份和店铺所属部门维护费用率；可填 8%、0.08 或 8。提成计算会按店铺所属部门套用对应费用率。")
     edited_department_fee = st.data_editor(
-        department_fee_config.fillna(""),
+        prepare_department_fee_editor_df(department_fee_config),
         num_rows="dynamic",
         use_container_width=True,
         hide_index=True,
@@ -619,11 +863,12 @@ def render_business_config_editors(reports=None):
     st.markdown("**提成配置**")
     st.caption("按月份和开发员维护库存计提、弃置和职位提点；职位提点可填 8%、0.08 或 8。")
     edited_commission = st.data_editor(
-        commission_config.fillna(""),
+        prepare_commission_editor_df(commission_config),
         num_rows="dynamic",
         use_container_width=True,
         hide_index=True,
         key="commission_config_editor",
+        column_config=commission_editor_column_config(reports),
     )
     if st.button("保存提成配置", use_container_width=True):
         saved = normalize_commission_config(edited_commission).fillna("")
@@ -921,15 +1166,17 @@ def render_sales_dashboard_page():
 
     total_onsale = stores["在售个数"].sum()
     total_yesterday = stores["昨日订单"].sum()
+    total_26_orders = stores["-26订单"].sum()
     total_7_avg = stores["7天日均"].sum()
     total_30_avg = stores["30天日均"].sum()
     total_stock = stores["总库存"].sum()
-    kpi_cols = st.columns(5)
+    kpi_cols = st.columns(6)
     kpi_cols[0].metric("在售个数", f"{total_onsale:,.0f}")
     kpi_cols[1].metric("昨日订单", f"{total_yesterday:,.0f}")
-    kpi_cols[2].metric("7天日均", f"{total_7_avg:,.2f}")
-    kpi_cols[3].metric("30天日均", f"{total_30_avg:,.2f}")
-    kpi_cols[4].metric("总库存", f"{total_stock:,.0f}")
+    kpi_cols[2].metric("-26订单", f"{total_26_orders:,.0f}")
+    kpi_cols[3].metric("7天日均", f"{total_7_avg:,.2f}")
+    kpi_cols[4].metric("30天日均", f"{total_30_avg:,.2f}")
+    kpi_cols[5].metric("总库存", f"{total_stock:,.0f}")
 
     chart_cols = st.columns(3)
     with chart_cols[0]:
@@ -1025,6 +1272,82 @@ def render_slow_moving_inventory_page():
     )
 
 
+def render_department_monitor_page():
+    st.title("部门监控")
+    source_path = get_latest_source_path("operational_sales")
+    if source_path is None:
+        st.info("请先到“上传中心”上传运营原始表。")
+        return
+
+    try:
+        operational_data = read_local_table(source_path)
+    except Exception as exc:
+        st.error(f"运营原始表读取失败：{exc}")
+        return
+
+    performance_paths = {
+        "销量明细": get_latest_source_path("sales_volume_detail"),
+        "销售额明细": get_latest_source_path("sales_amount_detail"),
+    }
+    missing_performance = [name for name, path in performance_paths.items() if path is None]
+    if missing_performance:
+        st.info("请先到“上传中心”上传：" + "、".join(missing_performance))
+    else:
+        try:
+            volume_data = read_local_table(performance_paths["销量明细"])
+            amount_data = read_local_table(performance_paths["销售额明细"])
+            performance_tables = build_department_performance_tables(operational_data, volume_data, amount_data)
+        except Exception as exc:
+            st.error(f"部门业绩看板无法读取或计算：{exc}")
+            performance_tables = {}
+
+        for title, table in performance_tables.items():
+            if table.empty:
+                st.info(f"{title} 暂无可展示数据。")
+                continue
+            st.markdown(department_performance_compact_html(title, table), unsafe_allow_html=True)
+            st.download_button(
+                f"导出{title} CSV",
+                data=table.to_csv(index=False, encoding="utf-8-sig"),
+                file_name=f"department_performance_{title}.csv",
+                mime="text/csv",
+            )
+
+    st.divider()
+    st.subheader("可售天数监控")
+    try:
+        monitor_table = build_available_inventory_monitor_table(operational_data)
+    except Exception as exc:
+        st.error(f"可售天数监控无法计算：{exc}")
+        return
+
+    if monitor_table.empty:
+        st.warning("当前运营原始表没有可展示的开发员可售天数监控数据。")
+        return
+
+    days_values = pd.to_numeric(monitor_table["总可售天数"], errors="coerce")
+    kpi_cols = st.columns(3)
+    kpi_cols[0].metric("开发员数", f"{len(monitor_table):,.0f}")
+    kpi_cols[1].metric(">90天开发员", f"{days_values.gt(90).sum():,.0f}")
+    kpi_cols[2].metric(">120天开发员", f"{days_values.gt(120).sum():,.0f}")
+
+    st.caption("库存总数 = 可售 + 待调仓 + 调仓中 + 待入库 + 采购在途 + 本地库存 + 在途 + 计划入库；总可售天数 = 库存总数 / 日均订单。")
+    st.dataframe(
+        available_inventory_monitor_styler(monitor_table),
+        use_container_width=True,
+        hide_index=True,
+        column_config=available_inventory_monitor_column_config(monitor_table),
+    )
+
+    csv = monitor_table.to_csv(index=False, encoding="utf-8-sig")
+    st.download_button(
+        "导出可售天数监控 CSV",
+        data=csv,
+        file_name="available_inventory_monitor.csv",
+        mime="text/csv",
+    )
+
+
 def product_management_column_config():
     int_columns = ["可售数量", "昨天销量", "前天销量", "上前销量", "7天销量", "14天销量", "30天销量", "90天销量"]
     decimal_columns = ["可售天数", "日均销量", "销售额", "毛利润"]
@@ -1086,6 +1409,105 @@ def save_replenishment_target_config(targets: pd.DataFrame):
     normalized = normalize_replenishment_targets(targets)
     REPLENISHMENT_TARGET_PATH.parent.mkdir(parents=True, exist_ok=True)
     normalized.to_csv(REPLENISHMENT_TARGET_PATH, index=False, encoding="utf-8-sig")
+
+
+def load_replenishment_column_order() -> pd.DataFrame:
+    if not REPLENISHMENT_COLUMN_ORDER_PATH.exists():
+        return pd.DataFrame(columns=["列名", "排序"])
+    data = read_local_table(REPLENISHMENT_COLUMN_ORDER_PATH)
+    for col in ["列名", "排序"]:
+        if col not in data.columns:
+            data[col] = pd.NA
+    data = data[["列名", "排序"]].copy()
+    data["列名"] = data["列名"].fillna("").astype(str).str.strip()
+    data["排序"] = pd.to_numeric(data["排序"], errors="coerce")
+    data = data[data["列名"].ne("")].copy()
+    return data.drop_duplicates(subset=["列名"], keep="last").reset_index(drop=True)
+
+
+def save_replenishment_column_order(order_config: pd.DataFrame):
+    config = normalize_replenishment_column_order(order_config, list(order_config["列名"]))
+    REPLENISHMENT_COLUMN_ORDER_PATH.parent.mkdir(parents=True, exist_ok=True)
+    config.to_csv(REPLENISHMENT_COLUMN_ORDER_PATH, index=False, encoding="utf-8-sig")
+
+
+def replenishment_column_order_from_columns(columns: list[str]) -> pd.DataFrame:
+    return pd.DataFrame(
+        {"列名": list(columns), "排序": list(range(1, len(columns) + 1))},
+        columns=["列名", "排序"],
+    )
+
+
+def normalize_replenishment_column_order(order_config: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
+    existing = order_config.copy() if order_config is not None else pd.DataFrame(columns=["列名", "排序"])
+    for col in ["列名", "排序"]:
+        if col not in existing.columns:
+            existing[col] = pd.NA
+    existing = existing[["列名", "排序"]].copy()
+    existing["列名"] = existing["列名"].fillna("").astype(str).str.strip()
+    existing["排序"] = pd.to_numeric(existing["排序"], errors="coerce")
+    existing = existing[existing["列名"].isin(columns)].drop_duplicates(subset=["列名"], keep="last")
+    order_lookup = existing.set_index("列名")["排序"].to_dict()
+    rows = []
+    for default_index, column in enumerate(columns, start=1):
+        order_value = order_lookup.get(column)
+        rows.append({"列名": column, "排序": default_index if pd.isna(order_value) else int(order_value)})
+    return pd.DataFrame(rows).sort_values(["排序", "列名"], kind="stable").reset_index(drop=True)
+
+
+def apply_replenishment_column_order(df: pd.DataFrame, order_config: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df.copy()
+    normalized = normalize_replenishment_column_order(order_config, list(df.columns))
+    ordered_columns = [col for col in normalized["列名"].tolist() if col in df.columns]
+    remaining_columns = [col for col in df.columns if col not in ordered_columns]
+    return df[ordered_columns + remaining_columns].copy()
+
+
+def render_replenishment_column_order_editor(detail: pd.DataFrame) -> pd.DataFrame:
+    saved_order = load_replenishment_column_order()
+    normalized_order = normalize_replenishment_column_order(saved_order, list(detail.columns))
+    with st.expander("列顺序配置"):
+        st.caption("拖拽列名调整补货明细显示顺序，保存后刷新页面仍按该顺序显示。")
+        available_columns = list(detail.columns)
+        current_columns = normalized_order["列名"].tolist()
+        preview_columns = st.session_state.get("replenishment_column_order_preview")
+        if isinstance(preview_columns, list):
+            preview_columns = [str(column) for column in preview_columns if str(column) in available_columns]
+            if preview_columns:
+                current_columns = normalize_replenishment_column_order(
+                    replenishment_column_order_from_columns(preview_columns),
+                    available_columns,
+                )["列名"].tolist()
+        dragged_columns = replenishment_column_order_component(
+            columns=current_columns,
+            key="replenishment_column_order_dragger",
+            height=180,
+            default=current_columns,
+        )
+        if isinstance(dragged_columns, list):
+            column_names = {str(column) for column in available_columns}
+            dragged_columns = [str(column) for column in dragged_columns if str(column) in column_names]
+            st.session_state["replenishment_column_order_preview"] = dragged_columns
+        else:
+            dragged_columns = current_columns
+        preview_order = normalize_replenishment_column_order(
+            replenishment_column_order_from_columns(dragged_columns),
+            available_columns,
+        )
+        col1, col2, _ = st.columns([1, 1, 4])
+        if col1.button("保存列顺序", use_container_width=True):
+            save_replenishment_column_order(preview_order)
+            st.session_state.pop("replenishment_column_order_preview", None)
+            st.success("列顺序已保存。")
+            st.rerun()
+        if col2.button("恢复默认顺序", use_container_width=True):
+            if REPLENISHMENT_COLUMN_ORDER_PATH.exists():
+                REPLENISHMENT_COLUMN_ORDER_PATH.unlink()
+            st.session_state.pop("replenishment_column_order_preview", None)
+            st.success("已恢复默认列顺序。")
+            st.rerun()
+    return preview_order
 
 
 def merge_replenishment_target_config(base: pd.DataFrame, overrides: pd.DataFrame | None) -> pd.DataFrame:
@@ -1207,16 +1629,18 @@ def render_replenishment_management_page():
         )
 
     st.subheader("补货明细")
-    disabled_columns = [col for col in detail.columns if col != "目标可售天数"]
+    column_order = render_replenishment_column_order_editor(detail)
+    display_detail = apply_replenishment_column_order(detail, column_order)
+    disabled_columns = [col for col in display_detail.columns if col != "目标可售天数"]
     edited_detail = st.data_editor(
-        replenishment_margin_styler(detail),
+        replenishment_margin_styler(display_detail),
         use_container_width=True,
         hide_index=True,
         disabled=disabled_columns,
         column_config=replenishment_column_config(editable=True),
         key="replenishment_target_editor",
     )
-    if replenishment_targets_changed(detail, edited_detail):
+    if replenishment_targets_changed(display_detail, edited_detail):
         st.session_state["replenishment_target_overrides"] = merge_replenishment_target_config(
             target_config,
             replenishment_targets_from_detail(edited_detail),
@@ -1230,7 +1654,7 @@ def render_replenishment_management_page():
         st.success("目标可售天数已保存。")
         st.rerun()
 
-    csv = detail.to_csv(index=False, encoding="utf-8-sig")
+    csv = display_detail.to_csv(index=False, encoding="utf-8-sig")
     st.download_button(
         "导出补货管理表 CSV",
         data=csv,
@@ -1334,36 +1758,59 @@ def render_product_management_page():
 
 def render_upload_center(records):
     st.title("上传中心")
-    report_files = st.file_uploader("业绩报表 CSV", type=["csv"], accept_multiple_files=True)
-    try:
-        process_report_uploads(report_files)
-    except Exception as exc:
-        st.error(f"业绩报表保存失败：{exc}")
-    render_upload_records(load_upload_records())
+    st.subheader("个人监控数据源")
+    personal_cols = st.columns(2)
+    with personal_cols[0]:
+        operational_file = st.file_uploader("运营原始表 XLS/XLSX", type=["xls", "xlsx"], accept_multiple_files=False)
+        try:
+            process_operational_sales_upload(operational_file)
+        except Exception as exc:
+            st.error(f"运营原始表保存失败：{exc}")
+        render_operational_sales_source_record()
+
+    with personal_cols[1]:
+        report_files = st.file_uploader("业绩报表 CSV", type=["csv"], accept_multiple_files=True)
+        try:
+            process_report_uploads(report_files)
+        except Exception as exc:
+            st.error(f"业绩报表保存失败：{exc}")
+        render_upload_records(load_upload_records())
+
+    personal_cols = st.columns(2)
+    with personal_cols[0]:
+        gross_profit_file = st.file_uploader("毛利原始表 CSV/XLS/XLSX", type=["csv", "xls", "xlsx"], accept_multiple_files=False, key="gross_profit_upload")
+        try:
+            process_latest_source_upload(gross_profit_file, "gross_profit", "毛利原始表", normalize_gross_profit_source)
+        except Exception as exc:
+            st.error(f"毛利原始表保存失败：{exc}")
+        render_latest_source_record("毛利原始表", load_latest_source_record("gross_profit"))
+
+    with personal_cols[1]:
+        rating_file = st.file_uploader("Rating XLS/XLSX", type=["xls", "xlsx"], accept_multiple_files=False, key="rating_upload")
+        try:
+            process_latest_source_upload(rating_file, "rating", "Rating", normalize_rating_source)
+        except Exception as exc:
+            st.error(f"Rating保存失败：{exc}")
+        render_latest_source_record("Rating", load_latest_source_record("rating"))
 
     st.divider()
-    operational_file = st.file_uploader("运营原始表 XLS/XLSX", type=["xls", "xlsx"], accept_multiple_files=False)
-    try:
-        process_operational_sales_upload(operational_file)
-    except Exception as exc:
-        st.error(f"运营原始表保存失败：{exc}")
-    render_operational_sales_source_record()
+    st.subheader("部门监控数据源")
+    department_cols = st.columns(2)
+    with department_cols[0]:
+        sales_volume_file = st.file_uploader("销量明细 CSV", type=["csv"], accept_multiple_files=False, key="sales_volume_detail_upload")
+        try:
+            process_latest_source_upload(sales_volume_file, "sales_volume_detail", "销量明细", normalize_sales_volume_detail)
+        except Exception as exc:
+            st.error(f"销量明细保存失败：{exc}")
+        render_latest_source_record("销量明细", load_latest_source_record("sales_volume_detail"))
 
-    st.divider()
-    gross_profit_file = st.file_uploader("毛利原始表 CSV/XLS/XLSX", type=["csv", "xls", "xlsx"], accept_multiple_files=False, key="gross_profit_upload")
-    try:
-        process_latest_source_upload(gross_profit_file, "gross_profit", "毛利原始表", normalize_gross_profit_source)
-    except Exception as exc:
-        st.error(f"毛利原始表保存失败：{exc}")
-    render_latest_source_record("毛利原始表", load_latest_source_record("gross_profit"))
-
-    st.divider()
-    rating_file = st.file_uploader("Rating XLS/XLSX", type=["xls", "xlsx"], accept_multiple_files=False, key="rating_upload")
-    try:
-        process_latest_source_upload(rating_file, "rating", "Rating", normalize_rating_source)
-    except Exception as exc:
-        st.error(f"Rating保存失败：{exc}")
-    render_latest_source_record("Rating", load_latest_source_record("rating"))
+    with department_cols[1]:
+        sales_amount_file = st.file_uploader("销售额明细 CSV", type=["csv"], accept_multiple_files=False, key="sales_amount_detail_upload")
+        try:
+            process_latest_source_upload(sales_amount_file, "sales_amount_detail", "销售额明细", normalize_sales_amount_detail)
+        except Exception as exc:
+            st.error(f"销售额明细保存失败：{exc}")
+        render_latest_source_record("销售额明细", load_latest_source_record("sales_amount_detail"))
 
 
 def render_config_center(metric_config_df, records):
@@ -1436,6 +1883,8 @@ def main():
         render_slow_moving_inventory_page()
     elif page == "产品管理":
         render_product_management_page()
+    elif page == "部门监控":
+        render_department_monitor_page()
     elif page == "补货管理":
         render_replenishment_management_page()
     elif page == "上传中心":

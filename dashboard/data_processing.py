@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import calendar
 import re
 import unicodedata
 from pathlib import Path
@@ -71,6 +72,38 @@ AGING_CAPITAL_COLUMNS = [
 ]
 OPERATIONAL_AGING_REQUIRED_COLUMNS = ["MSKU", "开发员", "ASIN"] + AGING_STOCK_COLUMNS + AGING_CAPITAL_COLUMNS
 REPLENISHMENT_STOCK_COMPONENT_COLUMNS = ["可售", "待入库", "采购在途", "本地库存", "在途", "计划入库"]
+AVAILABLE_INVENTORY_STOCK_COLUMNS = [
+    "可售",
+    "待调仓",
+    "调仓中",
+    "待入库",
+    "采购在途",
+    "本地库存",
+    "在途",
+    "计划入库",
+]
+AVAILABLE_INVENTORY_REQUIRED_COLUMNS = ["开发员", "日均销量"] + AVAILABLE_INVENTORY_STOCK_COLUMNS
+AVAILABLE_INVENTORY_SUMMARY_COLUMNS = ["开发员"] + AVAILABLE_INVENTORY_STOCK_COLUMNS + [
+    "库存总数",
+    "日均单量",
+    "总可售天数",
+]
+AVAILABLE_INVENTORY_MONITOR_COLUMNS = ["开发员", "库存总数", "日均订单", "总可售天数"]
+SALES_VOLUME_DETAIL_REQUIRED_COLUMNS = ["msku", "店铺", "开发专员"]
+SALES_AMOUNT_DETAIL_REQUIRED_COLUMNS = ["msku", "店铺", "开发专员"]
+DEPARTMENT_PERFORMANCE_FIXED_COLUMNS = [
+    "开发员",
+    "在售产品数",
+    "销售额贡献占比",
+    "近7天日均订单",
+    "近7天日均销售额（元）",
+    "预估本月销售额（元）",
+]
+DEPARTMENT_PERFORMANCE_BOARDS = [
+    ("运营20部", "20"),
+    ("联合部门", "union"),
+    ("人员业绩贡献总计", "all"),
+]
 REPLENISHMENT_OPERATIONAL_REQUIRED_COLUMNS = [
     "ASIN",
     "MSKU",
@@ -708,6 +741,277 @@ def slow_moving_inventory_columns() -> list[str]:
     ]
 
 
+def normalize_available_inventory_monitor(df: pd.DataFrame) -> pd.DataFrame:
+    missing = [col for col in AVAILABLE_INVENTORY_REQUIRED_COLUMNS if col not in df.columns]
+    if missing:
+        raise ValueError(f"运营原始表缺少可售监控列：{', '.join(missing)}")
+
+    base = df[AVAILABLE_INVENTORY_REQUIRED_COLUMNS].copy()
+    base["开发员"] = base["开发员"].fillna("").astype(str).str.strip()
+    base = base[base["开发员"].ne("")].copy()
+    for col in ["日均销量"] + AVAILABLE_INVENTORY_STOCK_COLUMNS:
+        base[col] = normalize_config_number(base[col]).fillna(0)
+
+    if base.empty:
+        return pd.DataFrame(columns=AVAILABLE_INVENTORY_SUMMARY_COLUMNS)
+
+    grouped = (
+        base.groupby("开发员", dropna=False, sort=True)[["日均销量"] + AVAILABLE_INVENTORY_STOCK_COLUMNS]
+        .sum()
+        .reset_index()
+    )
+    grouped["库存总数"] = grouped[AVAILABLE_INVENTORY_STOCK_COLUMNS].sum(axis=1)
+    grouped["日均单量"] = grouped["日均销量"]
+    grouped["总可售天数"] = grouped.apply(lambda row: safe_blank_ratio(row["库存总数"], row["日均单量"]), axis=1)
+    return grouped[AVAILABLE_INVENTORY_SUMMARY_COLUMNS].reset_index(drop=True)
+
+
+def build_available_inventory_monitor_table(df: pd.DataFrame) -> pd.DataFrame:
+    summary = normalize_available_inventory_monitor(df)
+    if summary.empty:
+        return pd.DataFrame(columns=AVAILABLE_INVENTORY_MONITOR_COLUMNS)
+
+    result = summary[["开发员", "库存总数", "日均单量", "总可售天数"]].rename(columns={"日均单量": "日均订单"})
+    return result[AVAILABLE_INVENTORY_MONITOR_COLUMNS].reset_index(drop=True)
+
+
+def sales_detail_date_columns(df: pd.DataFrame, suffix: str) -> list[str]:
+    pattern = re.compile(r"^\d{2}-\d{2}" + re.escape(suffix) + r"$")
+    return [col for col in df.columns if pattern.fullmatch(str(col).strip())]
+
+
+def normalize_sales_volume_detail(df: pd.DataFrame) -> pd.DataFrame:
+    return normalize_sales_metric_detail(df, SALES_VOLUME_DETAIL_REQUIRED_COLUMNS, "销量")
+
+
+def normalize_sales_amount_detail(df: pd.DataFrame) -> pd.DataFrame:
+    return normalize_sales_metric_detail(df, SALES_AMOUNT_DETAIL_REQUIRED_COLUMNS, "销售额")
+
+
+def normalize_sales_metric_detail(df: pd.DataFrame, required_columns: list[str], suffix: str) -> pd.DataFrame:
+    missing = [col for col in required_columns if col not in df.columns]
+    date_columns = sales_detail_date_columns(df, suffix)
+    if missing:
+        raise ValueError(f"{suffix}明细缺少列：{', '.join(missing)}")
+    if not date_columns:
+        raise ValueError(f"{suffix}明细缺少 MM-DD{suffix} 日期列")
+
+    result = df[required_columns + date_columns].copy()
+    for col in required_columns:
+        result[col] = result[col].fillna("").astype(str).str.strip()
+    result["msku"] = result["msku"].str.replace(r"^\t+", "", regex=True)
+    result["人员"] = result["开发专员"].map(normalize_department_person_name)
+    result["店铺前缀"] = result["店铺"].map(extract_department_store_prefix)
+    for col in date_columns:
+        result[col] = normalize_config_number(result[col]).fillna(0)
+    return result
+
+
+def normalize_department_person_name(value) -> str:
+    if pd.isna(value):
+        return ""
+    text = str(value).strip()
+    if not text or text == "--":
+        return ""
+    text = re.sub(r"^运营[一二三四五六七八九十百千万0-9]+部-", "", text)
+    text = re.sub(r"-26$", "", text)
+    return text.strip()
+
+
+def extract_department_store_prefix(value) -> str:
+    match = re.match(r"^\s*(\d+)-", str(value).strip())
+    return match.group(1) if match else ""
+
+
+def department_scope_mask(df: pd.DataFrame, scope: str) -> pd.Series:
+    if scope == "20":
+        return df["店铺前缀"].eq("20")
+    if scope == "union":
+        return df["店铺前缀"].isin(["6", "7"])
+    return pd.Series(True, index=df.index)
+
+
+def department_metric_columns_for_dates(dates: list[pd.Timestamp], suffix: str) -> list[str]:
+    return [f"{date.strftime('%m-%d')}{suffix}" for date in dates]
+
+
+def department_month_dates(today: pd.Timestamp) -> list[pd.Timestamp]:
+    month_start = today.replace(day=1)
+    if today.day == 1:
+        return []
+    return list(pd.date_range(month_start, today - pd.Timedelta(days=1), freq="D"))
+
+
+def department_performance_daily_columns(dates: list[pd.Timestamp]) -> list[str]:
+    columns = []
+    for date in dates:
+        label = f"{date.month}月{date.day}日"
+        columns.extend([f"{label}销量", f"{label}销售额（元）"])
+    return columns
+
+
+def department_performance_columns(dates: list[pd.Timestamp]) -> list[str]:
+    return DEPARTMENT_PERFORMANCE_FIXED_COLUMNS + department_performance_daily_columns(dates)
+
+
+def build_department_performance_tables(
+    operational_df: pd.DataFrame,
+    volume_df: pd.DataFrame,
+    amount_df: pd.DataFrame,
+    today=None,
+) -> dict[str, pd.DataFrame]:
+    today_ts = pd.Timestamp(today).normalize() if today is not None else pd.Timestamp.today().normalize()
+    window_dates = [today_ts - pd.Timedelta(days=offset) for offset in range(1, 8)]
+    volume = normalize_sales_volume_detail(volume_df)
+    amount = normalize_sales_amount_detail(amount_df)
+    volume_date_cols = department_metric_columns_for_dates(window_dates, "销量")
+    amount_date_cols = department_metric_columns_for_dates(window_dates, "销售额")
+    missing_volume = [col for col in volume_date_cols if col not in volume.columns]
+    missing_amount = [col for col in amount_date_cols if col not in amount.columns]
+    if missing_volume:
+        raise ValueError(f"销量明细缺少近7天日期列：{', '.join(missing_volume)}")
+    if missing_amount:
+        raise ValueError(f"销售额明细缺少近7天日期列：{', '.join(missing_amount)}")
+
+    month_dates = department_month_dates(today_ts)
+    month_amount_cols = [col for col in department_metric_columns_for_dates(month_dates, "销售额") if col in amount.columns]
+    remaining_days = calendar.monthrange(today_ts.year, today_ts.month)[1] - today_ts.day + 1
+    onsale_counts = build_department_onsale_counts(operational_df)
+    tables = {}
+    for title, scope in DEPARTMENT_PERFORMANCE_BOARDS:
+        volume_scope = volume[department_scope_mask(volume, scope)].copy()
+        amount_scope = amount[department_scope_mask(amount, scope)].copy()
+        tables[title] = build_department_performance_table_for_scope(
+            title,
+            scope,
+            volume_scope,
+            amount_scope,
+            window_dates,
+            volume_date_cols,
+            amount_date_cols,
+            month_amount_cols,
+            remaining_days,
+            onsale_counts,
+        )
+    return tables
+
+
+def build_department_performance_table_for_scope(
+    title: str,
+    scope: str,
+    volume: pd.DataFrame,
+    amount: pd.DataFrame,
+    window_dates: list[pd.Timestamp],
+    volume_date_cols: list[str],
+    amount_date_cols: list[str],
+    month_amount_cols: list[str],
+    remaining_days: int,
+    onsale_counts: dict[tuple[str, str | None], int],
+) -> pd.DataFrame:
+    people = sorted({person for person in volume["人员"].tolist() + amount["人员"].tolist() if person})
+    summary = build_department_performance_row(
+        title,
+        scope,
+        None,
+        volume,
+        amount,
+        window_dates,
+        volume_date_cols,
+        amount_date_cols,
+        month_amount_cols,
+        remaining_days,
+        onsale_counts,
+    )
+    denominator = summary["近7天日均销售额（元）"]
+    rows = [summary]
+    person_rows = []
+    for person in people:
+        person_rows.append(
+            build_department_performance_row(
+                person,
+                scope,
+                person,
+                volume[volume["人员"].eq(person)].copy(),
+                amount[amount["人员"].eq(person)].copy(),
+                window_dates,
+                volume_date_cols,
+                amount_date_cols,
+                month_amount_cols,
+                remaining_days,
+                onsale_counts,
+            )
+        )
+    person_rows = sorted(person_rows, key=lambda row: row["近7天日均销售额（元）"], reverse=True)
+    rows.extend(person_rows)
+    result = pd.DataFrame(rows)
+    result["销售额贡献占比"] = result["近7天日均销售额（元）"].map(lambda value: safe_blank_ratio(value, denominator))
+    return result[department_performance_columns(window_dates)].reset_index(drop=True)
+
+
+def build_department_performance_row(
+    label: str,
+    scope: str,
+    person: str | None,
+    volume: pd.DataFrame,
+    amount: pd.DataFrame,
+    window_dates: list[pd.Timestamp],
+    volume_date_cols: list[str],
+    amount_date_cols: list[str],
+    month_amount_cols: list[str],
+    remaining_days: int,
+    onsale_counts: dict[tuple[str, str | None], int],
+) -> dict:
+    total_volume_7 = volume[volume_date_cols].sum().sum() if not volume.empty else 0
+    total_amount_7 = amount[amount_date_cols].sum().sum() if not amount.empty else 0
+    month_amount = amount[month_amount_cols].sum().sum() if month_amount_cols and not amount.empty else 0
+    row = {
+        "开发员": label,
+        "在售产品数": onsale_counts.get((scope, person), 0),
+        "销售额贡献占比": 0,
+        "近7天日均订单": total_volume_7 / 7,
+        "近7天日均销售额（元）": total_amount_7 / 7,
+        "预估本月销售额（元）": month_amount + (total_amount_7 / 7) * remaining_days,
+    }
+    for date, volume_col, amount_col in zip(window_dates, volume_date_cols, amount_date_cols):
+        label_prefix = f"{date.month}月{date.day}日"
+        row[f"{label_prefix}销量"] = volume[volume_col].sum() if not volume.empty else 0
+        row[f"{label_prefix}销售额（元）"] = amount[amount_col].sum() if not amount.empty else 0
+    return row
+
+
+def build_department_onsale_counts(operational_df: pd.DataFrame) -> dict[tuple[str, str | None], int]:
+    required = ["MSKU", "店铺名称", "开发员", "可售"]
+    missing = [col for col in required if col not in operational_df.columns]
+    if missing:
+        raise ValueError(f"运营原始表缺少部门监控在售列：{', '.join(missing)}")
+
+    counts: dict[tuple[str, str | None], set[str]] = {}
+    base = operational_df[required].copy()
+    base["MSKU"] = base["MSKU"].fillna("").astype(str).str.strip()
+    base["开发员"] = base["开发员"].map(normalize_department_person_name)
+    base["可售"] = normalize_config_number(base["可售"]).fillna(0)
+    base = base[base["MSKU"].ne("") & base["可售"].gt(0)].copy()
+    for _, row in base.iterrows():
+        scopes = department_scopes_for_store_names(row["店铺名称"])
+        scopes.add("all")
+        for scope in scopes:
+            counts.setdefault((scope, None), set()).add(row["MSKU"])
+            if row["开发员"]:
+                counts.setdefault((scope, row["开发员"]), set()).add(row["MSKU"])
+    return {key: len(value) for key, value in counts.items()}
+
+
+def department_scopes_for_store_names(value) -> set[str]:
+    scopes = set()
+    for item in [part.strip() for part in str(value).split(",") if part.strip()]:
+        prefix = extract_department_store_prefix(item)
+        if prefix == "20":
+            scopes.add("20")
+        elif prefix in {"6", "7"}:
+            scopes.add("union")
+    return scopes
+
+
 def normalize_replenishment_targets(targets: pd.DataFrame | None) -> pd.DataFrame:
     if targets is None or targets.empty:
         return pd.DataFrame(columns=REPLENISHMENT_TARGET_COLUMNS)
@@ -1216,15 +1520,15 @@ def build_product_rating_columns(rating: pd.DataFrame) -> pd.DataFrame:
         .agg(Rating总数=("Rating总数", "max"), 评分=("评分", "mean"))
         .reset_index()
     )
-    result = grouped[["ASIN"]].drop_duplicates().copy()
-    for country in PRODUCT_COUNTRIES:
-        subset = grouped[grouped["国家"].eq(country)][["ASIN", "Rating总数", "评分"]].copy()
-        subset[f"{country}Rating"] = subset.apply(format_product_rating, axis=1)
-        result = result.merge(subset[["ASIN", f"{country}Rating"]], on="ASIN", how="left")
-    for col in product_rating_columns():
-        if col not in result.columns:
-            result[col] = ""
-    return result[["ASIN"] + product_rating_columns()]
+    country_order = {country: idx for idx, country in enumerate(PRODUCT_COUNTRIES)}
+    grouped["_国家排序"] = grouped["国家"].map(country_order).fillna(len(country_order))
+    best = grouped.sort_values(
+        ["ASIN", "Rating总数", "_国家排序"],
+        ascending=[True, False, True],
+        kind="stable",
+    ).drop_duplicates("ASIN", keep="first")
+    best["Rating"] = best.apply(format_product_rating, axis=1)
+    return best[["ASIN"] + product_rating_columns()].reset_index(drop=True)
 
 
 def columns_between(df: pd.DataFrame, start: str, end: str) -> list[str]:
@@ -1266,7 +1570,7 @@ def product_gross_columns() -> list[str]:
 
 
 def product_rating_columns() -> list[str]:
-    return [f"{country}Rating" for country in PRODUCT_COUNTRIES]
+    return ["Rating"]
 
 
 def product_management_columns() -> list[str]:
