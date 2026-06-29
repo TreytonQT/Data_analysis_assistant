@@ -3,6 +3,8 @@ import unittest
 import pandas as pd
 
 from dashboard.data_processing import (
+    build_available_inventory_monitor_table,
+    build_department_performance_tables,
     build_low_margin_product_table,
     build_product_management_table,
     build_replenishment_management_tables,
@@ -13,11 +15,15 @@ from dashboard.data_processing import (
     compute_stopped_commission_table,
     merge_business_config,
     normalize_commission_config,
+    normalize_available_inventory_monitor,
     normalize_config_number,
     normalize_department_fee_config,
+    normalize_department_person_name,
     normalize_product_operational,
     normalize_operational_aging,
     normalize_operational_sales,
+    normalize_sales_amount_detail,
+    normalize_sales_volume_detail,
     normalize_report,
     normalize_replenishment_targets,
     normalize_store_config,
@@ -554,10 +560,10 @@ class DataProcessingTests(unittest.TestCase):
     def rating_source(self):
         return pd.DataFrame(
             {
-                "ASIN": ["B001", "B001", "B001", "B002"],
-                "国家": ["德国", "德国", "法国", "德国"],
-                "Rating总数": [170, 173, 88, 0],
-                "评分": [4.1, 4.3, 3.8, ""],
+                "ASIN": ["B001", "B001", "B001", "B002", "B002"],
+                "国家": ["德国", "德国", "法国", "德国", "法国"],
+                "Rating总数": [170, 173, 188, 0, 8],
+                "评分": [4.1, 4.3, 3.8, "", 4.6],
             }
         )
 
@@ -583,6 +589,130 @@ class DataProcessingTests(unittest.TestCase):
                 "单品重量(g)": [80, 120, 50, 20],
             }
         )
+
+    def available_inventory_monitor_source(self):
+        return pd.DataFrame(
+            {
+                "开发员": ["A", "A", "B"],
+                "可售": [10, "20", 100],
+                "待调仓": [1, 2, 3],
+                "调仓中": [2, 3, 4],
+                "待入库": [3, 4, 5],
+                "采购在途": [4, 5, 6],
+                "本地库存": [5, 6, 7],
+                "在途": [6, 7, 8],
+                "计划入库": [7, "8", 9],
+                "日均销量": [1, "2", 0],
+            }
+        )
+
+    def test_available_inventory_monitor_requires_expected_columns(self):
+        with self.assertRaisesRegex(ValueError, "可售监控列"):
+            normalize_available_inventory_monitor(pd.DataFrame({"开发员": ["A"]}))
+
+    def test_available_inventory_monitor_groups_by_developer(self):
+        result = normalize_available_inventory_monitor(self.available_inventory_monitor_source()).set_index("开发员")
+
+        self.assertEqual(result.loc["A", "库存总数"], 93)
+        self.assertEqual(result.loc["A", "日均单量"], 3)
+        self.assertEqual(result.loc["A", "总可售天数"], 31)
+        self.assertEqual(result.loc["B", "库存总数"], 142)
+        self.assertEqual(result.loc["B", "日均单量"], 0)
+        self.assertTrue(pd.isna(result.loc["B", "总可售天数"]))
+
+    def test_available_inventory_monitor_table_uses_developers_as_rows(self):
+        result = build_available_inventory_monitor_table(self.available_inventory_monitor_source())
+
+        self.assertEqual(result.columns.tolist(), ["开发员", "库存总数", "日均订单", "总可售天数"])
+        indexed = result.set_index("开发员")
+        self.assertEqual(indexed.loc["A", "库存总数"], 93)
+        self.assertEqual(indexed.loc["A", "日均订单"], 3)
+        self.assertEqual(indexed.loc["A", "总可售天数"], 31)
+
+    def department_operational_source(self):
+        return pd.DataFrame(
+            {
+                "MSKU": ["S1", "S2", "S3", "S4"],
+                "店铺名称": ["20-A 德国", "20-B 法国", "6-C 德国,7-D 法国", "8-E 意大利"],
+                "开发员": ["运营二十部-陈千潼-26", "运营二十部-付凯乐", "运营六部-陈千潼", "运营二十部-杨国梁"],
+                "可售": [10, 0, 5, 3],
+            }
+        )
+
+    def department_volume_source(self):
+        return pd.DataFrame(
+            {
+                "msku": ["S1", "S2", "S3", "S4"],
+                "店铺": ["20-A 德国", "20-B 法国", "6-C 德国", "8-E 意大利"],
+                "开发专员": ["运营二十部-陈千潼-26", "运营二十部-付凯乐", "运营六部-陈千潼", "运营二十部-杨国梁"],
+                "06-09销量": [999, 999, 999, 999],
+                "06-08销量": [7, 1, 2, 4],
+                "06-07销量": [7, 1, 2, 4],
+                "06-06销量": [7, 1, 2, 4],
+                "06-05销量": [7, 1, 2, 4],
+                "06-04销量": [7, 1, 2, 4],
+                "06-03销量": [7, 1, 2, 4],
+                "06-02销量": [7, 1, 2, 4],
+                "06-01销量": [1, 1, 1, 1],
+            }
+        )
+
+    def department_amount_source(self):
+        return pd.DataFrame(
+            {
+                "msku": ["S1", "S2", "S3", "S4"],
+                "店铺": ["20-A 德国", "20-B 法国", "6-C 德国", "8-E 意大利"],
+                "开发专员": ["运营二十部-陈千潼-26", "运营二十部-付凯乐", "运营六部-陈千潼", "运营二十部-杨国梁"],
+                "06-09销售额": [9999, 9999, 9999, 9999],
+                "06-08销售额": [70, 14, 7, 100],
+                "06-07销售额": [70, 14, 7, 100],
+                "06-06销售额": [70, 14, 7, 100],
+                "06-05销售额": [70, 14, 7, 100],
+                "06-04销售额": [70, 14, 7, 100],
+                "06-03销售额": [70, 14, 7, 100],
+                "06-02销售额": [70, 14, 7, 100],
+                "06-01销售额": [10, 0, 0, 0],
+            }
+        )
+
+    def test_department_person_name_normalizes_department_and_26_suffix(self):
+        self.assertEqual(normalize_department_person_name("运营二十部-陈千潼-26"), "陈千潼")
+        self.assertEqual(normalize_department_person_name("运营六部-陈千潼"), "陈千潼")
+
+    def test_sales_detail_requires_date_columns(self):
+        with self.assertRaisesRegex(ValueError, "日期列"):
+            normalize_sales_volume_detail(pd.DataFrame({"msku": ["S1"], "店铺": ["20-A"], "开发专员": ["A"]}))
+        with self.assertRaisesRegex(ValueError, "日期列"):
+            normalize_sales_amount_detail(pd.DataFrame({"msku": ["S1"], "店铺": ["20-A"], "开发专员": ["A"]}))
+
+    def test_department_performance_tables_split_stores_and_exclude_today(self):
+        tables = build_department_performance_tables(
+            self.department_operational_source(),
+            self.department_volume_source(),
+            self.department_amount_source(),
+            today="2026-06-09",
+        )
+
+        twenty = tables["运营20部"].set_index("开发员")
+        self.assertEqual(twenty.index.tolist(), ["运营20部", "陈千潼", "付凯乐"])
+        self.assertEqual(twenty.loc["运营20部", "在售产品数"], 1)
+        self.assertEqual(twenty.loc["陈千潼", "在售产品数"], 1)
+        self.assertEqual(twenty.loc["付凯乐", "在售产品数"], 0)
+        self.assertEqual(twenty.loc["运营20部", "近7天日均订单"], 8)
+        self.assertEqual(twenty.loc["运营20部", "近7天日均销售额（元）"], 84)
+        self.assertAlmostEqual(twenty.loc["陈千潼", "销售额贡献占比"], 70 / 84)
+        self.assertEqual(twenty.loc["陈千潼", "预估本月销售额（元）"], 2040)
+        self.assertEqual(twenty.loc["运营20部", "6月8日销量"], 8)
+        self.assertEqual(twenty.loc["运营20部", "6月8日销售额（元）"], 84)
+
+        union = tables["联合部门"].set_index("开发员")
+        self.assertEqual(union.loc["联合部门", "在售产品数"], 1)
+        self.assertEqual(union.loc["联合部门", "近7天日均订单"], 2)
+        self.assertEqual(union.loc["联合部门", "近7天日均销售额（元）"], 7)
+
+        total = tables["人员业绩贡献总计"].set_index("开发员")
+        self.assertEqual(total.loc["人员业绩贡献总计", "在售产品数"], 3)
+        self.assertEqual(total.loc["人员业绩贡献总计", "近7天日均销售额（元）"], 191)
 
     def replenishment_gross_source(self):
         return pd.DataFrame(
@@ -685,6 +815,9 @@ class DataProcessingTests(unittest.TestCase):
         self.assertEqual(result["SKU"].tolist(), ["SKU1", "SKU2", "SKU3"])
         self.assertEqual(result["ASIN"].tolist(), ["B001", "B001", "B002"])
         self.assertNotIn("行类型", result.columns)
+        self.assertIn("Rating", result.columns)
+        for country in ["德国", "法国", "西班牙", "意大利"]:
+            self.assertNotIn(f"{country}Rating", result.columns)
         self.assertEqual(result.loc[0, "可售数量"], 10)
         self.assertEqual(result.loc[0, "可售天数"], 5)
         self.assertEqual(result.loc[1, "30天销量"], 90)
@@ -700,8 +833,8 @@ class DataProcessingTests(unittest.TestCase):
         self.assertAlmostEqual(sku1["销售额"], 440)
         self.assertAlmostEqual(sku1["毛利润"], 88)
         self.assertAlmostEqual(sku1["毛利率"], 88 / 440)
-        self.assertEqual(sku1["德国Rating"], "173(4.2)")
-        self.assertEqual(sku2["德国Rating"], "173(4.2)")
+        self.assertEqual(sku1["Rating"], "188(3.8)")
+        self.assertEqual(sku2["Rating"], "188(3.8)")
         self.assertEqual(sku2["法国销量"], 222)
         self.assertAlmostEqual(sku2["销售额"], 220)
         self.assertAlmostEqual(sku2["毛利润"], 44)
