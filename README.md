@@ -1,85 +1,101 @@
-# 开发员销售数据看板
+# 本地销售数据分析助手
 
-本项目是一个本地 Streamlit 数据看板，用来上传和维护多类销售原始表，并按开发员、月份、店铺、产品、库存库龄等维度生成经营分析。它不是通用 BI 工具，核心目标是把固定格式的业务报表清洗、合并、计算并展示成可筛选、可导出的看板。
+这是一个仅供单人、本机桌面使用的销售数据看板。React 负责界面，FastAPI 负责数据读取、校验、计算、缓存与导出；项目不包含登录、权限体系和手机端适配，也不再使用 Streamlit。
 
-## 快速启动
+服务默认只监听 `127.0.0.1:8000`，不会主动暴露到局域网。
 
-```powershell
-python -m pip install -r requirements.txt
-streamlit run app.py
-```
+## 首次安装
 
-如果只想验证数据处理逻辑：
+建议使用 Python 3.12 和 Node.js 20 或更高版本。
 
 ```powershell
-python -m unittest discover -s tests
+py -3.12 -m venv .venv
+.venv\Scripts\python.exe -m pip install -r requirements.txt
+
+cd frontend
+npm.cmd ci
+npm.cmd run build
+cd ..
 ```
 
-## 主要页面
+安装并构建完成后，双击 `start_dashboard.bat`，或在终端运行：
 
-- `首页`：上传的业绩报表分析入口，包含总览 KPI、月度趋势、开发员分析、店铺分析、开发员+店铺分析、异常预警和提成预估。
-- `销量看板`：基于运营原始表，按店铺和产品等级展示在售数、订单量、日均、库存等指标。
-- `滞销提醒`：基于运营原始表中的库龄列，计算 90 天以上库存、占用资金、库存计提和弃置费。
-- `产品管理`：合并运营原始表、毛利原始表和 Rating，生成 SKU 级产品管理明细，并单独列出低毛利率 SKU。
-- `补货管理`：合并运营原始表、毛利原始表和 Rating，按 ASIN 计算建议补货数量、异常原因、店铺分布和补货方式。
-- `上传中心`：上传业绩报表、运营原始表、毛利原始表和 Rating。上传后的文件保存在 `data/` 下，刷新页面后仍可继续分析。
-- `配置中心`：维护指标公式、店铺配置、目标配置、提成配置和部门费用率配置，保存后写回 `configs/`。
-
-## 数据来源
-
-- 业绩报表 CSV：用于首页和提成预估，必须包含 `销售专员`、`月份`、`店铺`，其余指标通过公式配置引用。
-- 运营原始表 XLS/XLSX：用于销量看板、滞销提醒和产品管理，关键列包括 `MSKU`、`店铺名称`、销量、库存、开发员和 ASIN。
-- 毛利原始表 CSV/XLS/XLSX：用于产品管理和低毛利率 SKU，关键列包括 ASIN、MSKU、国家、销售额区间列、销量列、毛利润和广告费列。
-- Rating XLS/XLSX：用于产品管理，关键列包括 ASIN、国家、Rating 总数和评分。
-
-上传文件由 `dashboard/report_store.py` 管理。多月份业绩报表会按月份记录，重复月份会替换旧记录；运营、毛利、Rating 属于“最新文件”类型，同类只保留最近一次上传。
-
-## 配置文件
-
-配置文件默认存放在 `configs/`：
-
-- `metrics_config.csv`：首页指标公式配置，字段为 `指标名称`、`显示分组`、`公式`、`格式`、`排序`、`是否启用`。
-- `store_config.csv`：店铺配置，字段为 `店铺名`、`店铺类型`、`停提款时间`、`店铺所属部门`。
-- `monthly_targets.csv`：开发员目标配置，字段为 `开发员`、`目标业绩`、`目标毛利率`。
-- `commission_config.csv`：提成配置，字段为 `月份`、`开发员`、`库存计提`、`弃置`、`职位提点`。
-- `department_fee_config.csv`：部门费用率配置，字段为 `月份`、`部门`、`费用率`。
-- `replenishment_targets.csv`：补货目标配置，字段为 `ASIN`、`目标可售天数`；缺失 ASIN 默认按 70 天计算。
-- `replenishment_column_order.csv`：补货明细列顺序配置，字段为 `列名`、`排序`；页面内可拖拽列名调整顺序并保存。
-
-`停提款时间` 为空表示店铺一直计入首页常规看板；填写月份后，从该月份开始含当月的数据不计入常规看板，只在提成预估中的“停提款店铺缺提成”单独展示。
-
-补货管理按 ASIN 汇总运营库存，`总库存数量 = 可售 + 待入库 + 采购在途 + 本地库存 + 在途 + 计划入库`，`建议补货数量 = max(日均销量 * 目标可售天数 - 总库存数量, 0)`。毛利异常原因按 MSKU 判断后合并到 ASIN 行，德法西意分别展示；Rating 取四站点中 Rating 总数最多的站点展示为 `数量(评分)`。
-
-## 指标公式
-
-公式引擎位于 `dashboard/formula_engine.py`，计算入口在 `dashboard/data_processing.py` 的 `compute_metric_table()`。公式只支持安全白名单能力：
-
-- 字段引用：`[字段名]`
-- 四则运算、括号、比较和布尔运算
-- 函数：`sum()`、`mean()`、`min()`、`max()`、`count()`、`nunique()`、`abs()`、`round()`、`safe_divide()`、`if()`、`range_sum()`
-- 字符串比较：`[店铺类型] == "本土"`
-
-示例：
-
-```text
-range_sum("销售额--FBA销售额", "COD")
-safe_divide(sum([毛利润]), range_sum("销售额--FBA销售额", "COD"))
-if(safe_divide(sum([毛利润]), sum([销售额--FBA销售额])) < 0.15, 1, 0)
+```powershell
+.\start_dashboard.bat
 ```
+
+启动脚本会检查 Python 依赖、React 构建产物和 `8000` 端口，后台启动 FastAPI，等待 `/api/health` 就绪后再打开浏览器。运行日志和进程号保存在 `.tmp/`。
+
+停止由启动脚本创建的服务：
+
+```powershell
+Stop-Process -Id (Get-Content .tmp\dashboard.pid)
+```
+
+## 开发模式
+
+先安装开发依赖：
+
+```powershell
+.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
+```
+
+分别启动后端和前端：
+
+```powershell
+.venv\Scripts\python.exe -m uvicorn backend.main:app --host 127.0.0.1 --port 8000 --reload
+```
+
+```powershell
+cd frontend
+npm.cmd run dev
+```
+
+Vite 开发服务器会把 `/api` 请求代理到本机的 FastAPI 服务。生产构建由 FastAPI 直接提供，因此修改前端后需要重新执行 `npm.cmd run build`。
+
+## 数据与缓存
+
+- `data/` 保存上传的原始 CSV/XLS/XLSX、上传记录和 `app.db`。原始文件是权威数据，不能用 Parquet 替代。
+- `configs/` 保存指标公式、店铺、月目标、提成、部门费率和补货等业务配置。
+- `data/cache/` 只保存根据源文件指纹和 schema 版本生成的 Parquet 缓存。缓存损坏或版本变化时会自动重建；应用停止后可安全删除整个缓存目录。
+
+升级或批量导入前，应同时备份 `data/`、`configs/` 和 `data/app.db`。上传失败不会以缓存文件作为恢复来源。
+
+## 主要功能
+
+- 经营总览、销售、滞销、产品、部门和补货看板
+- 滞销页内的促销提醒：按动销策略自动分档、复制 SKU、标记促销周期并统计日均销量提升
+- 按月份、开发员、部门、店铺类型等条件筛选
+- 大表分页、搜索、排序和 CSV 导出
+- 业绩及运营/毛利/Rating 数据源上传与下载
+- 指标公式、店铺、目标、提成、费用率和补货配置维护
+- 现有待办功能保持原状，本轮未扩展
+
+## 测试与构建检查
+
+```powershell
+.venv\Scripts\python.exe -m unittest discover -s tests
+
+cd frontend
+npm.cmd test
+npm.cmd run build
+```
+
+使用当前工作区数据执行一次冷请求和五次热请求性能基准：
+
+```powershell
+.venv\Scripts\python.exe scripts\benchmark_dashboard.py
+```
+
+自动化代理运行安装、构建或测试命令时须遵循 [AGENTS.md](AGENTS.md) 中的 90 秒上限、有限重试和分批安装规则。
 
 ## 代码结构
 
-- `app.py`：Streamlit 页面、筛选控件、图表和表格展示。
-- `dashboard/data_processing.py`：数据读取、清洗、合并、汇总、提成、销量、滞销和产品管理核心逻辑。
-- `dashboard/formula_engine.py`：安全公式解析和执行。
-- `dashboard/report_store.py`：上传文件持久化、上传记录维护和最新原始表管理。
-- `dashboard/filters.py`：首页筛选逻辑。
-- `dashboard/display.py`：展示辅助函数和静态资源路径。
-- `tests/`：数据处理、公式、筛选、上传记录和辅助函数测试。
+- `backend/`：FastAPI 路由、看板接口、配置、上传和本地 SQLite 功能
+- `frontend/`：React 桌面端界面
+- `dashboard/`：共享的数据标准化、公式、业务计算、文件存储和 Parquet 缓存
+- `configs/`：本地业务配置
+- `data/`：本地原始数据、缓存和数据库（不提交到 Git）
+- `tests/`：后端业务与 API 回归测试
 
-## 维护要点
-
-- 原始表中的数值可能来自 Excel 公式、复制粘贴或不同区域格式，可能出现全角数字、中文逗号、不换行空格、货币符号、百分号或会计负数。新增数值列时，应优先复用 `normalize_config_number()` 或现有 normalize 函数，避免直接按字符串排序或求和。
-- 展示层应尽量保留数值列类型，再用 Streamlit `column_config` 控制格式；不要为了显示千分位或百分比把表格数据整体转成字符串，否则用户点击列头排序会变成文本排序。
-- 新页面如果依赖上传文件，优先通过 `read_local_table()` / `read_upload_table()` 读取，保持 CSV 编码和 XLS/XLSX 兼容策略一致。
-- 新业务指标优先放入 `metrics_config.csv` 公式配置；只有跨表、分摊或需要特殊业务规则的逻辑才写入 Python。
+Docker 是可选运行方式，详见 [DEPLOYMENT.md](DEPLOYMENT.md)。
