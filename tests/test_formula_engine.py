@@ -1,6 +1,6 @@
 import unittest
 
-from dashboard.formula_engine import FormulaContext, FormulaError, evaluate_formula, extract_fields
+from dashboard.formula_engine import FormulaContext, FormulaError, evaluate_formula, extract_fields, validate_formula
 
 
 class SimpleSeries(list):
@@ -42,6 +42,34 @@ class FormulaEngineTests(unittest.TestCase):
         context = FormulaContext(field_getter=lambda name: SimpleSeries([1]))
         with self.assertRaises(FormulaError):
             evaluate_formula("__import__('os')", context)
+
+    def test_scalar_not_uses_boolean_semantics(self):
+        context = FormulaContext(field_getter=lambda name: None)
+
+        self.assertFalse(evaluate_formula("not True", context))
+        self.assertTrue(evaluate_formula("not 0", context))
+
+    def test_scalar_boolean_operators_short_circuit(self):
+        context = FormulaContext(field_getter=lambda name: None)
+
+        self.assertFalse(evaluate_formula("False and (1 / 0)", context))
+        self.assertTrue(evaluate_formula("True or (1 / 0)", context))
+        self.assertFalse(evaluate_formula("2 < 1 < (1 / 0)", context))
+
+    def test_conditionals_only_evaluate_selected_scalar_branch(self):
+        context = FormulaContext(field_getter=lambda name: None)
+
+        self.assertEqual(evaluate_formula("if(True, 7, 1 / 0)", context), 7)
+        self.assertEqual(evaluate_formula("(1 / 0) if False else 8", context), 8)
+
+    def test_validate_formula_compiles_without_data_context(self):
+        self.assertIsNone(validate_formula('safe_divide(sum([销售额]), range_sum("销售额", "COD"))'))
+        with self.assertRaisesRegex(FormulaError, "需要 2 个参数"):
+            validate_formula("safe_divide(1)")
+        with self.assertRaisesRegex(FormulaError, "字段名参数"):
+            validate_formula("range_sum(1, 2)")
+        with self.assertRaisesRegex(FormulaError, "不允许的函数"):
+            validate_formula("open('secret')")
 
 
 if __name__ == "__main__":

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import calendar
+import math
 import re
 import unicodedata
 from pathlib import Path
@@ -9,7 +10,7 @@ from typing import Iterable
 
 import pandas as pd
 
-from dashboard.formula_engine import FormulaContext, FormulaError, evaluate_formula, extract_fields
+from dashboard.formula_engine import FormulaContext, FormulaError, evaluate_formula, extract_fields, extract_range_sums
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -22,6 +23,7 @@ COMMISSION_COLUMNS = ["月份", "开发员", "库存计提", "弃置", "职位�
 DEPARTMENT_FEE_COLUMNS = ["月份", "部门", "费用率"]
 REPLENISHMENT_TARGET_COLUMNS = ["ASIN", "目标可售天数"]
 DEFAULT_REPLENISHMENT_TARGET_DAYS = 70
+DEFAULT_REPLENISHMENT_CASE_PACK = 10
 OPERATIONAL_SALES_REQUIRED_COLUMNS = [
     "MSKU",
     "店铺名称",
@@ -92,17 +94,11 @@ AVAILABLE_INVENTORY_MONITOR_COLUMNS = ["开发员", "库存总数", "日均订�
 SALES_VOLUME_DETAIL_REQUIRED_COLUMNS = ["msku", "店铺", "开发专员"]
 SALES_AMOUNT_DETAIL_REQUIRED_COLUMNS = ["msku", "店铺", "开发专员"]
 DEPARTMENT_PERFORMANCE_FIXED_COLUMNS = [
-    "开发员",
     "在售产品数",
     "销售额贡献占比",
     "近7天日均订单",
     "近7天日均销售额（元）",
     "预估本月销售额（元）",
-]
-DEPARTMENT_PERFORMANCE_BOARDS = [
-    ("运营20部", "20"),
-    ("联合部门", "union"),
-    ("人员业绩贡献总计", "all"),
 ]
 REPLENISHMENT_OPERATIONAL_REQUIRED_COLUMNS = [
     "ASIN",
@@ -242,7 +238,7 @@ def read_csv_bytes(data: bytes) -> pd.DataFrame:
     last_error = None
     for encoding in ("utf-8-sig", "gb18030", "utf-8"):
         try:
-            return pd.read_csv(io.BytesIO(data), encoding=encoding)
+            return pd.read_csv(io.BytesIO(data), encoding=encoding, low_memory=False)
         except UnicodeDecodeError as exc:
             last_error = exc
     raise ValueError(f"CSV 编码无法识别：{last_error}")
@@ -417,16 +413,30 @@ def normalize_month(value) -> str | None:
     text = text.strip()
     if not text:
         return None
-    chinese_match = re.search(r"(\d{2,4})\s*年\s*(\d{1,2})\s*月", text)
+    range_match = re.fullmatch(r"(\d{4})-(\d{2})-(\d{2})\s*[~～]\s*(\d{4})-(\d{2})-(\d{2})", text)
+    if range_match:
+        start_year, start_month, start_day, end_year, end_month, end_day = map(int, range_match.groups())
+        if (
+            start_year == end_year
+            and start_month == end_month
+            and 1 <= start_month <= 12
+            and start_day == 1
+            and end_day == calendar.monthrange(start_year, start_month)[1]
+        ):
+            return f"{start_year:04d}-{start_month:02d}"
+        return None
+    chinese_match = re.fullmatch(r"(\d{2,4})\s*年\s*(\d{1,2})\s*月", text)
     if chinese_match:
         year = int(chinese_match.group(1))
         if year < 100:
             year += 2000
-        return f"{year:04d}-{int(chinese_match.group(2)):02d}"
-    match = re.search(r"(\d{4})[-/](\d{1,2})", text)
+        month = int(chinese_match.group(2))
+        return f"{year:04d}-{month:02d}" if 1 <= month <= 12 else None
+    match = re.fullmatch(r"(\d{4})[-/](\d{1,2})", text)
     if not match:
-        return text
-    return f"{int(match.group(1)):04d}-{int(match.group(2)):02d}"
+        return None
+    month = int(match.group(2))
+    return f"{int(match.group(1)):04d}-{month:02d}" if 1 <= month <= 12 else None
 
 
 def normalize_config_month(value) -> str | None:
@@ -518,16 +528,30 @@ def ensure_operational_sales_normalized(df: pd.DataFrame) -> pd.DataFrame:
     return normalize_operational_sales(df)
 
 
+def count_chen_26_onsale_skus(df: pd.DataFrame) -> int:
+    data = ensure_operational_sales_normalized(df)
+    if data.empty:
+        return 0
+    developer = data["开发员"].fillna("").astype(str).str.strip()
+    onsale = normalize_config_number(data["可售"]).fillna(0).gt(0)
+    matched = data.loc[developer.str.endswith("陈千潼-26") & onsale, "MSKU"].fillna("").astype(str).str.strip()
+    return int(matched[matched.ne("")].nunique())
+
+
 def merge_operational_store_config(df: pd.DataFrame, store_config: pd.DataFrame) -> pd.DataFrame:
     result = df.copy()
     config = normalize_store_config(store_config).copy()
     if not config.empty:
         config["店铺编码"] = config["店铺名"].map(extract_store_code)
         config = config.drop_duplicates(subset=["店铺编码"], keep="first")
-        result = result.merge(config[["店铺编码", "店铺类型"]], on="店铺编码", how="left")
-    if "店铺类型" not in result.columns:
-        result["店铺类型"] = pd.NA
+        result = result.merge(config[["店铺编码", "店铺类型", "停提款时间"]], on="店铺编码", how="left")
+    for col in ["店铺类型", "停提款时间"]:
+        if col not in result.columns:
+            result[col] = pd.NA
     result["店铺类型"] = result["店铺类型"].where(result["店铺类型"].notna() & result["店铺类型"].astype(str).str.strip().ne(""), result["店铺类型推断"])
+    result["停提款时间"] = result["停提款时间"].fillna("").astype(str).str.strip()
+    result["是否封店"] = result["停提款时间"].ne("")
+    result["店铺状态"] = result["是否封店"].map(lambda value: "已封店" if value else "正常")
     return result
 
 
@@ -553,13 +577,14 @@ def build_sales_dashboard_tables(df: pd.DataFrame, store_config: pd.DataFrame) -
         store_order = normalize_store_config(store_config)["店铺名"].map(extract_store_code).dropna().drop_duplicates().tolist()
 
     data["产品等级"] = data["30天日均"].map(product_level_for_daily_sales)
-    total_onsale = data["是否在售"].sum()
+    data["有效在售"] = data["是否在售"] & ~data["是否封店"]
+    total_onsale = data["有效在售"].sum()
     total_30_avg = data["30天日均"].sum()
 
     store_summary = (
-        data.groupby(["店铺编码", "店铺类型"], dropna=False, as_index=False)
+        data.groupby(["店铺编码", "店铺类型", "店铺状态"], dropna=False, as_index=False)
         .agg(
-            在售个数=("是否在售", "sum"),
+            在售个数=("有效在售", "sum"),
             昨日订单=("昨天销量", "sum"),
             前天订单=("前天销量", "sum"),
             上前订单=("上前销量", "sum"),
@@ -580,6 +605,7 @@ def build_sales_dashboard_tables(df: pd.DataFrame, store_config: pd.DataFrame) -
         [
             "店铺编码",
             "店铺类型",
+            "店铺状态",
             "在售个数",
             "产品数占比",
             "昨日D值",
@@ -596,7 +622,7 @@ def build_sales_dashboard_tables(df: pd.DataFrame, store_config: pd.DataFrame) -
     level_summary = (
         data.groupby("产品等级", dropna=False, as_index=False)
         .agg(
-            在售个数=("是否在售", "sum"),
+            在售个数=("有效在售", "sum"),
             昨日订单=("昨天销量", "sum"),
             **{"7天日均": ("7天日均", "sum")},
             **{"30天日均": ("30天日均", "sum")},
@@ -788,6 +814,67 @@ def normalize_sales_amount_detail(df: pd.DataFrame) -> pd.DataFrame:
     return normalize_sales_metric_detail(df, SALES_AMOUNT_DETAIL_REQUIRED_COLUMNS, "销售额")
 
 
+def duplicate_row_issues(frame: pd.DataFrame, example_limit: int = 5) -> list[dict]:
+    """Describe every group of completely duplicate rows for upload validation.
+
+    ``example_limit`` limits reported row numbers per group, not the number of
+    groups, so summing ``duplicate_count`` always yields the exact total.
+    """
+
+    if not isinstance(frame, pd.DataFrame):
+        raise TypeError("重复行检测只接受 DataFrame")
+    if example_limit < 1:
+        raise ValueError("每组示例行数必须大于 0")
+    if frame.empty or not frame.duplicated(keep=False).any():
+        return []
+
+    def value_key(value):
+        try:
+            missing = pd.isna(value)
+            if isinstance(missing, bool) and missing:
+                return ("missing",)
+        except (TypeError, ValueError):
+            pass
+        try:
+            hash(value)
+            return (type(value).__name__, value)
+        except TypeError:
+            return (type(value).__name__, repr(value))
+
+    groups: dict[tuple, list[int]] = {}
+    examples: dict[tuple, tuple] = {}
+    for row_number, values in enumerate(frame.itertuples(index=False, name=None), start=1):
+        key = tuple(value_key(value) for value in values)
+        groups.setdefault(key, []).append(row_number)
+        examples.setdefault(key, values)
+
+    issues = []
+    for key, row_numbers in groups.items():
+        if len(row_numbers) < 2:
+            continue
+        values = examples[key]
+        example = {}
+        for column, value in zip(frame.columns, values):
+            try:
+                is_missing = bool(pd.isna(value))
+            except (TypeError, ValueError):
+                is_missing = False
+            if is_missing:
+                example[str(column)] = None
+            elif hasattr(value, "item"):
+                example[str(column)] = value.item()
+            else:
+                example[str(column)] = value
+        issues.append(
+            {
+                "duplicate_count": len(row_numbers) - 1,
+                "row_numbers": row_numbers[:example_limit],
+                "example": example,
+            }
+        )
+    return issues
+
+
 def normalize_sales_metric_detail(df: pd.DataFrame, required_columns: list[str], suffix: str) -> pd.DataFrame:
     missing = [col for col in required_columns if col not in df.columns]
     date_columns = sales_detail_date_columns(df, suffix)
@@ -802,6 +889,7 @@ def normalize_sales_metric_detail(df: pd.DataFrame, required_columns: list[str],
     result["msku"] = result["msku"].str.replace(r"^\t+", "", regex=True)
     result["人员"] = result["开发专员"].map(normalize_department_person_name)
     result["店铺前缀"] = result["店铺"].map(extract_department_store_prefix)
+    result["店铺部门"] = result["店铺"].map(department_name_from_store)
     for col in date_columns:
         result[col] = normalize_config_number(result[col]).fillna(0)
     return result
@@ -810,12 +898,19 @@ def normalize_sales_metric_detail(df: pd.DataFrame, required_columns: list[str],
 def normalize_department_person_name(value) -> str:
     if pd.isna(value):
         return ""
-    text = str(value).strip()
+    text = normalize_department_developer_text(value)
     if not text or text == "--":
         return ""
     text = re.sub(r"^运营[一二三四五六七八九十百千万0-9]+部-", "", text)
-    text = re.sub(r"-26$", "", text)
+    text = re.sub(r"-?26$", "", text)
     return text.strip()
+
+
+def normalize_department_developer_text(value) -> str:
+    text = unicodedata.normalize("NFKC", str(value)).strip()
+    text = re.sub(r"[\u2010-\u2015\u2212－]", "-", text)
+    text = re.sub(r"\s*-\s*", "-", text)
+    return text
 
 
 def extract_department_store_prefix(value) -> str:
@@ -823,16 +918,51 @@ def extract_department_store_prefix(value) -> str:
     return match.group(1) if match else ""
 
 
-def department_scope_mask(df: pd.DataFrame, scope: str) -> pd.Series:
-    if scope == "20":
-        return df["店铺前缀"].eq("20")
-    if scope == "union":
-        return df["店铺前缀"].isin(["6", "7"])
-    return pd.Series(True, index=df.index)
+def department_name_from_store(value) -> str:
+    prefix = extract_department_store_prefix(value)
+    if prefix in {"6", "7"}:
+        return "联合部门"
+    if prefix == "20":
+        return "运营二十部"
+    return ""
 
 
 def department_metric_columns_for_dates(dates: list[pd.Timestamp], suffix: str) -> list[str]:
     return [f"{date.strftime('%m-%d')}{suffix}" for date in dates]
+
+
+def latest_department_detail_date(
+    volume_df: pd.DataFrame,
+    amount_df: pd.DataFrame,
+    reference_date=None,
+) -> pd.Timestamp | None:
+    """Return the latest date shared by the department volume and amount sources."""
+    volume_days = {
+        match.group(1)
+        for column in volume_df.columns
+        if (match := re.fullmatch(r"(\d{2}-\d{2})销量", str(column)))
+    }
+    amount_days = {
+        match.group(1)
+        for column in amount_df.columns
+        if (match := re.fullmatch(r"(\d{2}-\d{2})销售额", str(column)))
+    }
+    common_days = volume_days & amount_days
+    if not common_days:
+        return None
+
+    reference = pd.Timestamp(reference_date).normalize() if reference_date is not None else pd.Timestamp.today().normalize()
+    candidates = []
+    for day in common_days:
+        month, day_of_month = map(int, day.split("-"))
+        try:
+            candidate = pd.Timestamp(year=reference.year, month=month, day=day_of_month)
+            if candidate > reference:
+                candidate = candidate.replace(year=reference.year - 1)
+            candidates.append(candidate)
+        except ValueError:
+            continue
+    return max(candidates) if candidates else None
 
 
 def department_month_dates(today: pd.Timestamp) -> list[pd.Timestamp]:
@@ -850,8 +980,20 @@ def department_performance_daily_columns(dates: list[pd.Timestamp]) -> list[str]
     return columns
 
 
-def department_performance_columns(dates: list[pd.Timestamp]) -> list[str]:
-    return DEPARTMENT_PERFORMANCE_FIXED_COLUMNS + department_performance_daily_columns(dates)
+def department_performance_columns(label_col: str, dates: list[pd.Timestamp]) -> list[str]:
+    return [label_col] + DEPARTMENT_PERFORMANCE_FIXED_COLUMNS + department_performance_daily_columns(dates)
+
+
+def with_department_performance_total(frame: pd.DataFrame) -> pd.DataFrame:
+    """Prepend a total row for either department or developer performance."""
+    if frame.empty:
+        return frame
+    label_col = "部门" if "部门" in frame.columns else "开发员"
+    total = {label_col: "合计"}
+    for column in frame.columns:
+        if column != label_col:
+            total[column] = pd.to_numeric(frame[column], errors="coerce").fillna(0).sum()
+    return pd.concat([pd.DataFrame([total]), frame], ignore_index=True)
 
 
 def build_department_performance_tables(
@@ -860,10 +1002,15 @@ def build_department_performance_tables(
     amount_df: pd.DataFrame,
     today=None,
 ) -> dict[str, pd.DataFrame]:
-    today_ts = pd.Timestamp(today).normalize() if today is not None else pd.Timestamp.today().normalize()
+    # Official exports can contain byte-for-byte repeated detail lines. Remove
+    # only rows whose normalized calculation fields are completely identical;
+    # rows for the same SKU with any differing value remain independent.
+    volume = normalize_sales_volume_detail(volume_df).drop_duplicates(keep="first").reset_index(drop=True)
+    amount = normalize_sales_amount_detail(amount_df).drop_duplicates(keep="first").reset_index(drop=True)
+    today_ts = pd.Timestamp(today).normalize() if today is not None else latest_department_detail_date(volume, amount)
+    if today_ts is None:
+        raise ValueError("销量明细与销售额明细没有共同的日期列")
     window_dates = [today_ts - pd.Timedelta(days=offset) for offset in range(1, 8)]
-    volume = normalize_sales_volume_detail(volume_df)
-    amount = normalize_sales_amount_detail(amount_df)
     volume_date_cols = department_metric_columns_for_dates(window_dates, "销量")
     amount_date_cols = department_metric_columns_for_dates(window_dates, "销售额")
     missing_volume = [col for col in volume_date_cols if col not in volume.columns]
@@ -877,28 +1024,42 @@ def build_department_performance_tables(
     month_amount_cols = [col for col in department_metric_columns_for_dates(month_dates, "销售额") if col in amount.columns]
     remaining_days = calendar.monthrange(today_ts.year, today_ts.month)[1] - today_ts.day + 1
     onsale_counts = build_department_onsale_counts(operational_df)
-    tables = {}
-    for title, scope in DEPARTMENT_PERFORMANCE_BOARDS:
-        volume_scope = volume[department_scope_mask(volume, scope)].copy()
-        amount_scope = amount[department_scope_mask(amount, scope)].copy()
-        tables[title] = build_department_performance_table_for_scope(
-            title,
-            scope,
-            volume_scope,
-            amount_scope,
+    department_volume = volume[volume["店铺部门"].ne("")].copy()
+    department_amount = amount[amount["店铺部门"].ne("")].copy()
+    return {
+        "开发员业绩排行": build_department_performance_table_for_group(
+            "开发员",
+            "人员",
+            "person",
+            volume,
+            amount,
             window_dates,
             volume_date_cols,
             amount_date_cols,
             month_amount_cols,
             remaining_days,
             onsale_counts,
-        )
-    return tables
+        ),
+        "部门业绩": build_department_performance_table_for_group(
+            "部门",
+            "店铺部门",
+            "department",
+            department_volume,
+            department_amount,
+            window_dates,
+            volume_date_cols,
+            amount_date_cols,
+            month_amount_cols,
+            remaining_days,
+            onsale_counts,
+        ),
+    }
 
 
-def build_department_performance_table_for_scope(
-    title: str,
-    scope: str,
+def build_department_performance_table_for_group(
+    label_col: str,
+    group_col: str,
+    count_kind: str,
     volume: pd.DataFrame,
     amount: pd.DataFrame,
     window_dates: list[pd.Timestamp],
@@ -908,31 +1069,16 @@ def build_department_performance_table_for_scope(
     remaining_days: int,
     onsale_counts: dict[tuple[str, str | None], int],
 ) -> pd.DataFrame:
-    people = sorted({person for person in volume["人员"].tolist() + amount["人员"].tolist() if person})
-    summary = build_department_performance_row(
-        title,
-        scope,
-        None,
-        volume,
-        amount,
-        window_dates,
-        volume_date_cols,
-        amount_date_cols,
-        month_amount_cols,
-        remaining_days,
-        onsale_counts,
-    )
-    denominator = summary["近7天日均销售额（元）"]
-    rows = [summary]
-    person_rows = []
-    for person in people:
-        person_rows.append(
+    labels = sorted({label for label in volume[group_col].tolist() + amount[group_col].tolist() if label})
+    rows = []
+    for label in labels:
+        rows.append(
             build_department_performance_row(
-                person,
-                scope,
-                person,
-                volume[volume["人员"].eq(person)].copy(),
-                amount[amount["人员"].eq(person)].copy(),
+                label_col,
+                label,
+                count_kind,
+                volume[volume[group_col].eq(label)].copy(),
+                amount[amount[group_col].eq(label)].copy(),
                 window_dates,
                 volume_date_cols,
                 amount_date_cols,
@@ -941,17 +1087,19 @@ def build_department_performance_table_for_scope(
                 onsale_counts,
             )
         )
-    person_rows = sorted(person_rows, key=lambda row: row["近7天日均销售额（元）"], reverse=True)
-    rows.extend(person_rows)
+    if not rows:
+        return pd.DataFrame(columns=department_performance_columns(label_col, window_dates))
+    rows = sorted(rows, key=lambda row: row["近7天日均销售额（元）"], reverse=True)
     result = pd.DataFrame(rows)
+    denominator = result["近7天日均销售额（元）"].sum()
     result["销售额贡献占比"] = result["近7天日均销售额（元）"].map(lambda value: safe_blank_ratio(value, denominator))
-    return result[department_performance_columns(window_dates)].reset_index(drop=True)
+    return result[department_performance_columns(label_col, window_dates)].reset_index(drop=True)
 
 
 def build_department_performance_row(
+    label_col: str,
     label: str,
-    scope: str,
-    person: str | None,
+    count_kind: str,
     volume: pd.DataFrame,
     amount: pd.DataFrame,
     window_dates: list[pd.Timestamp],
@@ -965,8 +1113,8 @@ def build_department_performance_row(
     total_amount_7 = amount[amount_date_cols].sum().sum() if not amount.empty else 0
     month_amount = amount[month_amount_cols].sum().sum() if month_amount_cols and not amount.empty else 0
     row = {
-        "开发员": label,
-        "在售产品数": onsale_counts.get((scope, person), 0),
+        label_col: label,
+        "在售产品数": onsale_counts.get((count_kind, label), 0),
         "销售额贡献占比": 0,
         "近7天日均订单": total_volume_7 / 7,
         "近7天日均销售额（元）": total_amount_7 / 7,
@@ -989,27 +1137,15 @@ def build_department_onsale_counts(operational_df: pd.DataFrame) -> dict[tuple[s
     base = operational_df[required].copy()
     base["MSKU"] = base["MSKU"].fillna("").astype(str).str.strip()
     base["开发员"] = base["开发员"].map(normalize_department_person_name)
+    base["店铺部门"] = base["店铺名称"].map(department_name_from_store)
     base["可售"] = normalize_config_number(base["可售"]).fillna(0)
     base = base[base["MSKU"].ne("") & base["可售"].gt(0)].copy()
     for _, row in base.iterrows():
-        scopes = department_scopes_for_store_names(row["店铺名称"])
-        scopes.add("all")
-        for scope in scopes:
-            counts.setdefault((scope, None), set()).add(row["MSKU"])
-            if row["开发员"]:
-                counts.setdefault((scope, row["开发员"]), set()).add(row["MSKU"])
+        if row["开发员"]:
+            counts.setdefault(("person", row["开发员"]), set()).add(row["MSKU"])
+        if row["店铺部门"]:
+            counts.setdefault(("department", row["店铺部门"]), set()).add(row["MSKU"])
     return {key: len(value) for key, value in counts.items()}
-
-
-def department_scopes_for_store_names(value) -> set[str]:
-    scopes = set()
-    for item in [part.strip() for part in str(value).split(",") if part.strip()]:
-        prefix = extract_department_store_prefix(item)
-        if prefix == "20":
-            scopes.add("20")
-        elif prefix in {"6", "7"}:
-            scopes.add("union")
-    return scopes
 
 
 def normalize_replenishment_targets(targets: pd.DataFrame | None) -> pd.DataFrame:
@@ -1020,11 +1156,18 @@ def normalize_replenishment_targets(targets: pd.DataFrame | None) -> pd.DataFram
     for col in REPLENISHMENT_TARGET_COLUMNS:
         if col not in data.columns:
             data[col] = pd.NA
-    data = data[REPLENISHMENT_TARGET_COLUMNS].copy()
+    optional_columns = [column for column in ["箱规"] if column in data.columns]
+    data = data[REPLENISHMENT_TARGET_COLUMNS + optional_columns].copy()
     data["ASIN"] = data["ASIN"].fillna("").astype(str).str.strip()
     data["目标可售天数"] = normalize_config_number(data["目标可售天数"]).round()
-    data = data[data["ASIN"].ne("") & data["目标可售天数"].notna()].copy()
-    data["目标可售天数"] = data["目标可售天数"].clip(lower=0).astype(int)
+    if "箱规" in data.columns:
+        data["箱规"] = normalize_config_number(data["箱规"]).round()
+        data["箱规"] = data["箱规"].where(data["箱规"].gt(0))
+    configured = data["目标可售天数"].notna()
+    if "箱规" in data.columns:
+        configured |= data["箱规"].notna()
+    data = data[data["ASIN"].ne("") & configured].copy()
+    data["目标可售天数"] = data["目标可售天数"].clip(lower=0).astype("Int64")
     return data.drop_duplicates(subset=["ASIN"], keep="last").reset_index(drop=True)
 
 
@@ -1221,7 +1364,10 @@ def build_replenishment_management_tables(
     rating_df: pd.DataFrame,
     target_config: pd.DataFrame | None = None,
     only_needed: bool = True,
+    default_case_pack: int = DEFAULT_REPLENISHMENT_CASE_PACK,
 ) -> dict[str, pd.DataFrame]:
+    if isinstance(default_case_pack, bool) or not isinstance(default_case_pack, int) or default_case_pack <= 0:
+        raise ValueError("默认箱规必须是正整数")
     operational = build_replenishment_operational_summary(operational_df)
     gross_profit = build_replenishment_gross_summary(gross_profit_df)
     rating = build_replenishment_rating_summary(rating_df)
@@ -1233,10 +1379,17 @@ def build_replenishment_management_tables(
 
     result = operational.merge(targets, on="ASIN", how="left")
     result["目标可售天数"] = result["目标可售天数"].fillna(DEFAULT_REPLENISHMENT_TARGET_DAYS).astype(int)
-    raw_replenishment_quantity = (
+    if "箱规" not in result.columns:
+        result["箱规"] = default_case_pack
+    result["箱规"] = normalize_config_number(result["箱规"]).fillna(default_case_pack)
+    result["箱规"] = result["箱规"].where(result["箱规"].gt(0), default_case_pack).round().astype(int)
+    result["原始缺口"] = (
         result["日均销量"] * result["目标可售天数"] - result["总库存数量"]
     ).clip(lower=0)
-    result["建议补货数量"] = (raw_replenishment_quantity // 10) * 10
+    result["建议补货数量"] = result.apply(
+        lambda row: int(math.ceil(row["原始缺口"] / row["箱规"]) * row["箱规"]) if row["原始缺口"] > 0 else 0,
+        axis=1,
+    )
     result = result.merge(gross_profit, on="ASIN", how="left").merge(rating, on="ASIN", how="left")
     for col in replenishment_management_columns():
         if col not in result.columns:
@@ -1280,6 +1433,8 @@ def replenishment_management_columns() -> list[str]:
         "日均销量",
         "重量",
         "建议补货方式",
+        "原始缺口",
+        "箱规",
         "建议补货数量",
     ]
     return base_columns + replenishment_gross_columns() + ["产品评分"]
@@ -1406,7 +1561,7 @@ def build_low_margin_product_table(
     if grouped.empty:
         return pd.DataFrame(columns=LOW_MARGIN_PRODUCT_COLUMNS)
 
-    grouped = grouped.sort_values(["毛利率", "SKU", "国家"], ascending=[False, True, True], kind="stable")
+    grouped = grouped.sort_values(["毛利率", "SKU", "国家"], ascending=[True, True, True], kind="stable")
     return grouped[LOW_MARGIN_PRODUCT_COLUMNS].reset_index(drop=True)
 
 
@@ -1840,6 +1995,52 @@ def compute_commission_table(
     return merged[COMMISSION_OUTPUT_COLUMNS].sort_values(["月份", "开发员"]).reset_index(drop=True)
 
 
+def build_person_commission_summary(
+    df: pd.DataFrame,
+    metric_config: pd.DataFrame,
+    commission_config: pd.DataFrame,
+    department_fee_config: pd.DataFrame,
+) -> pd.DataFrame:
+    columns = ["人员", "营业额", "毛利润", "毛利率", "提成预估", "缺配置月份数"]
+    detail = compute_commission_table(df, metric_config, commission_config, department_fee_config)
+    if detail.empty:
+        return pd.DataFrame(columns=columns)
+
+    numeric = detail.copy()
+    for col in ["营业额", "毛利润", "提成预估"]:
+        numeric[col] = pd.to_numeric(numeric[col], errors="coerce")
+    numeric["人员"] = numeric["开发员"].map(normalize_department_person_name)
+    numeric["人员"] = numeric["人员"].where(numeric["人员"].astype(str).str.strip().ne(""), numeric["开发员"])
+    numeric["_缺配置"] = numeric["配置状态"].ne("已配置")
+
+    summary = (
+        numeric.groupby("人员", dropna=False, as_index=False)
+        .agg(
+            营业额=("营业额", "sum"),
+            毛利润=("毛利润", "sum"),
+            提成预估=("提成预估", lambda values: values.sum(min_count=1)),
+            缺配置月份数=("_缺配置", "sum"),
+        )
+    )
+    summary["毛利率"] = summary.apply(
+        lambda row: row["毛利润"] / row["营业额"] if pd.notna(row["营业额"]) and row["营业额"] else pd.NA,
+        axis=1,
+    )
+    summary = summary[columns].sort_values("提成预估", ascending=False, na_position="last").reset_index(drop=True)
+
+    total_row = {
+        "人员": "合计",
+        "营业额": summary["营业额"].sum(),
+        "毛利润": summary["毛利润"].sum(),
+        "提成预估": summary["提成预估"].sum(min_count=1),
+        "缺配置月份数": summary["缺配置月份数"].sum(),
+    }
+    total_row["毛利率"] = (
+        total_row["毛利润"] / total_row["营业额"] if pd.notna(total_row["营业额"]) and total_row["营业额"] else pd.NA
+    )
+    return pd.concat([summary, pd.DataFrame([total_row])[columns]], ignore_index=True)
+
+
 def compute_stopped_commission_table(
     df: pd.DataFrame,
     metric_config: pd.DataFrame,
@@ -1904,18 +2105,65 @@ def compute_metric_table(df: pd.DataFrame, metric_config: pd.DataFrame, group_co
         return pd.DataFrame()
 
     validate_metric_fields(df, metric_config)
+    working = df.reset_index(drop=True)
+
+    field_names = {
+        field
+        for formula in metric_config["公式"]
+        for field in extract_fields(formula)
+        if field in working.columns
+    }
+    field_cache = {field: maybe_numeric(working[field]) for field in field_names}
+    range_specs = {
+        bounds
+        for formula in metric_config["公式"]
+        for bounds in extract_range_sums(formula)
+    }
+    range_sum_cache: dict[tuple[str, str], pd.Series] = {}
+    columns = list(working.columns)
+    for start, end in range_specs:
+        if start not in columns or end not in columns:
+            continue
+        start_idx, end_idx = columns.index(start), columns.index(end)
+        if start_idx > end_idx:
+            continue
+        numeric_columns = {
+            column: normalize_config_number(working[column])
+            for column in columns[start_idx : end_idx + 1]
+        }
+        range_sum_cache[(start, end)] = pd.DataFrame(numeric_columns, index=working.index).sum(axis=1)
+
+    target_month_count = 1
+    if "月份" in working.columns and "月份" not in group_cols:
+        target_month_count = max(1, int(working["月份"].dropna().astype(str).nunique()))
 
     rows = []
     if group_cols:
-        grouped = df.groupby(group_cols, dropna=False, sort=False)
+        grouped = working.groupby(group_cols, dropna=False, sort=False)
         for keys, group in grouped:
             if not isinstance(keys, tuple):
                 keys = (keys,)
             row = dict(zip(group_cols, keys))
-            row.update(compute_metrics_for_frame(group, metric_config))
+            row.update(
+                compute_metrics_for_frame(
+                    group,
+                    metric_config,
+                    target_month_count=target_month_count,
+                    field_cache=field_cache,
+                    range_sum_cache=range_sum_cache,
+                )
+            )
             rows.append(row)
     else:
-        rows.append(compute_metrics_for_frame(df, metric_config))
+        rows.append(
+            compute_metrics_for_frame(
+                working,
+                metric_config,
+                target_month_count=target_month_count,
+                field_cache=field_cache,
+                range_sum_cache=range_sum_cache,
+            )
+        )
     return pd.DataFrame(rows)
 
 
@@ -1930,13 +2178,25 @@ def validate_metric_fields(df: pd.DataFrame, metric_config: pd.DataFrame) -> Non
         raise FormulaError("; ".join(missing_by_metric))
 
 
-def compute_metrics_for_frame(df: pd.DataFrame, metric_config: pd.DataFrame) -> dict:
+def compute_metrics_for_frame(
+    df: pd.DataFrame,
+    metric_config: pd.DataFrame,
+    target_month_count: int = 1,
+    field_cache: dict[str, pd.Series] | None = None,
+    range_sum_cache: dict[tuple[str, str], pd.Series] | None = None,
+) -> dict:
     def get_field(name: str):
         if name not in df.columns:
             raise FormulaError(f"字段不存在：{name}")
-        return maybe_numeric(df[name])
+        values = field_cache[name].loc[df.index] if field_cache is not None and name in field_cache else maybe_numeric(df[name])
+        if name == "销售额目标" and target_month_count > 1:
+            return values * target_month_count
+        return values
 
     def get_range_sum(start: str, end: str):
+        cached = range_sum_cache.get((start, end)) if range_sum_cache is not None else None
+        if cached is not None:
+            return cached.loc[df.index].sum()
         columns = list(df.columns)
         if start not in columns:
             raise FormulaError(f"range_sum() 起始字段不存在：{start}")

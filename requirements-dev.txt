@@ -1,0 +1,4 @@
+-r requirements.txt
+
+# Backend API and integration tests.
+httpx==0.28.1

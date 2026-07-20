@@ -16,10 +16,8 @@ htmlcov/
 
 # Local app/runtime files
 .tmp/
-.streamlit/*
-!.streamlit/
-!.streamlit/config.toml
 data/
+data/cache/
 
 # Logs
 *.log
@@ -29,3 +27,8 @@ data/
 Thumbs.db
 .vscode/
 .idea/
+
+# Frontend build artifacts
+frontend/node_modules/
+frontend/dist/
+*.tsbuildinfo
