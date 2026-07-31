@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 import pandas as pd
@@ -84,6 +86,24 @@ class DashboardApiTests(unittest.TestCase):
         self.assertEqual(payload["selected"], {"developers": []})
         self.assertEqual(payload["metrics"][0]["value"], 2)
 
+    def test_slow_moving_filters_stores_configured_as_stopped_before_building_table(self):
+        raw = pd.DataFrame({"开发员": ["保留", "已停款"]})
+        filtered = pd.DataFrame({"开发员": ["保留"]})
+        store_config = pd.DataFrame({"店铺名": ["SGE"], "停提款时间": ["2026-01"]})
+        with (
+            patch("backend.dashboard_api.load_source_frame", return_value=raw),
+            patch("backend.dashboard_api.load_business_config", return_value=(store_config, pd.DataFrame())),
+            patch("backend.dashboard_api.exclude_stopped_store_operational_rows", return_value=filtered) as exclude_rows,
+            patch("backend.dashboard_api.build_slow_moving_inventory_table", return_value=pd.DataFrame()) as build_table,
+        ):
+            payload = dashboard_api._build_slow_moving(None, "90天以上")
+
+        exclude_rows.assert_called_once_with(raw, store_config)
+        build_table.assert_called_once()
+        pd.testing.assert_frame_equal(build_table.call_args.args[0], filtered)
+        self.assertEqual(build_table.call_args.args[1], "90天以上")
+        self.assertFalse(payload["has_data"])
+
     def test_latest_detail_date_uses_latest_common_metric_day(self):
         volume = pd.DataFrame(columns=["07-06销量", "07-05销量"])
         amount = pd.DataFrame(columns=["07-06销售额", "07-04销售额"])
@@ -112,6 +132,83 @@ class DashboardApiTests(unittest.TestCase):
                 payload = response.json()
                 self.assertTrue(payload["has_data"])
                 self.assertGreater(len(payload["sections"]), 0)
+
+    def test_replenishment_min_qty_filters_disabled_rows_before_metrics(self):
+        detail = pd.DataFrame([
+            {"补货组ID": "B001", "ASIN": "B001", "开发员": "甲", "建议补货数量": 20, "是否补货": True, "数据状态": "正常"},
+            {"补货组ID": "B002", "ASIN": "B002", "开发员": "甲", "建议补货数量": 30, "是否补货": True, "数据状态": "正常"},
+            {"补货组ID": "B003", "ASIN": "B003", "开发员": "乙", "建议补货数量": 100, "是否补货": False, "数据状态": "已关闭补货"},
+            {"补货组ID": "B004", "ASIN": "B004", "开发员": "乙", "建议补货数量": pd.NA, "是否补货": True, "数据状态": "数据异常"},
+        ])
+        with (
+            patch("backend.dashboard_api.load_source_frame", return_value=pd.DataFrame({"开发员": ["甲", "乙"]})),
+            patch("backend.dashboard_api._replenishment_tables", return_value={"detail": detail}),
+        ):
+            payload = dashboard_api._build_replenishment(None, min_qty=30)
+
+        visible = payload["sections"][0]["frame"]
+        self.assertEqual(visible["ASIN"].tolist(), ["B002"])
+        self.assertEqual(payload["metrics"][0]["value"], 1)
+        self.assertEqual(payload["metrics"][1]["value"], 30)
+        self.assertEqual(payload["metrics"][2]["value"], 0)
+
+    def test_replenishment_switch_overlay_reuses_calculation_and_preserves_data_errors(self):
+        detail = pd.DataFrame([
+            {
+                "补货组ID": "B001", "ASIN": "B001", "测算建议补货数量": 30,
+                "建议补货数量": 30, "是否补货": True, "关闭原因": "",
+                "数据状态": "正常",
+            },
+            {
+                "补货组ID": "B002", "ASIN": "B002", "测算建议补货数量": pd.NA,
+                "建议补货数量": pd.NA, "是否补货": True, "关闭原因": "",
+                "数据状态": "数据异常",
+            },
+        ])
+        switches = pd.DataFrame([
+            {"ASIN": "B001", "是否补货": False, "关闭原因": "停售"},
+            {"ASIN": "B002", "是否补货": False, "关闭原因": "资料缺失"},
+        ])
+
+        result = dashboard_api._apply_replenishment_switches(detail, switches).set_index("ASIN")
+
+        self.assertFalse(result.loc["B001", "是否补货"])
+        self.assertEqual(result.loc["B001", "建议补货数量"], 0)
+        self.assertEqual(result.loc["B001", "数据状态"], "已关闭补货")
+        self.assertEqual(result.loc["B001", "关闭原因"], "停售")
+        self.assertFalse(result.loc["B002", "是否补货"])
+        self.assertTrue(pd.isna(result.loc["B002", "建议补货数量"]))
+        self.assertEqual(result.loc["B002", "数据状态"], "数据异常")
+
+    def test_replenishment_switch_endpoint_upserts_asin_and_requires_reason(self):
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch("backend.dashboard_api.load_source_frame", return_value=pd.DataFrame({"ASIN": ["B001"]})),
+            patch("backend.config_api.CONFIG_DIR", Path(directory)),
+            patch("backend.config_api._invalidate_replenishment_view_cache") as invalidate,
+        ):
+            invalid = self.client.put(
+                "/api/dashboard/replenishment/asins/B001/switch",
+                json={"is_replenishment": False, "close_reason": ""},
+            )
+            first = self.client.put(
+                "/api/dashboard/replenishment/asins/b001/switch",
+                json={"is_replenishment": False, "close_reason": "停售"},
+            )
+            second = self.client.put(
+                "/api/dashboard/replenishment/asins/B001/switch",
+                json={"is_replenishment": False, "close_reason": "季节结束"},
+            )
+
+            self.assertEqual(invalid.status_code, 422)
+            self.assertEqual(first.status_code, 200, first.text)
+            self.assertEqual(second.status_code, 200, second.text)
+            self.assertEqual(second.json()["ASIN"], "B001")
+            saved = pd.read_csv(Path(directory) / "replenishment_switches.csv", encoding="utf-8-sig")
+            self.assertEqual(saved.to_dict(orient="records"), [
+                {"ASIN": "B001", "是否补货": False, "关闭原因": "季节结束"},
+            ])
+            self.assertEqual(invalidate.call_count, 2)
 
 
 if __name__ == "__main__":

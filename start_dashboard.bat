@@ -49,8 +49,9 @@ if not exist "%RUNTIME_DIR%" mkdir "%RUNTIME_DIR%"
 del /q "%STDOUT_LOG%" "%STDERR_LOG%" "%PID_FILE%" >nul 2>&1
 
 echo Starting the local dashboard at %APP_URL% ...
-powershell.exe -NoProfile -ExecutionPolicy Bypass -Command ^
-  "$process = Start-Process -FilePath '%PYTHON%' -ArgumentList '-m','uvicorn','backend.main:app','--host','127.0.0.1','--port','8000' -WorkingDirectory '%~dp0' -RedirectStandardOutput '%STDOUT_LOG%' -RedirectStandardError '%STDERR_LOG%' -WindowStyle Hidden -PassThru; Set-Content -LiteralPath '%PID_FILE%' -Value $process.Id -Encoding ascii"
+rem Use cmd's native background launch: some Windows environments expose both
+rem Path and PATH, which makes PowerShell Start-Process fail before Python starts.
+start "" /b "%PYTHON%" -m uvicorn backend.main:app --host 127.0.0.1 --port 8000 1>"%STDOUT_LOG%" 2>"%STDERR_LOG%"
 if errorlevel 1 (
   echo [ERROR] The API process could not be started.
   exit /b 1
@@ -64,6 +65,11 @@ if errorlevel 1 (
   echo Logs: %STDOUT_LOG% and %STDERR_LOG%
   if exist "%PID_FILE%" powershell.exe -NoProfile -Command "$id = Get-Content -LiteralPath '%PID_FILE%' -ErrorAction SilentlyContinue; if ($id) { Stop-Process -Id $id -ErrorAction SilentlyContinue }"
   exit /b 1
+)
+
+for /f "tokens=5" %%P in ('netstat -ano ^| findstr /r /c:"127.0.0.1:8000 .*LISTENING"') do (
+  > "%PID_FILE%" echo %%P
+  goto open_dashboard
 )
 
 :open_dashboard

@@ -17,6 +17,9 @@ from dashboard.data_processing import (
     COMMISSION_COLUMNS,
     DEPARTMENT_FEE_COLUMNS,
     METRIC_COLUMNS,
+    REPLENISHMENT_COVERAGE_RULE_COLUMNS,
+    REPLENISHMENT_PRODUCT_TAG_COLUMNS,
+    REPLENISHMENT_SWITCH_COLUMNS,
     REPLENISHMENT_TARGET_COLUMNS,
     STORE_COLUMNS,
     TARGET_COLUMNS,
@@ -29,6 +32,9 @@ from dashboard.data_processing import (
     normalize_department_fee_config,
     normalize_month,
     normalize_replenishment_targets,
+    normalize_replenishment_coverage_rules,
+    normalize_replenishment_product_tags,
+    normalize_replenishment_switches,
     normalize_store_config,
     normalize_target_config,
     read_local_table,
@@ -85,27 +91,15 @@ def normalize_metrics(frame: pd.DataFrame) -> pd.DataFrame:
     return result
 
 
-def normalize_column_order(frame: pd.DataFrame) -> pd.DataFrame:
-    columns = ["列名", "排序"]
-    for column in columns:
-        if column not in frame.columns:
-            frame[column] = pd.NA
-    result = frame[columns].copy()
-    result["列名"] = result["列名"].fillna("").astype(str).str.strip()
-    result["排序"] = pd.to_numeric(result["排序"], errors="coerce")
-    result = result[result["列名"].ne("") & result["排序"].notna()].copy()
-    result["排序"] = result["排序"].astype(int)
-    return result.drop_duplicates("列名", keep="last").sort_values("排序").reset_index(drop=True)
-
-
 CONFIGS: dict[str, ConfigDefinition] = {
     "metrics_config": ConfigDefinition("指标公式配置", "维护指标名称、分组、公式、格式、排序和启用状态。", METRIC_COLUMNS, normalize_metrics, ("指标名称", "显示分组")),
     "store_config": ConfigDefinition("店铺配置", "维护店铺类型、停提款月份和所属部门。", STORE_COLUMNS, normalize_store_config, ("店铺名",)),
     "monthly_targets": ConfigDefinition("目标配置", "每位开发员维护固定月目标和目标毛利率。", TARGET_COLUMNS, normalize_target_config, ("开发员",)),
     "department_fee_config": ConfigDefinition("部门费用率", "按月份和部门维护费用率，可填写 8%、0.08 或 8。", DEPARTMENT_FEE_COLUMNS, normalize_department_fee_config, ("月份", "部门")),
     "commission_config": ConfigDefinition("提成配置", "按月份和开发员维护库存计提、弃置和职位提点。", COMMISSION_COLUMNS, normalize_commission_config, ("月份", "开发员")),
-    "replenishment_targets": ConfigDefinition("补货目标", "按 ASIN 维护目标可售天数及可选箱规。", REPLENISHMENT_TARGET_COLUMNS + ["箱规"], normalize_replenishment_targets, ("ASIN",)),
-    "replenishment_column_order": ConfigDefinition("补货列顺序", "维护补货管理明细的列展示顺序。", ["列名", "排序"], normalize_column_order, ("列名",)),
+    "replenishment_coverage_rules": ConfigDefinition("库存覆盖规则", "按重量匹配运输方式，并由头程时效、预警天数和补货频次计算库存覆盖天数。", REPLENISHMENT_COVERAGE_RULE_COLUMNS, normalize_replenishment_coverage_rules, ("运输方式", "重量下限")),
+    "replenishment_switches": ConfigDefinition("补货开关", "按ASIN控制是否进入补货决策矩阵；关闭补货时必须填写原因。", REPLENISHMENT_SWITCH_COLUMNS, normalize_replenishment_switches, ("ASIN",)),
+    "replenishment_product_tags": ConfigDefinition("ASIN产品标签", "按ASIN维护一个或多个产品标签；颜色可留空或填写#RRGGBB。", REPLENISHMENT_PRODUCT_TAG_COLUMNS, normalize_replenishment_product_tags, ("ASIN", "产品标签")),
 }
 
 
@@ -175,8 +169,7 @@ def _validate_numeric_values(name: str, frame: pd.DataFrame) -> None:
         "monthly_targets": ["目标业绩", "目标毛利率"],
         "department_fee_config": ["费用率"],
         "commission_config": ["库存计提", "弃置", "职位提点"],
-        "replenishment_targets": ["目标可售天数", "箱规"],
-        "replenishment_column_order": ["排序"],
+        "replenishment_coverage_rules": ["重量下限", "重量上限", "头程时效", "预警天数", "补货频次"],
     }.get(name, [])
     issues: list[str] = []
     for column in numeric_columns:
@@ -195,6 +188,8 @@ def validate_and_normalize_config(name: str, frame: pd.DataFrame) -> pd.DataFram
     definition = definition_or_404(name)
     _validate_frame_limits(frame)
     working = frame.copy()
+    if name == "replenishment_switches" and "ASIN" not in working.columns and "补货组ID" in working.columns:
+        working = working.rename(columns={"补货组ID": "ASIN"})
     for column in definition.columns:
         if column not in working.columns:
             working[column] = pd.NA
@@ -238,9 +233,56 @@ def _invalidate_dashboard_cache() -> None:
     clear_dashboard_caches()
 
 
+def _invalidate_replenishment_view_cache() -> None:
+    from backend.dashboard_api import clear_replenishment_view_cache
+
+    clear_replenishment_view_cache()
+
+
 def _updated_at(path: Path | None = None) -> str:
     timestamp = datetime.fromtimestamp(path.stat().st_mtime) if path and path.exists() else datetime.now()
     return timestamp.astimezone().isoformat(timespec="seconds")
+
+
+def upsert_replenishment_switch(
+    asin: str,
+    is_replenishment: bool,
+    close_reason: str,
+) -> dict[str, object]:
+    normalized_asin = str(asin or "").strip().upper()
+    normalized_reason = str(close_reason or "").strip()
+    if not normalized_asin:
+        raise ValueError("ASIN不能为空")
+    if not is_replenishment and not normalized_reason:
+        raise ValueError("关闭补货时必须填写关闭原因")
+
+    with _CONFIG_WRITE_LOCK:
+        existing = read_config("replenishment_switches")
+        existing = existing[~existing["ASIN"].fillna("").astype(str).str.upper().eq(normalized_asin)].copy()
+        updated = pd.concat(
+            [
+                existing,
+                pd.DataFrame(
+                    [
+                        {
+                            "ASIN": normalized_asin,
+                            "是否补货": is_replenishment,
+                            "关闭原因": "" if is_replenishment else normalized_reason,
+                        }
+                    ]
+                ),
+            ],
+            ignore_index=True,
+        )
+        normalized = validate_and_normalize_config("replenishment_switches", updated)
+        path = _atomic_write_config("replenishment_switches", normalized)
+        _invalidate_replenishment_view_cache()
+    return {
+        "ASIN": normalized_asin,
+        "is_replenishment": bool(is_replenishment),
+        "close_reason": "" if is_replenishment else normalized_reason,
+        "updated_at": _updated_at(path),
+    }
 
 
 def merge_rows(existing: pd.DataFrame, discovered: pd.DataFrame, keys: list[str]) -> pd.DataFrame:

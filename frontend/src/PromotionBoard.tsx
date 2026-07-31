@@ -7,6 +7,7 @@ import {
   DatePicker,
   Form,
   Input,
+  InputNumber,
   Modal,
   Popconfirm,
   Select,
@@ -15,11 +16,13 @@ import {
   Statistic,
   Table,
   Tag,
+  Tabs,
   Typography,
   message,
 } from 'antd';
 import {
   CopyOutlined,
+  DeleteOutlined,
   DownloadOutlined,
   EditOutlined,
   ReloadOutlined,
@@ -30,11 +33,12 @@ import type { TableProps } from 'antd';
 import {
   api,
   type PromotionCandidate,
-  type PromotionDateInput,
+  type PromotionInput,
   type PromotionDiscount,
-  type PromotionDiscountSummary,
+  type PromotionActivitySummary,
   type PromotionOverview,
   type PromotionPage,
+  type LastPromotionRecord,
   type PromotionRecord,
   type PromotionStatus,
   type PromotionStatusFilter,
@@ -49,11 +53,24 @@ type ListQuery = {
   developers: string[];
 };
 
-type PromotionFormValues = { start_date: Dayjs; end_date?: Dayjs | null };
+type PromotionFormValues = { promotion_name: string; start_date: Dayjs; end_date?: Dayjs | null };
+type ManualPromotionFormValues = {
+  skus_text: string;
+  promotion_name: string;
+  discount_percent: number;
+  promotion_dates: [Dayjs | null, Dayjs | null];
+};
 type PromotionDialog = { kind: 'create'; skus: string[] } | { kind: 'edit'; record: PromotionRecord } | null;
+type PromotionDataTab = 'records' | 'last-promotions' | 'candidates-10' | 'candidates-8' | 'candidates-5';
 
 const defaultQuery: ListQuery = { page: 1, pageSize: 50, search: '', developers: [] };
 const statusColours: Record<PromotionStatus, string> = { pending: 'gold', active: 'green', ended: 'default' };
+const promotionDataTabs: PromotionDataTab[] = ['records', 'last-promotions', 'candidates-10', 'candidates-8', 'candidates-5'];
+
+export function promotionDataTabFromSearch(search: string): PromotionDataTab {
+  const value = new URLSearchParams(search).get('promotion_view');
+  return promotionDataTabs.includes(value as PromotionDataTab) ? value as PromotionDataTab : 'records';
+}
 
 export function promotionStatusLabel(status: PromotionStatus) {
   return status === 'active' ? '正在促销' : status === 'pending' ? '待开始' : '已结束';
@@ -65,8 +82,17 @@ export function promotionRuleLabel(ruleKey: string, discount: number) {
     sales_11_20: '可售≥20，90天销量11–20',
     sales_21_30: '可售≥20，90天销量21–30',
     aged_90d: '90天以上库存兜底',
+    manual: '手动添加',
   };
   return labels[ruleKey] || (discount === 10 ? '可售≥20，90天销量≤10' : discount === 8 ? '可售≥20，90天销量≤20' : '建议降价促销');
+}
+
+export function parseManualSkus(value: string) {
+  return [...new Set(value.split(/\r?\n/).map(item => item.trim()).filter(Boolean))];
+}
+
+function discountTagColor(discount: number) {
+  return discount === 10 ? 'red' : discount === 8 ? 'orange' : discount === 5 ? 'blue' : 'purple';
 }
 
 export function skuCopyText(skus: string[]) {
@@ -98,6 +124,10 @@ function formatUpdatedAt(value?: string | number | null) {
   if (!value) return '';
   const parsed = typeof value === 'number' && value < 10_000_000_000 ? dayjs.unix(value) : dayjs(value);
   return parsed.isValid() ? parsed.format('YYYY-MM-DD HH:mm:ss') : '';
+}
+
+export function promotionDateRange(startDate: string, endDate?: string | null) {
+  return `${startDate} 至 ${endDate || '持续促销'}`;
 }
 
 function queryParams(query: ListQuery, includePage = true) {
@@ -154,29 +184,42 @@ function applyTableSort<T>(sorter: Parameters<NonNullable<TableProps<T>['onChang
   }));
 }
 
-function LiftSummaryChart({ rows }: { rows: PromotionDiscountSummary[] }) {
-  const sorted = ([10, 8, 5] as PromotionDiscount[]).map(discount => rows.find(row => row.discount_percent === discount) || {
-    discount_percent: discount, sku_count: 0, average_7d: 0, average_30d: 0, daily_lift: 0,
-  });
-  const maximum = Math.max(...sorted.map(row => Math.abs(Number(row.daily_lift) || 0)), 1);
-  return <div className="promotion-lift-chart" role="img" aria-label="各折扣日均销量提升对比">
-    {sorted.map(row => {
+function LiftSummaryChart({ rows, deletingName, onDelete }: { rows: PromotionActivitySummary[]; deletingName: string | null; onDelete: (row: PromotionActivitySummary) => void }) {
+  const maximum = Math.max(...rows.map(row => Math.abs(Number(row.daily_lift) || 0)), 1);
+  return <div className="promotion-lift-chart" role="img" aria-label="各促销活动日均销量提升对比">
+    {rows.map(row => {
       const lift = Number(row.daily_lift) || 0;
-      return <div className="promotion-lift-row" key={row.discount_percent}>
-        <Tag color={row.discount_percent === 10 ? 'red' : row.discount_percent === 8 ? 'orange' : 'blue'}>-{row.discount_percent}%</Tag>
+      return <div className="promotion-lift-row" key={row.promotion_name}>
+        <div className="promotion-activity-meta">
+          <Space size={6} wrap>
+            <Tag color="blue">{row.promotion_name}</Tag>
+            {(row.discount_percents || []).map(discount => <Tag key={discount} color={discountTagColor(discount)}>-{discount}%</Tag>)}
+            <Tag color={statusColours[row.status]}>{promotionStatusLabel(row.status)}</Tag>
+          </Space>
+          <Typography.Text type="secondary">{promotionDateRange(row.start_date, row.end_date)}</Typography.Text>
+        </div>
         <div className="promotion-lift-track"><i className={lift >= 0 ? 'positive' : 'negative'} style={{ width: `${Math.abs(lift) / maximum * 50}%` }} /></div>
         <strong className={lift < 0 ? 'promotion-negative' : 'promotion-positive'}>{lift > 0 ? '+' : ''}{formatNumber(lift)}</strong>
         <Typography.Text type="secondary">{formatNumber(row.sku_count, 0)} 个 SKU</Typography.Text>
+        <Popconfirm
+          title={`删除“${row.promotion_name}”促销活动？`}
+          description="会删除该活动下的全部 SKU 记录，删除后无法恢复。"
+          onConfirm={() => onDelete(row)}
+          okText="删除"
+          cancelText="取消"
+          okButtonProps={{ danger: true }}
+        ><Button size="small" type="link" danger icon={<DeleteOutlined />} loading={deletingName === row.promotion_name} disabled={deletingName !== null}>删除活动</Button></Popconfirm>
       </div>;
     })}
   </div>;
 }
 
-function PromotionOverviewPanel({ refreshToken }: { refreshToken: number }) {
+function PromotionOverviewPanel({ refreshToken, onRefresh }: { refreshToken: number; onRefresh: () => void }) {
   const [data, setData] = useState<PromotionOverview | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [retry, setRetry] = useState(0);
+  const [deletingName, setDeletingName] = useState<string | null>(null);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -187,6 +230,19 @@ function PromotionOverviewPanel({ refreshToken }: { refreshToken: number }) {
     }).finally(() => { if (!controller.signal.aborted) setLoading(false); });
     return () => controller.abort();
   }, [refreshToken, retry]);
+
+  const removeActivity = async (row: PromotionActivitySummary) => {
+    setDeletingName(row.promotion_name);
+    try {
+      const result = await api.deletePromotionActivity(row.promotion_name);
+      message.success(`已删除“${row.promotion_name}”活动及 ${result.deleted} 条 SKU 记录`);
+      onRefresh();
+    } catch (reason) {
+      message.error(reason instanceof Error ? reason.message : '删除促销活动失败');
+    } finally {
+      setDeletingName(null);
+    }
+  };
 
   if (loading && !data) return <Card className="promotion-overview-card"><Skeleton active paragraph={{ rows: 4 }} /></Card>;
   return <>
@@ -200,8 +256,8 @@ function PromotionOverviewPanel({ refreshToken }: { refreshToken: number }) {
         <Card><Statistic title="单 SKU 平均提升" value={`${Number(data.daily_lift_average) > 0 ? '+' : ''}${formatNumber(data.daily_lift_average)}`} valueStyle={{ color: Number(data.daily_lift_average) < 0 ? '#ef4444' : '#16a34a' }} /></Card>
       </div>
       {Number(data.source_missing_count) > 0 && <Alert className="promotion-source-warning" type="warning" showIcon message={`${formatNumber(data.source_missing_count, 0)} 个促销 SKU 已不在当前源数据中`} description="记录仍会保留，但不会计入上方销量提升汇总。" />}
-      <Card className="promotion-overview-card" title="各折扣日均销量提升" extra={formatUpdatedAt(data.updated_at) ? <Typography.Text type="secondary">数据更新时间 {formatUpdatedAt(data.updated_at)}</Typography.Text> : null}>
-        <LiftSummaryChart rows={data.by_discount || []} />
+      <Card className="promotion-overview-card" title="各促销活动日均销量提升" extra={formatUpdatedAt(data.updated_at) ? <Typography.Text type="secondary">数据更新时间 {formatUpdatedAt(data.updated_at)}</Typography.Text> : null}>
+        <LiftSummaryChart rows={data.by_promotion || []} deletingName={deletingName} onDelete={removeActivity} />
       </Card>
     </>}
   </>;
@@ -255,7 +311,7 @@ function CandidateTable({ discount, refreshToken, onMark }: { discount: Promotio
     { ...sortableColumn<PromotionCandidate>('average_7d', '7天日均', query, 105), align: 'right', render: value => formatNumber(value) },
     { ...sortableColumn<PromotionCandidate>('average_30d', '30天日均', query, 105), align: 'right', render: value => formatNumber(value) },
     { ...sortableColumn<PromotionCandidate>('daily_lift', '日均提升', query, 110), align: 'right', render: value => <span className={Number(value) < 0 ? 'promotion-negative' : 'promotion-positive'}>{Number(value) > 0 ? '+' : ''}{formatNumber(value)}</span> },
-    { key: 'discount_percent', dataIndex: 'discount_percent', title: '建议折扣', width: 100, render: value => <Tag color={discount === 10 ? 'red' : discount === 8 ? 'orange' : 'blue'}>-{value}%</Tag> },
+    { key: 'discount_percent', dataIndex: 'discount_percent', title: '建议折扣', width: 100, render: value => <Tag color={discountTagColor(discount)}>-{value}%</Tag> },
     { key: 'rule_key', dataIndex: 'rule_key', title: '命中策略', width: 210, render: value => promotionRuleLabel(String(value), discount) },
     { key: 'action', title: '操作', fixed: 'right', width: 110, render: (_, row) => <Button size="small" type="link" icon={<TagsOutlined />} onClick={() => onMark([row.sku])}>标记促销</Button> },
   ];
@@ -264,7 +320,7 @@ function CandidateTable({ discount, refreshToken, onMark }: { discount: Promotio
     setSelected([]);
     setQuery(current => ({ ...current, page: 1, search: value.trim() }));
   };
-  return <Card className="promotion-table-card" title={<Space><Tag color={discount === 10 ? 'red' : discount === 8 ? 'orange' : 'blue'}>-{discount}%</Tag><span>促销候选</span><Typography.Text type="secondary">共 {formatNumber(data?.total ?? 0, 0)} 个</Typography.Text></Space>}>
+  return <Card className="promotion-table-card">
     <div className="promotion-table-toolbar">
       <Space wrap>
         <Input.Search value={searchDraft} onChange={event => setSearchDraft(event.target.value)} onSearch={applySearch} allowClear placeholder="搜索 SKU、ASIN、开发员" style={{ width: 260 }} />
@@ -295,6 +351,54 @@ function CandidateTable({ discount, refreshToken, onMark }: { discount: Promotio
   </Card>;
 }
 
+function LastPromotionTable({ refreshToken }: { refreshToken: number }) {
+  const [data, setData] = useState<PromotionPage<LastPromotionRecord> | null>(null);
+  const [query, setQuery] = useState<ListQuery>(defaultQuery);
+  const [searchDraft, setSearchDraft] = useState('');
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+  const [retry, setRetry] = useState(0);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    setLoading(true); setError('');
+    setData(current => current ? { ...current, rows: [] } : null);
+    api.lastPromotions(queryParams(query) as Parameters<typeof api.lastPromotions>[0], controller.signal).then(setData).catch(reason => {
+      if (reason instanceof DOMException && reason.name === 'AbortError') return;
+      setError(reason instanceof Error ? reason.message : '最后一次促销记录加载失败');
+    }).finally(() => { if (!controller.signal.aborted) setLoading(false); });
+    return () => controller.abort();
+  }, [query.page, query.pageSize, query.search, query.sortBy, query.sortOrder, refreshToken, retry]);
+
+  const columns: NonNullable<TableProps<LastPromotionRecord>['columns']> = [
+    { ...sortableColumn<LastPromotionRecord>('sku', 'SKU', query, 220), fixed: 'left', render: value => <Typography.Text copyable={{ text: String(value) }}>{String(value)}</Typography.Text> },
+    { ...sortableColumn<LastPromotionRecord>('promotion_content', '促销内容', query, 460), render: value => String(value || '-') },
+  ];
+
+  return <Card className="promotion-table-card promotion-last-promotion-card">
+    <div className="promotion-table-toolbar">
+      <Space wrap>
+        <Input.Search value={searchDraft} onChange={event => setSearchDraft(event.target.value)} onSearch={value => setQuery(current => ({ ...current, page: 1, search: value.trim() }))} allowClear placeholder="搜索 SKU 或促销内容" style={{ width: 320 }} />
+        <Button icon={<DownloadOutlined />} onClick={() => download(exportUrl('/api/promotions/last-promotions/export.csv', query))}>导出 CSV</Button>
+      </Space>
+    </div>
+    {error && <Alert className="section-load-error" type="error" showIcon message="最后一次促销记录加载失败" description={error} action={<Button size="small" onClick={() => setRetry(value => value + 1)}>重试</Button>} />}
+    <Table<LastPromotionRecord>
+      rowKey="sku"
+      size="small"
+      loading={loading}
+      dataSource={data?.rows || []}
+      columns={columns}
+      scroll={{ x: 700 }}
+      pagination={{ current: query.page, pageSize: query.pageSize, total: data?.total || 0, showSizeChanger: true, pageSizeOptions: [20, 50, 100, 200], showTotal: total => `共 ${total} 条` }}
+      onChange={(pagination, _filters, sorter, extra) => {
+        if (extra.action === 'sort') applyTableSort(sorter, setQuery);
+        else setQuery(current => ({ ...current, page: pagination.pageSize !== current.pageSize ? 1 : pagination.current || 1, pageSize: pagination.pageSize || 50 }));
+      }}
+    />
+  </Card>;
+}
+
 function PromotionDateModal({ dialog, onClose, onSaved }: { dialog: PromotionDialog; onClose: () => void; onSaved: () => void }) {
   const [form] = Form.useForm<PromotionFormValues>();
   const [saving, setSaving] = useState(false);
@@ -304,8 +408,9 @@ function PromotionDateModal({ dialog, onClose, onSaved }: { dialog: PromotionDia
     if (!dialog) return;
     form.resetFields();
     form.setFieldsValue(dialog.kind === 'edit' ? {
+      promotion_name: dialog.record.promotion_name,
       start_date: dayjs(dialog.record.start_date), end_date: dialog.record.end_date ? dayjs(dialog.record.end_date) : null,
-    } : { start_date: dayjs(), end_date: null });
+    } : { promotion_name: '', start_date: dayjs(), end_date: null });
   }, [dialog, form]);
 
   const close = () => { if (!savingRef.current) { form.resetFields(); onClose(); } };
@@ -316,7 +421,11 @@ function PromotionDateModal({ dialog, onClose, onSaved }: { dialog: PromotionDia
     try { values = await form.validateFields(); }
     catch { savingRef.current = false; return; }
     setSaving(true);
-    const payload: PromotionDateInput = { start_date: values.start_date.format('YYYY-MM-DD'), end_date: values.end_date ? values.end_date.format('YYYY-MM-DD') : null };
+    const payload: PromotionInput = {
+      promotion_name: values.promotion_name,
+      start_date: values.start_date.format('YYYY-MM-DD'),
+      end_date: values.end_date ? values.end_date.format('YYYY-MM-DD') : null,
+    };
     try {
       if (dialog.kind === 'edit') await api.updatePromotion(dialog.record.id, payload);
       else await api.createPromotions(dialog.skus, payload);
@@ -328,7 +437,7 @@ function PromotionDateModal({ dialog, onClose, onSaved }: { dialog: PromotionDia
 
   const skus = dialog?.kind === 'create' ? dialog.skus : [];
   return <Modal
-    title={dialog?.kind === 'edit' ? `编辑促销日期 · ${dialog.record.sku}` : '标记正在促销'}
+    title={dialog?.kind === 'edit' ? `编辑促销 · ${dialog.record.sku}` : '标记正在促销'}
     open={Boolean(dialog)}
     onCancel={close}
     onOk={() => void submit()}
@@ -343,6 +452,10 @@ function PromotionDateModal({ dialog, onClose, onSaved }: { dialog: PromotionDia
   >
     {dialog?.kind === 'create' && <Alert className="promotion-dialog-summary" type="info" showIcon message={`将标记 ${skus.length} 个 SKU`} description={<Typography.Paragraph ellipsis={{ rows: 3, expandable: true, symbol: '展开' }} copyable={{ text: skuCopyText(skus) }}>{skus.join('、')}</Typography.Paragraph>} />}
     <Form form={form} layout="vertical" preserve={false}>
+      <Form.Item name="promotion_name" label="促销名称" rules={[
+        { required: true, whitespace: true, message: '请输入促销名称' },
+        { max: 100, message: '促销名称不能超过 100 个字符' },
+      ]}><Input maxLength={100} showCount placeholder="例如：8月会员日促销" /></Form.Item>
       <Form.Item name="start_date" label="开始日期" rules={[{ required: true, message: '请选择开始日期' }]}><DatePicker allowClear={false} style={{ width: '100%' }} /></Form.Item>
       <Form.Item name="end_date" label="结束日期（可不填）" dependencies={['start_date']} rules={[({ getFieldValue }) => ({ validator(_, value?: Dayjs | null) { const start = getFieldValue('start_date') as Dayjs | undefined; return value && start && value.isBefore(start, 'day') ? Promise.reject(new Error('结束日期不能早于开始日期')) : Promise.resolve(); } })]}><DatePicker placeholder="不填表示持续促销" style={{ width: '100%' }} /></Form.Item>
       <Typography.Text type="secondary">结束日期当天仍计为“正在促销”，次日自动转为“已结束”。</Typography.Text>
@@ -350,7 +463,96 @@ function PromotionDateModal({ dialog, onClose, onSaved }: { dialog: PromotionDia
   </Modal>;
 }
 
-function RecordsTable({ refreshToken, onRefresh, onEdit }: { refreshToken: number; onRefresh: () => void; onEdit: (record: PromotionRecord) => void }) {
+function ManualPromotionModal({ open, onClose, onSaved }: { open: boolean; onClose: () => void; onSaved: () => void }) {
+  const [form] = Form.useForm<ManualPromotionFormValues>();
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState('');
+  const savingRef = useRef(false);
+  const skuText = Form.useWatch('skus_text', form) || '';
+  const skuCount = parseManualSkus(skuText).length;
+
+  useEffect(() => {
+    if (!open) return;
+    setError('');
+    form.resetFields();
+    form.setFieldsValue({ skus_text: '', promotion_name: '', promotion_dates: [dayjs(), null] });
+  }, [open, form]);
+
+  const close = () => {
+    if (savingRef.current) return;
+    setError('');
+    form.resetFields();
+    onClose();
+  };
+
+  const submit = async () => {
+    if (savingRef.current) return;
+    savingRef.current = true;
+    let values: ManualPromotionFormValues;
+    try { values = await form.validateFields(); }
+    catch { savingRef.current = false; return; }
+    const skus = parseManualSkus(values.skus_text);
+    const [startDate, endDate] = values.promotion_dates;
+    setSaving(true); setError('');
+    try {
+      const response = await api.createManualPromotions(skus, {
+        promotion_name: values.promotion_name,
+        discount_percent: values.discount_percent,
+        start_date: startDate!.format('YYYY-MM-DD'),
+        end_date: endDate ? endDate.format('YYYY-MM-DD') : null,
+      });
+      const pending = response.created.filter(row => row.status === 'pending').length;
+      const replaced = response.replaced || 0;
+      const details = [
+        replaced ? `覆盖 ${replaced} 个现有记录` : '',
+        pending ? `${pending} 个待开始` : '',
+      ].filter(Boolean).join('，');
+      message.success(`已保存 ${response.created.length} 个促销 SKU${details ? `，${details}` : ''}`);
+      form.resetFields(); onClose(); onSaved();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : '手动添加失败，请重试');
+    } finally {
+      savingRef.current = false; setSaving(false);
+    }
+  };
+
+  return <Modal
+    title="手动添加促销 SKU"
+    open={open}
+    onCancel={close}
+    onOk={() => void submit()}
+    okText="保存"
+    cancelText="取消"
+    confirmLoading={saving}
+    closable={!saving}
+    maskClosable={!saving}
+    keyboard={!saving}
+    cancelButtonProps={{ disabled: saving }}
+    destroyOnHidden
+  >
+    {error && <Alert className="promotion-dialog-summary" type="error" showIcon message="手动添加失败" description={error} />}
+    <Form form={form} layout="vertical" preserve={false} disabled={saving}>
+      <Form.Item name="skus_text" label="SKU（一行一个）" extra={skuCount ? `已识别 ${skuCount} 个去重 SKU` : '空行会自动忽略'} rules={[
+        { required: true, message: '请输入 SKU' },
+        { validator(_, value?: string) { const skus = parseManualSkus(value || ''); if (!skus.length) return Promise.reject(new Error('至少输入一个 SKU')); if (skus.length > 5000) return Promise.reject(new Error('单次最多添加 5000 个 SKU')); if (skus.some(sku => sku.length > 200)) return Promise.reject(new Error('单个 SKU 不能超过 200 个字符')); return Promise.resolve(); } },
+      ]}><Input.TextArea autoSize={{ minRows: 5, maxRows: 12 }} placeholder={'SKU-A\nSKU-B\nSKU-C'} /></Form.Item>
+      <Form.Item name="promotion_name" label="促销名称" rules={[
+        { required: true, whitespace: true, message: '请输入促销名称' },
+        { max: 100, message: '促销名称不能超过 100 个字符' },
+      ]}><Input maxLength={100} showCount placeholder="例如：8月会员日促销" /></Form.Item>
+      <Form.Item name="discount_percent" label="促销力度" rules={[
+        { required: true, message: '请输入促销力度' },
+        { validator(_, value?: number) { return Number.isInteger(value) && Number(value) >= 1 && Number(value) <= 99 ? Promise.resolve() : Promise.reject(new Error('促销力度必须是 1–99 的整数')); } },
+      ]}><InputNumber min={1} max={99} precision={0} suffix="%" placeholder="例如 12" style={{ width: '100%' }} /></Form.Item>
+      <Form.Item name="promotion_dates" label="促销日期" rules={[
+        { validator(_, value?: [Dayjs | null, Dayjs | null]) { return value?.[0] ? Promise.resolve() : Promise.reject(new Error('请选择开始日期')); } },
+      ]}><DatePicker.RangePicker allowEmpty={[false, true]} placeholder={['开始日期', '结束日期（可留空）']} style={{ width: '100%' }} /></Form.Item>
+      <Typography.Text type="secondary">结束日期留空表示持续促销；结束日期当天仍计为“正在促销”。</Typography.Text>
+    </Form>
+  </Modal>;
+}
+
+function RecordsTable({ refreshToken, onRefresh, onEdit, onManualAdd }: { refreshToken: number; onRefresh: () => void; onEdit: (record: PromotionRecord) => void; onManualAdd: () => void }) {
   const [data, setData] = useState<PromotionPage<PromotionRecord> | null>(null);
   const [query, setQuery] = useState<ListQuery>(defaultQuery);
   const [status, setStatus] = useState<PromotionStatusFilter>('active');
@@ -374,7 +576,11 @@ function RecordsTable({ refreshToken, onRefresh, onEdit }: { refreshToken: numbe
   const endToday = async (record: PromotionRecord) => {
     setActionId(record.id);
     try {
-      await api.updatePromotion(record.id, { start_date: record.start_date, end_date: dayjs().format('YYYY-MM-DD') });
+      await api.updatePromotion(record.id, {
+        promotion_name: record.promotion_name,
+        start_date: record.start_date,
+        end_date: dayjs().format('YYYY-MM-DD'),
+      });
       message.success('已将结束日期设为今天'); onRefresh();
     } catch (reason) { message.error(reason instanceof Error ? reason.message : '结束促销失败'); }
     finally { setActionId(null); }
@@ -389,7 +595,8 @@ function RecordsTable({ refreshToken, onRefresh, onEdit }: { refreshToken: numbe
   const columns: NonNullable<TableProps<PromotionRecord>['columns']> = [
     { ...sortableColumn<PromotionRecord>('sku', 'SKU', query, 170), fixed: 'left', render: value => <Typography.Text copyable={{ text: String(value) }}>{String(value)}</Typography.Text> },
     { key: 'status', dataIndex: 'status', title: '状态', width: 105, render: (value: PromotionStatus) => <Tag color={statusColours[value]}>{promotionStatusLabel(value)}</Tag> },
-    { ...sortableColumn<PromotionRecord>('discount_percent', '折扣', query, 80), render: value => <Tag color={Number(value) === 10 ? 'red' : Number(value) === 8 ? 'orange' : 'blue'}>-{value}%</Tag> },
+    { ...sortableColumn<PromotionRecord>('promotion_name', '促销名称', query, 180), render: value => value || '历史未命名促销' },
+    { ...sortableColumn<PromotionRecord>('discount_percent', '折扣', query, 80), render: value => <Tag color={discountTagColor(Number(value))}>-{value}%</Tag> },
     { key: 'asin', title: 'ASIN', width: 130, render: (_, row) => row.asin || row.asin_snapshot || '-' },
     { key: 'developer', title: '开发员', width: 110, render: (_, row) => row.developer || row.developer_snapshot || '未配置' },
     { ...sortableColumn<PromotionRecord>('start_date', '开始日期', query, 115) },
@@ -406,14 +613,17 @@ function RecordsTable({ refreshToken, onRefresh, onEdit }: { refreshToken: numbe
     </Space> },
   ];
 
-  return <Card className="promotion-table-card promotion-record-card" title={<Space><span>已开促销 SKU</span><Typography.Text type="secondary">共 {formatNumber(data?.total ?? 0, 0)} 条</Typography.Text></Space>}>
+  return <Card className="promotion-table-card promotion-record-card">
     <div className="promotion-table-toolbar">
       <Space wrap>
         <Select value={status} onChange={value => { setStatus(value); setQuery(current => ({ ...current, page: 1 })); }} options={[{ value: 'active', label: '正在促销' }, { value: 'pending', label: '待开始' }, { value: 'ended', label: '已结束' }, { value: 'all', label: '全部状态' }]} style={{ width: 140 }} />
         <Input.Search value={searchDraft} onChange={event => setSearchDraft(event.target.value)} onSearch={value => setQuery(current => ({ ...current, page: 1, search: value.trim() }))} allowClear placeholder="搜索 SKU、ASIN、开发员" style={{ width: 260 }} />
         <Select mode="multiple" maxTagCount="responsive" value={query.developers} onChange={values => setQuery(current => ({ ...current, page: 1, developers: values }))} allowClear placeholder="筛选开发员" options={(data?.developers || []).map(value => ({ value, label: value }))} style={{ minWidth: 220 }} />
       </Space>
-      <Button icon={<DownloadOutlined />} onClick={() => download(exportUrl('/api/promotions/records/export.csv', query, { status }))}>导出 CSV</Button>
+      <Space>
+        <Button type="primary" icon={<TagsOutlined />} onClick={onManualAdd}>手动添加促销 SKU</Button>
+        <Button icon={<DownloadOutlined />} onClick={() => download(exportUrl('/api/promotions/records/export.csv', query, { status }))}>导出 CSV</Button>
+      </Space>
     </div>
     {error && <Alert className="section-load-error" type="error" showIcon message="促销记录加载失败" description={error} action={<Button size="small" onClick={() => setRetry(value => value + 1)}>重试</Button>} />}
     <Table<PromotionRecord>
@@ -422,7 +632,7 @@ function RecordsTable({ refreshToken, onRefresh, onEdit }: { refreshToken: numbe
       loading={loading}
       dataSource={data?.rows || []}
       columns={columns}
-      scroll={{ x: 1600 }}
+      scroll={{ x: 1780 }}
       pagination={{ current: query.page, pageSize: query.pageSize, total: data?.total || 0, showSizeChanger: true, pageSizeOptions: [20, 50, 100, 200], showTotal: total => `共 ${total} 条` }}
       onChange={(pagination, _filters, sorter, extra) => {
         if (extra.action === 'sort') applyTableSort(sorter, setQuery);
@@ -432,19 +642,62 @@ function RecordsTable({ refreshToken, onRefresh, onEdit }: { refreshToken: numbe
   </Card>;
 }
 
-export default function PromotionBoard() {
+export default function PromotionBoard({ active = true, routeVersion = 0, refreshVersion = 0 }: { active?: boolean; routeVersion?: number; refreshVersion?: number }) {
   const [refreshToken, setRefreshToken] = useState(0);
   const [dialog, setDialog] = useState<PromotionDialog>(null);
+  const [manualOpen, setManualOpen] = useState(false);
+  const [dataTab, setDataTab] = useState<PromotionDataTab>(() => promotionDataTabFromSearch(window.location.search));
+  const externalRefreshVersion = useRef(refreshVersion);
+  const externalRouteVersion = useRef(routeVersion);
   const refresh = useCallback(() => setRefreshToken(value => value + 1), []);
+
+  useEffect(() => {
+    const onPopState = () => { if (active) setDataTab(promotionDataTabFromSearch(window.location.search)); };
+    window.addEventListener('popstate', onPopState);
+    return () => window.removeEventListener('popstate', onPopState);
+  }, [active]);
+  useEffect(() => {
+    if (!active || externalRefreshVersion.current === refreshVersion) return;
+    externalRefreshVersion.current = refreshVersion;
+    refresh();
+  }, [active, refresh, refreshVersion]);
+  useEffect(() => {
+    if (!active || externalRouteVersion.current === routeVersion) return;
+    externalRouteVersion.current = routeVersion;
+    setDataTab(promotionDataTabFromSearch(window.location.search));
+  }, [active, routeVersion]);
+
+  const changeDataTab = (value: string) => {
+    const next = value as PromotionDataTab;
+    if (next === dataTab) return;
+    const url = new URL(window.location.href);
+    url.searchParams.set('promotion_view', next);
+    window.history.pushState({}, '', url);
+    window.dispatchEvent(new Event('sales-dashboard-route-change'));
+    setDataTab(next);
+  };
+
+  const tabItems = [
+    { key: 'records', label: '已开促销 SKU' },
+    { key: 'last-promotions', label: 'SKU 最后一次促销' },
+    { key: 'candidates-10', label: '促销候选 -10%' },
+    { key: 'candidates-8', label: '促销候选 -8%' },
+    { key: 'candidates-5', label: '促销候选 -5%' },
+  ];
+
   return <div className="promotion-board">
     <div className="page-heading promotion-page-heading">
       <div><Typography.Title level={2}>促销提醒</Typography.Title><Typography.Text type="secondary">自动识别动销折扣候选，并跟踪正在促销 SKU 的日均销量变化</Typography.Text></div>
       <Button icon={<ReloadOutlined />} onClick={refresh}>刷新全部</Button>
     </div>
-    <PromotionOverviewPanel refreshToken={refreshToken} />
-    <RecordsTable refreshToken={refreshToken} onRefresh={refresh} onEdit={record => setDialog({ kind: 'edit', record })} />
-    <div className="promotion-candidate-heading"><Typography.Title level={3}>待标记促销候选</Typography.Title><Typography.Text type="secondary">正在促销和待开始的 SKU 已自动排除；已结束后如仍满足策略会重新出现。</Typography.Text></div>
-    {([10, 8, 5] as PromotionDiscount[]).map(discount => <CandidateTable key={discount} discount={discount} refreshToken={refreshToken} onMark={skus => setDialog({ kind: 'create', skus })} />)}
+    <PromotionOverviewPanel refreshToken={refreshToken} onRefresh={refresh} />
+    <Tabs className="promotion-data-tabs" activeKey={dataTab} onChange={changeDataTab} items={tabItems} />
+    {dataTab === 'records' && <RecordsTable refreshToken={refreshToken} onRefresh={refresh} onEdit={record => setDialog({ kind: 'edit', record })} onManualAdd={() => setManualOpen(true)} />}
+    {dataTab === 'last-promotions' && <LastPromotionTable refreshToken={refreshToken} />}
+    {dataTab === 'candidates-10' && <CandidateTable discount={10} refreshToken={refreshToken} onMark={skus => setDialog({ kind: 'create', skus })} />}
+    {dataTab === 'candidates-8' && <CandidateTable discount={8} refreshToken={refreshToken} onMark={skus => setDialog({ kind: 'create', skus })} />}
+    {dataTab === 'candidates-5' && <CandidateTable discount={5} refreshToken={refreshToken} onMark={skus => setDialog({ kind: 'create', skus })} />}
     <PromotionDateModal dialog={dialog} onClose={() => setDialog(null)} onSaved={refresh} />
+    <ManualPromotionModal open={manualOpen} onClose={() => setManualOpen(false)} onSaved={refresh} />
   </div>;
 }

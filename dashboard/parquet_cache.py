@@ -14,7 +14,7 @@ import pandas as pd
 
 ROOT = Path(__file__).resolve().parent.parent
 CACHE_DIR = ROOT / "data" / "cache"
-CACHE_SCHEMA_VERSION = "3"
+CACHE_SCHEMA_VERSION = "4"
 _CACHE_LOCK = RLock()
 
 

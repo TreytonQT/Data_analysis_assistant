@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Alert, Button, Card, Input, Popconfirm, Select, Space, Spin, Table, Tabs, Tag, Typography, Upload, message } from 'antd';
 import { DeleteOutlined, DownloadOutlined, PlusOutlined, ReloadOutlined, SaveOutlined, UploadOutlined } from '@ant-design/icons';
 import type { UploadProps } from 'antd';
@@ -40,13 +40,16 @@ function cellEditor(
   disabled: boolean,
   update: (rowId: string, column: string, value: unknown) => void,
 ) {
-  if (column === '是否启用') return <Select disabled={disabled} value={String(value || '否')} style={{ width: 90 }} options={[{ value: '是', label: '是' }, { value: '否', label: '否' }]} onChange={next => update(rowId, column, next)} />;
+  if (column === '是否启用' || column === '是否补货') {
+    const enabled = value === true || ['1', 'true', 'yes', 'y', '是', '启用'].includes(String(value || '').trim().toLowerCase());
+    return <Select disabled={disabled} value={enabled ? '是' : '否'} style={{ width: 90 }} options={[{ value: '是', label: '是' }, { value: '否', label: '否' }]} onChange={next => update(rowId, column, next)} />;
+  }
   if (column === '店铺类型') return <Select disabled={disabled} allowClear value={value ? String(value) : undefined} style={{ minWidth: 110 }} options={['中企', '本土', '其他'].map(item => ({ value: item, label: item }))} onChange={next => update(rowId, column, next || '')} />;
   if (column === '公式') return <Input.TextArea disabled={disabled} value={String(value ?? '')} autoSize={{ minRows: 1, maxRows: 4 }} onChange={event => update(rowId, column, event.target.value)} />;
   return <Input disabled={disabled} value={String(value ?? '')} onChange={event => update(rowId, column, event.target.value)} />;
 }
 
-export default function ConfigCenter() {
+export default function ConfigCenter({ active: pageActive = true, refreshVersion = 0 }: { active?: boolean; refreshVersion?: number }) {
   const [configs, setConfigs] = useState<EditableConfig[]>([]);
   const [active, setActive] = useState('metrics_config');
   const [saving, setSaving] = useState('');
@@ -54,6 +57,7 @@ export default function ConfigCenter() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [lastUpdated, setLastUpdated] = useState('');
+  const seenRefreshVersion = useRef(refreshVersion);
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -72,6 +76,11 @@ export default function ConfigCenter() {
   }, []);
 
   useEffect(() => { void refresh(); }, [refresh]);
+  useEffect(() => {
+    if (!pageActive || seenRefreshVersion.current === refreshVersion) return;
+    seenRefreshVersion.current = refreshVersion;
+    void refresh();
+  }, [pageActive, refresh, refreshVersion]);
 
   const markDirty = (name: string) => setDirty(current => {
     const next = new Set(current); next.add(name); return next;
@@ -170,7 +179,7 @@ export default function ConfigCenter() {
   const reloadButton = <Button disabled={loading || Boolean(saving)} loading={loading} icon={<ReloadOutlined />} onClick={() => { if (!hasDirty) void refresh(); }}>重新载入</Button>;
   return <>
     <div className="page-heading">
-      <div><Typography.Title level={2}>配置中心</Typography.Title><Typography.Text type="secondary">七类配置均使用原项目的规范化规则，保存前自动校验字段、月份、百分比和数值。{lastUpdated && ` · 数据更新时间 ${lastUpdated}`}</Typography.Text></div>
+      <div><Typography.Title level={2}>配置中心</Typography.Title><Typography.Text type="secondary">所有配置均在保存前校验字段、数值和业务规则；库存覆盖规则会校验重量区间完整且不重叠。{lastUpdated && ` · 数据更新时间 ${lastUpdated}`}</Typography.Text></div>
       {hasDirty ? <Popconfirm title="放弃全部未保存修改并重新载入吗？" onConfirm={() => void refresh()}>{reloadButton}</Popconfirm> : reloadButton}
     </div>
     {error && <Alert className="persistent-page-error" type="error" showIcon message="配置操作失败" description={error} action={hasDirty ? <Button size="small" onClick={() => setError('')}>保留本地修改</Button> : <Button size="small" onClick={() => void refresh()}>重新加载</Button>} />}

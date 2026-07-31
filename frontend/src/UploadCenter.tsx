@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Alert, Button, Card, Modal, Popconfirm, Space, Spin, Table, Tag, Typography, Upload, message } from 'antd';
 import { DeleteOutlined, DownloadOutlined, EyeOutlined, InboxOutlined, ReloadOutlined } from '@ant-design/icons';
 import type { TableProps, UploadProps } from 'antd';
@@ -8,6 +8,7 @@ const sourceDefinitions = [
   { key: 'operational_sales', title: '运营原始表', accept: '.xls,.xlsx', description: '个人销量、库存、库龄、产品和补货分析的核心数据源' },
   { key: 'gross_profit', title: '毛利原始表', accept: '.csv,.xls,.xlsx', description: '产品毛利率、广告费和异常原因分析' },
   { key: 'rating', title: 'Rating', accept: '.xls,.xlsx', description: 'ASIN 各站点评分和评价数量' },
+  { key: 'sales_history_2025', title: '25年销量明细', accept: '.xlsx', description: '仅接收1月至12月十二-sheet原始表，按ASIN汇总四站销量、出单天数和除0日均，不参与建议补货计算' },
   { key: 'sales_volume_detail', title: '销量明细', accept: '.csv', description: '部门监控的销量明细数据' },
   { key: 'sales_amount_detail', title: '销售额明细', accept: '.csv', description: '部门监控的销售额明细数据' },
 ];
@@ -24,13 +25,14 @@ function latestUploadTime(data: ReportsResponse) {
   return timestamps.at(-1) || '';
 }
 
-export default function UploadCenter() {
+export default function UploadCenter({ active = true, refreshVersion = 0 }: { active?: boolean; refreshVersion?: number }) {
   const [data, setData] = useState<ReportsResponse>({ reports: [], sources: {} });
   const [initialLoading, setInitialLoading] = useState(true);
   const [pending, setPending] = useState<Record<string, number>>({});
   const [error, setError] = useState('');
   const [lastUpdated, setLastUpdated] = useState('');
   const [preview, setPreview] = useState<{ title: string; columns: string[]; rows: Record<string, unknown>[]; total: number }>();
+  const seenRefreshVersion = useRef(refreshVersion);
 
   const begin = (key: string) => setPending(current => ({ ...current, [key]: (current[key] || 0) + 1 }));
   const end = (key: string) => setPending(current => {
@@ -54,6 +56,11 @@ export default function UploadCenter() {
     }
   }, []);
   useEffect(() => { void refresh(); }, [refresh]);
+  useEffect(() => {
+    if (!active || seenRefreshVersion.current === refreshVersion) return;
+    seenRefreshVersion.current = refreshVersion;
+    void refresh(false);
+  }, [active, refresh, refreshVersion]);
 
   const uploader = (key: string, url: string, multiple = false, accept?: string): UploadProps => ({
     accept, multiple, showUploadList: false,
@@ -144,12 +151,12 @@ export default function UploadCenter() {
     <Spin spinning={initialLoading} tip="正在读取上传记录…"><div className="page-loading-min-height">
       <Typography.Title level={4}>个人监控数据源</Typography.Title>
       <div className="upload-grid">
-        {sourceDefinitions.slice(0, 3).map(sourceCard)}
+        {sourceDefinitions.slice(0, 4).map(sourceCard)}
         <Card title="业绩报表 CSV" data-testid="performance-reports"><Typography.Paragraph type="secondary">支持一次拖入或选择多个文件；相同月份会替换原记录。</Typography.Paragraph><Spin spinning={isPending('upload-performance')} tip="正在逐个校验并保存…"><Dragger {...uploader('performance', '/api/reports/performance', true, '.csv')} disabled={isPending('upload-performance')} className="source-dragger"><p className="ant-upload-drag-icon"><InboxOutlined /></p><p className="ant-upload-text">拖拽一个或多个 CSV 到这里，或点击选择</p><p className="ant-upload-hint">每个文件都会先校验，再保存为对应月份的业绩报表</p></Dragger></Spin></Card>
       </div>
       <Card title="已上传业绩报表" className="section-card"><Table rowKey={row => String(row['月份'])} columns={reportColumns} dataSource={data.reports} pagination={{ pageSize: 8 }} scroll={{ x: 760 }} locale={{ emptyText: '暂无业绩报表' }} /></Card>
       <Typography.Title level={4}>部门监控数据源</Typography.Title>
-      <div className="upload-grid">{sourceDefinitions.slice(3).map(sourceCard)}</div>
+      <div className="upload-grid">{sourceDefinitions.slice(4).map(sourceCard)}</div>
     </div></Spin>
     <Modal width="90vw" title={preview ? `${preview.title}预览（共 ${preview.total} 行，显示前 ${preview.rows.length} 行）` : '数据预览'} open={!!preview} footer={null} onCancel={() => setPreview(undefined)} destroyOnHidden>{preview && <Table rowKey={(_, index) => String(index)} size="small" columns={preview.columns.map(column => ({ title: column, dataIndex: column, key: column, ellipsis: true }))} dataSource={preview.rows} scroll={{ x: 'max-content', y: 500 }} pagination={{ pageSize: 15 }} />}</Modal>
   </>;

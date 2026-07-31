@@ -4,25 +4,31 @@ import io
 import json
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 from urllib.parse import quote
 
 import pandas as pd
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
+from backend.db import DB_PATH, connect
 
 from dashboard.data_processing import (
+    SALES_HISTORY_2025_MONTH_COLUMNS,
+    SALES_HISTORY_2025_SITE_COLUMNS,
     build_alerts,
     build_department_performance_tables,
     build_low_margin_product_table,
     build_person_commission_summary,
     build_product_management_table,
     build_replenishment_management_tables,
+    build_sales_history_2025_summary,
     build_sales_dashboard_tables,
     build_slow_moving_inventory_table,
     compute_metric_table,
     count_chen_26_onsale_skus,
     duplicate_row_issues,
+    exclude_stopped_store_operational_rows,
     load_business_config,
     load_commission_config,
     load_department_fee_config,
@@ -33,6 +39,10 @@ from dashboard.data_processing import (
     normalize_operational_sales,
     normalize_rate,
     normalize_replenishment_targets,
+    normalize_replenishment_coverage_rules,
+    normalize_replenishment_product_tags,
+    normalize_replenishment_switches,
+    normalize_store_config,
     normalize_sales_amount_detail,
     normalize_sales_volume_detail,
     product_management_display_table,
@@ -133,10 +143,17 @@ def section(
     frame: pd.DataFrame,
     chart: dict[str, Any] | None = None,
     formats: dict[str, str] | None = None,
+    summary_mode: str | None = None,
+    row_serializer: Callable[[pd.DataFrame], list[dict[str, Any]]] | None = None,
 ) -> dict[str, Any]:
     frame = frame.reset_index(drop=True)
     columns = column_definitions(frame, formats)
-    return {"key": key, "title": title, "frame": frame, "columns": columns, "chart": chart_definition(chart, columns)}
+    result = {"key": key, "title": title, "frame": frame, "columns": columns, "chart": chart_definition(chart, columns)}
+    if summary_mode:
+        result["summary_mode"] = summary_mode
+    if row_serializer:
+        result["row_serializer"] = row_serializer
+    return result
 
 
 def metric(name: str, value: Any, format_name: str = "number") -> dict[str, Any]:
@@ -179,7 +196,12 @@ def source_path(key: str, title: str) -> Path:
 
 def load_source_frame(key: str, title: str) -> pd.DataFrame:
     path = source_path(key, title)
-    return load_or_build_parquet(f"source-{key}-raw", [path], lambda: read_local_table(path))
+    loader = (
+        (lambda: build_sales_history_2025_summary(path)[0])
+        if key == "sales_history_2025"
+        else (lambda: read_local_table(path))
+    )
+    return load_or_build_parquet(f"source-{key}-raw", [path], loader)
 
 
 def warm_source_cache(source_key: str) -> None:
@@ -189,6 +211,7 @@ def warm_source_cache(source_key: str) -> None:
         "rating": "Rating",
         "sales_volume_detail": "销量明细",
         "sales_amount_detail": "销售额明细",
+        "sales_history_2025": "25年销量明细",
     }
     title = titles.get(source_key)
     if title:
@@ -373,7 +396,13 @@ def _build_sales(developers: str | None) -> dict[str, Any]:
         "has_data": not stores.empty,
         "metrics": metrics,
         "sections": [
-            section("stores", "店铺明细", stores, {"x": "店铺编码", "series": ["昨日订单", "30天日均"]}),
+            section(
+                "stores",
+                "店铺明细",
+                stores,
+                {"x": "店铺编码", "series": ["昨日订单", "30天日均"]},
+                summary_mode="sales_stores",
+            ),
             section("levels", "产品等级", tables["levels"]),
             section("date-compare", "日期对比", tables["date_compare"]),
         ],
@@ -385,6 +414,8 @@ def _build_slow_moving(developers: str | None, threshold: str) -> dict[str, Any]
     if threshold not in thresholds:
         raise HTTPException(422, "非法库龄范围")
     operational = load_source_frame("operational_sales", "运营原始表")
+    store_config, _ = load_business_config()
+    operational = exclude_stopped_store_operational_rows(operational, store_config)
     options = developer_options(operational)
     chosen = selected_values(developers, options)
     if options:
@@ -484,32 +515,270 @@ def _build_department(month: str | None) -> dict[str, Any]:
     return payload
 
 
-def _build_replenishment(developers: str | None) -> dict[str, Any]:
+def _read_optional_replenishment_config(name: str, normalizer) -> pd.DataFrame:
+    path = CONFIG_DIR / f"{name}.csv"
+    return normalizer(read_local_table(path)) if path.exists() else normalizer(pd.DataFrame())
+
+
+def _last_promotion_rows() -> pd.DataFrame:
+    try:
+        with connect() as conn:
+            rows = [dict(row) for row in conn.execute(
+                "SELECT sku, promotion_name, discount_percent, start_date, end_date, updated_at FROM sku_last_promotions"
+            ).fetchall()]
+        return pd.DataFrame(rows)
+    except Exception:
+        # Promotions are supporting evidence only; a missing snapshot must not
+        # prevent replenishment quantity calculation.
+        return pd.DataFrame(columns=["sku", "promotion_name", "discount_percent", "start_date", "end_date", "updated_at"])
+
+
+def _replenishment_base_paths() -> list[Path]:
+    paths: list[Path] = []
+    for key in ("operational_sales", "gross_profit", "rating", "sales_history_2025"):
+        path = get_latest_source_path(key)
+        if path:
+            paths.append(path)
+    for name in ("replenishment_coverage_rules", "replenishment_product_tags", "store_config"):
+        path = CONFIG_DIR / f"{name}.csv"
+        if path.exists():
+            paths.append(path)
+    if DB_PATH.exists():
+        paths.append(DB_PATH)
+    return sorted(set(paths), key=str)
+
+
+@lru_cache(maxsize=4)
+def _cached_replenishment_base_tables(revision: str) -> dict[str, pd.DataFrame]:
+    del revision
     operational = load_source_frame("operational_sales", "运营原始表")
-    gross = load_source_frame("gross_profit", "毛利原始表")
-    rating = load_source_frame("rating", "Rating")
+    gross = load_source_frame("gross_profit", "毛利原始表") if get_latest_source_path("gross_profit") else pd.DataFrame()
+    rating = load_source_frame("rating", "Rating") if get_latest_source_path("rating") else pd.DataFrame()
+    history = load_source_frame("sales_history_2025", "25年销量明细") if get_latest_source_path("sales_history_2025") else pd.DataFrame()
+    return build_replenishment_management_tables(
+        operational,
+        gross,
+        rating,
+        coverage_rules=_read_optional_replenishment_config("replenishment_coverage_rules", normalize_replenishment_coverage_rules),
+        product_tags=_read_optional_replenishment_config("replenishment_product_tags", normalize_replenishment_product_tags),
+        store_config=_read_optional_replenishment_config("store_config", normalize_store_config),
+        sales_history_2025=history,
+        promotions=_last_promotion_rows(),
+        only_needed=False,
+    )
+
+
+def _apply_replenishment_switches(
+    detail: pd.DataFrame,
+    switches: pd.DataFrame,
+) -> pd.DataFrame:
+    result = detail.copy()
+    if result.empty or switches.empty:
+        return result
+    switch_lookup = switches.set_index("ASIN")
+    group_ids = result["补货组ID"].fillna("").astype(str).str.strip().str.upper()
+    configured = group_ids.isin(switch_lookup.index)
+    if not configured.any():
+        return result
+    enabled_lookup = switch_lookup["是否补货"].to_dict()
+    reason_lookup = switch_lookup["关闭原因"].to_dict()
+    result.loc[configured, "是否补货"] = group_ids[configured].map(enabled_lookup).astype(bool)
+    result.loc[configured, "关闭原因"] = group_ids[configured].map(reason_lookup).fillna("")
+    disabled = configured & ~result["是否补货"].fillna(False).astype(bool)
+    disabled_valid = disabled & ~result["数据状态"].eq("数据异常")
+    result.loc[disabled_valid, "建议补货数量"] = 0
+    result.loc[disabled_valid, "数据状态"] = "已关闭补货"
+    return result
+
+
+def _replenishment_tables() -> dict[str, pd.DataFrame]:
+    paths = _replenishment_base_paths()
+    revision = revision_digest("replenishment-base", paths) if paths else "empty"
+    base = _cached_replenishment_base_tables(revision)
+    switches = _read_optional_replenishment_config(
+        "replenishment_switches",
+        normalize_replenishment_switches,
+    )
+    return {
+        **base,
+        "detail": _apply_replenishment_switches(base["detail"], switches),
+    }
+
+
+def _split_compact(value: Any) -> list[str]:
+    if value is None:
+        return []
+    return [part.strip() for part in str(value).split("；") if part.strip()]
+
+
+def _replenishment_number(value: Any) -> int | float | None:
+    if value is None or pd.isna(value):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return int(number) if number.is_integer() else number
+
+
+def _replenishment_history(row: dict[str, Any], *, include_months: bool = False) -> dict[str, Any]:
+    raw_values = [row.get(column) for column in (*SALES_HISTORY_2025_SITE_COLUMNS, *SALES_HISTORY_2025_MONTH_COLUMNS)]
+    available = any(value is not None and not pd.isna(value) for value in raw_values)
+    site_sales = {
+        code: (_replenishment_number(row.get(f"{code}总销量")) or 0)
+        for code in ("DE", "FR", "ES", "IT")
+    }
+    months = [
+        {
+            "month": month,
+            "total_sales": _replenishment_number(row.get(f"{month}月总销量")) or 0,
+            "active_days": int(_replenishment_number(row.get(f"{month}月出单天数")) or 0),
+            "nonzero_daily_average": _replenishment_number(row.get(f"{month}月除0日均")) or 0,
+        }
+        for month in range(1, 13)
+    ]
+    peak_months = sorted(
+        (item for item in months if float(item["total_sales"]) > 0),
+        key=lambda item: (
+            -float(item["total_sales"]),
+            -float(item["nonzero_daily_average"]),
+            int(item["month"]),
+        ),
+    )[:6]
+    result: dict[str, Any] = {
+        "available": available,
+        "site_sales": site_sales,
+        "peak_months": peak_months,
+    }
+    if include_months:
+        result["months"] = months
+    return result
+
+
+def _replenishment_group_rows(frame: pd.DataFrame) -> list[dict[str, Any]]:
+    country_columns = {
+        "DE": "德国",
+        "FR": "法国",
+        "ES": "西班牙",
+        "IT": "意大利",
+    }
+    result: list[dict[str, Any]] = []
+    for row in records(frame):
+        tag_labels = _split_compact(row.get("产品标签"))
+        raw_colors = str(row.get("产品标签颜色") or "").split("；")
+        tags = [
+            {"label": label, "color": raw_colors[index].strip() if index < len(raw_colors) else ""}
+            for index, label in enumerate(tag_labels)
+        ]
+        countries = {
+            code: {
+                "units": row.get(f"{country}单量"),
+                "margin": row.get(f"{country}毛利率"),
+                "reasons": _split_compact(row.get(f"{country}原因")),
+            }
+            for code, country in country_columns.items()
+        }
+        review_count = _replenishment_number(row.get("产品评价数"))
+        rating_score = _replenishment_number(row.get("产品评分值"))
+        rating = (
+            {"review_count": review_count, "score": rating_score}
+            if review_count is not None or rating_score is not None
+            else None
+        )
+        promotion = None
+        if any(row.get(column) is not None for column in ("最近促销开始日期", "最近促销截止日期", "最近促销折扣")):
+            promotion = {
+                "start_date": row.get("最近促销开始日期"),
+                "end_date": row.get("最近促销截止日期"),
+                "discount_percent": row.get("最近促销折扣"),
+            }
+        result.append(
+            {
+                "group_id": str(row.get("补货组ID") or ""),
+                "identity": {
+                    "asin": str(row.get("ASIN") or ""),
+                    "original_sku": str(row.get("原SKU") or ""),
+                    "follower_skus": _split_compact(row.get("跟卖SKU")),
+                    "sku_count": int(row.get("SKU数量") or 0),
+                    "stores": _split_compact(row.get("店铺编码")),
+                    "store_statuses": _split_compact(row.get("店铺状态")),
+                    "developers": _split_compact(row.get("开发员")),
+                    "tags": tags,
+                    "rating": rating,
+                },
+                "countries": countries,
+                "inventory": {
+                    "amazon_available": row.get("亚马逊可售"),
+                    "group_total": row.get("总可售"),
+                    "asin_reference_total": row.get("跟卖总可售"),
+                    "aged_over_90": row.get("库龄90天以上"),
+                    "aged_180_to_365": row.get("库龄180-365天"),
+                    "aged_over_365": row.get("库龄365天以上"),
+                    "is_split_reference": row.get("总可售") != row.get("跟卖总可售"),
+                },
+                "trend": {
+                    "t_value": row.get("T值"),
+                    "calibrated_daily_sales": row.get("校准日销量"),
+                    "max_weight_g": row.get("最大重量(g)"),
+                    "coverage_days": row.get("库存覆盖天数"),
+                },
+                "promotion": promotion,
+                "history": _replenishment_history(row),
+                "recommendation": {
+                    "target_inventory": row.get("目标库存"),
+                    "measured_quantity": row.get("测算建议补货数量"),
+                    "official_quantity": row.get("建议补货数量"),
+                    "enabled": bool(row.get("是否补货")),
+                    "close_reason": row.get("关闭原因"),
+                    "status": row.get("数据状态"),
+                    "errors": _split_compact(row.get("数据异常")),
+                },
+            }
+        )
+    return result
+
+
+def _filter_replenishment_detail(
+    detail: pd.DataFrame,
+    developers: str | None,
+    min_qty: int,
+    developer_choices: list[str],
+) -> pd.DataFrame:
+    result = detail[detail["是否补货"].fillna(False).astype(bool)].copy()
+    if developers:
+        chosen = selected_values(developers, developer_choices)
+        result = result[
+            result["开发员"].fillna("").astype(str).map(
+                lambda value: any(
+                    item in [part.strip() for part in value.split("；")]
+                    for item in chosen
+                )
+            )
+        ].copy()
+    if min_qty > 0:
+        quantities = pd.to_numeric(result["建议补货数量"], errors="coerce")
+        result = result[quantities.ge(min_qty)].copy()
+    return result.reset_index(drop=True)
+
+
+def _build_replenishment(developers: str | None, min_qty: int = 30) -> dict[str, Any]:
+    operational = load_source_frame("operational_sales", "运营原始表")
     options = developer_options(operational)
     chosen = selected_values(developers, options)
-    if options:
-        operational = operational[operational["开发员"].fillna("").astype(str).str.strip().isin(chosen)].copy()
-    target_path = CONFIG_DIR / "replenishment_targets.csv"
-    targets = normalize_replenishment_targets(read_local_table(target_path)) if target_path.exists() else normalize_replenishment_targets(pd.DataFrame())
-    tables = build_replenishment_management_tables(operational, gross, rating, targets)
-    detail, distribution = tables["detail"], tables["store_distribution"]
-    metrics = [] if detail.empty else [
-        metric("需补货ASIN数", detail["ASIN"].nunique(), "integer"),
-        metric("预计补货总库存数", pd.to_numeric(detail["建议补货数量"], errors="coerce").fillna(0).sum(), "integer"),
-        metric("涉及店铺数", distribution["店铺编码"].nunique() if not distribution.empty else 0, "integer"),
+    tables = _replenishment_tables()
+    detail = _filter_replenishment_detail(tables["detail"], developers, min_qty, options)
+    positive = detail[pd.to_numeric(detail["建议补货数量"], errors="coerce").fillna(0).gt(0)]
+    metrics = [
+        metric("需补货ASIN数", int(positive["补货组ID"].nunique()), "integer"),
+        metric("建议补货总量", pd.to_numeric(positive["建议补货数量"], errors="coerce").fillna(0).sum(), "integer"),
+        metric("数据异常ASIN数", int(detail["数据状态"].eq("数据异常").sum()), "integer"),
     ]
     return {
         **_base_payload("补货管理", {"developers": options}, {"developers": chosen}),
         "has_data": not detail.empty,
-        "message": "当前筛选条件下没有需要补货的 ASIN" if detail.empty else None,
+        "message": "当前筛选条件下没有补货组" if detail.empty else None,
         "metrics": metrics,
-        "sections": [
-            section("distribution", "需补货店铺分布", distribution, {"x": "店铺编码", "series": ["需补货ASIN数"]}),
-            section("detail", "补货明细", detail),
-        ],
+        "sections": [section("detail", "ASIN补货汇总", detail, row_serializer=_replenishment_group_rows)],
     }
 
 
@@ -520,7 +789,7 @@ def _revision_paths() -> list[Path]:
         paths.append(index_path)
     upload_records = load_upload_records()
     paths.extend(_report_paths(upload_records))
-    for key in ("operational_sales", "gross_profit", "rating", "sales_volume_detail", "sales_amount_detail"):
+    for key in ("operational_sales", "gross_profit", "rating", "sales_volume_detail", "sales_amount_detail", "sales_history_2025"):
         path = get_latest_source_path(key)
         if path:
             paths.append(path)
@@ -544,6 +813,7 @@ def _cached_bundle(
     store_types: str | None,
     threshold: str,
     month: str | None,
+    min_qty: int,
     revision: str,
 ) -> dict[str, Any]:
     del revision
@@ -558,13 +828,20 @@ def _cached_bundle(
     if page_name == "department":
         return _build_department(month)
     if page_name == "replenishment":
-        return _build_replenishment(developers)
+        return _build_replenishment(developers, min_qty)
     raise HTTPException(404, "未知看板页面")
 
 
 def clear_dashboard_caches() -> None:
     _cached_bundle.cache_clear()
+    _cached_replenishment_base_tables.cache_clear()
     clear_parquet_memory_cache()
+
+
+def clear_replenishment_view_cache() -> None:
+    """Invalidate switch-filtered responses without discarding expensive base calculations."""
+
+    _cached_bundle.cache_clear()
 
 
 def _bundle(
@@ -575,6 +852,7 @@ def _bundle(
     store_types: str | None = None,
     threshold: str = "90天以上",
     month: str | None = None,
+    min_qty: int = 30,
 ) -> dict[str, Any]:
     return _cached_bundle(
         page_name,
@@ -584,6 +862,7 @@ def _bundle(
         store_types,
         threshold,
         month,
+        min_qty,
         dashboard_revision(),
     )
 
@@ -665,6 +944,42 @@ def _query_frame(
     return result.reset_index(drop=True)
 
 
+def _sales_store_summary(frame: pd.DataFrame) -> dict[str, Any] | None:
+    if frame.empty:
+        return None
+
+    def total(column: str) -> float:
+        if column not in frame.columns:
+            return 0.0
+        return float(normalize_config_number(frame[column]).fillna(0).sum())
+
+    onsale = total("在售个数")
+    summary: dict[str, Any] = {str(column): None for column in frame.columns}
+    summary.update(
+        {
+            "店铺编码": "合计",
+            "店铺类型": "—",
+            "店铺状态": "—",
+            "在售个数": onsale,
+            "产品数占比": float(normalize_rate(frame["产品数占比"]).fillna(0).sum())
+            if "产品数占比" in frame.columns
+            else 0.0,
+            "昨日D值": total("昨日订单") / onsale if onsale else 0.0,
+            "7天D值": total("7天日均") / onsale if onsale else 0.0,
+        }
+    )
+    for column in ("昨日订单", "-26订单", "7天日均", "30天日均", "总库存", "占用资金"):
+        if column in frame.columns:
+            summary[column] = total(column)
+    return summary
+
+
+def _section_summary(frame: pd.DataFrame, mode: str | None) -> dict[str, Any] | None:
+    if mode == "sales_stores":
+        return _sales_store_summary(frame)
+    return None
+
+
 def _serialized_section(
     model: dict[str, Any],
     page: int = 1,
@@ -677,7 +992,7 @@ def _serialized_section(
     total = len(filtered)
     start = (page - 1) * page_size
     visible = filtered.iloc[start : start + page_size]
-    return {
+    result = {
         "key": model["key"],
         "title": model["title"],
         "columns": model["columns"],
@@ -687,12 +1002,23 @@ def _serialized_section(
         "page_size": page_size,
         "total": total,
         "paginated": total > page_size,
+        "summary": _section_summary(filtered, model.get("summary_mode")),
     }
+    row_serializer = model.get("row_serializer")
+    if row_serializer:
+        result["group_rows"] = row_serializer(visible)
+    return result
 
 
 def _serialize_bundle(bundle: dict[str, Any]) -> dict[str, Any]:
     result = {key: value for key, value in bundle.items() if key != "sections"}
     result["sections"] = [_serialized_section(item) for item in bundle.get("sections", [])]
+    replenishment_section = next(
+        (item for item in result["sections"] if item.get("key") == "detail" and "group_rows" in item),
+        None,
+    )
+    if replenishment_section:
+        result["group_rows"] = replenishment_section["group_rows"]
     result["updated_at"] = max((path.stat().st_mtime for path in _revision_paths()), default=0)
     return result
 
@@ -743,8 +1069,106 @@ def department(month: str | None = None):
 
 
 @router.get("/replenishment")
-def replenishment(developers: str | None = None):
-    return _dashboard_response("replenishment", developers=developers)
+def replenishment(
+    developers: str | None = None,
+    min_qty: int = Query(30, ge=0),
+):
+    return _dashboard_response("replenishment", developers=developers, min_qty=min_qty)
+
+
+class ReplenishmentSwitchInput(BaseModel):
+    is_replenishment: bool
+    close_reason: str = ""
+
+
+@router.put("/replenishment/asins/{asin}/switch")
+def update_replenishment_switch(asin: str, payload: ReplenishmentSwitchInput):
+    normalized_asin = str(asin or "").strip().upper()
+    operational = load_source_frame("operational_sales", "运营原始表")
+    available_asins = set(operational["ASIN"].fillna("").astype(str).str.strip().str.upper())
+    if not normalized_asin or normalized_asin not in available_asins:
+        raise HTTPException(404, "ASIN不存在于当前运营原始表")
+    try:
+        from backend.config_api import upsert_replenishment_switch
+
+        return upsert_replenishment_switch(
+            normalized_asin,
+            payload.is_replenishment,
+            payload.close_reason,
+        )
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@router.get("/replenishment/groups/{group_id}/details")
+def replenishment_group_details(group_id: str):
+    try:
+        tables = _replenishment_tables()
+        summary = tables["detail"]
+        match = summary[summary["补货组ID"].astype(str).eq(group_id)]
+        if match.empty:
+            raise HTTPException(404, "补货组不存在")
+        sku_detail = tables["sku_detail"]
+        sku_detail = sku_detail[sku_detail["补货组ID"].astype(str).eq(group_id)].reset_index(drop=True)
+        asin = str(match.iloc[0]["ASIN"]).split("；")[0]
+        history = tables["history"]
+        history_row = records(history[history["ASIN"].astype(str).eq(asin)].head(1)) if not history.empty else []
+        return {
+            "group": records(match.head(1))[0],
+            "sku_columns": column_definitions(sku_detail),
+            "sku_rows": records(sku_detail),
+            "sales_history_2025": (
+                _replenishment_history(history_row[0], include_months=True)
+                if history_row
+                else None
+            ),
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(422, f"补货组明细读取失败：{exc}") from exc
+
+
+@router.get("/replenishment/export.xlsx")
+def export_replenishment(
+    developers: str | None = None,
+    min_qty: int = Query(30, ge=0),
+):
+    try:
+        tables = _replenishment_tables()
+        operational = load_source_frame("operational_sales", "运营原始表")
+        options = developer_options(operational)
+        detail = _filter_replenishment_detail(tables["detail"], developers, min_qty, options)
+        sku_detail = tables["sku_detail"].copy()
+        sku_detail = sku_detail[sku_detail["补货组ID"].isin(set(detail["补货组ID"]))].copy()
+        export_detail = detail.drop(columns=SALES_HISTORY_2025_MONTH_COLUMNS, errors="ignore").copy()
+        peak_sets = [_replenishment_history(row)["peak_months"] for row in records(detail)]
+        for index in range(6):
+            export_detail[f"峰值{index + 1}月份"] = [
+                f"{peaks[index]['month']}月" if index < len(peaks) else None
+                for peaks in peak_sets
+            ]
+            export_detail[f"峰值{index + 1}除0日均"] = [
+                peaks[index]["nonzero_daily_average"] if index < len(peaks) else None
+                for peaks in peak_sets
+            ]
+            export_detail[f"峰值{index + 1}月销量"] = [
+                peaks[index]["total_sales"] if index < len(peaks) else None
+                for peaks in peak_sets
+            ]
+        buffer = io.BytesIO()
+        with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+            export_detail.to_excel(writer, index=False, sheet_name="ASIN补货汇总")
+            sku_detail.to_excel(writer, index=False, sheet_name="SKU计算明细")
+        buffer.seek(0)
+        filename = quote("补货管理导出.xlsx")
+        return StreamingResponse(
+            buffer,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f"attachment; filename*=UTF-8''{filename}"},
+        )
+    except Exception as exc:
+        raise HTTPException(422, f"补货导出失败：{exc}") from exc
 
 
 def _section_model(bundle: dict[str, Any], section_key: str) -> dict[str, Any]:
@@ -769,9 +1193,19 @@ def dashboard_section(
     store_types: str | None = None,
     threshold: str = "90天以上",
     month: str | None = None,
+    min_qty: int = Query(30, ge=0),
 ):
     try:
-        bundle = _bundle(page_name, developers, months, departments, store_types, threshold, month)
+        bundle = _bundle(
+            page_name,
+            developers=developers,
+            months=months,
+            departments=departments,
+            store_types=store_types,
+            threshold=threshold,
+            month=month,
+            min_qty=min_qty,
+        )
         return _serialized_section(_section_model(bundle, section_key), page, page_size, search, sort_by, sort_order)
     except HTTPException:
         raise
@@ -803,9 +1237,19 @@ def export_dashboard_section(
     store_types: str | None = None,
     threshold: str = "90天以上",
     month: str | None = None,
+    min_qty: int = Query(30, ge=0),
 ):
     try:
-        bundle = _bundle(page_name, developers, months, departments, store_types, threshold, month)
+        bundle = _bundle(
+            page_name,
+            developers=developers,
+            months=months,
+            departments=departments,
+            store_types=store_types,
+            threshold=threshold,
+            month=month,
+            min_qty=min_qty,
+        )
         model = _section_model(bundle, section_key)
         frame = _query_frame(model["frame"], search, sort_by, sort_order, model.get("columns"))
         filename = quote(f"{model['title']}.csv")

@@ -217,6 +217,11 @@ function DashboardSectionCard({ initialSection, dashboardPage, filters, compactS
   const exportButton = remote
     ? <Button size="small" icon={<DownloadOutlined />} disabled={(section.total || 0) === 0} href={sectionExportUrl(dashboardPage, section.key, filters, query)}>导出全部 CSV</Button>
     : <Button size="small" icon={<DownloadOutlined />} disabled={!section.rows.length} onClick={() => exportSection(section)}>导出 CSV</Button>;
+  const tableSummary = section.summary ? () => <Table.Summary.Row className="dashboard-summary-row">
+    {section.columns.map((column, index) => <Table.Summary.Cell key={column.key} index={index}>
+      <strong>{formattedValue(section.summary?.[column.key], column, column.label)}</strong>
+    </Table.Summary.Cell>)}
+  </Table.Summary.Row> : undefined;
 
   return <Card
     className={`dashboard-section dashboard-section-${section.key}`}
@@ -231,6 +236,7 @@ function DashboardSectionCard({ initialSection, dashboardPage, filters, compactS
           rowKey={(row, index) => String(row._rowId || row.id || `${section.page || 1}-${index}-${Object.values(row).slice(0, 2).join('-')}`)}
           size="small" sticky loading={loading} columns={tableColumns} dataSource={section.rows}
           pagination={pagination} onChange={handleTableChange}
+          summary={tableSummary}
           scroll={{ x: 'max-content', y: section.key === 'stores' ? undefined : compactSales ? 250 : section.rows.length > 20 ? 520 : undefined }}
         />
       </>}
@@ -266,6 +272,7 @@ function updateDashboardUrl(page: string, params: Record<string, string>) {
   url.searchParams.set('page', page);
   Object.entries(params).forEach(([key, value]) => { if (value) url.searchParams.set(key, value); });
   window.history.pushState({}, '', url);
+  window.dispatchEvent(new Event('sales-dashboard-route-change'));
 }
 
 function updatedAtLabel(value: DashboardPayload['updated_at']) {
@@ -278,7 +285,7 @@ function DashboardSkeleton() {
   return <><Card className="filter-card"><Skeleton active paragraph={{ rows: 1 }} title={false} /></Card><div className="metric-grid">{Array.from({ length: 4 }, (_, index) => <Card key={index}><Skeleton active paragraph={{ rows: 1 }} /></Card>)}</div><Card className="dashboard-section"><Skeleton active paragraph={{ rows: 8 }} /></Card></>;
 }
 
-export default function DashboardPage({ page }: { page: string }) {
+export default function DashboardPage({ page, active = true, routeVersion = 0, refreshVersion = 0 }: { page: string; active?: boolean; routeVersion?: number; refreshVersion?: number }) {
   const [data, setData] = useState<DashboardPayload>();
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
@@ -288,6 +295,8 @@ export default function DashboardPage({ page }: { page: string }) {
   const [lastUpdated, setLastUpdated] = useState('');
   const abortRef = useRef<AbortController | undefined>(undefined);
   const requestRef = useRef(0);
+  const seenRefreshVersion = useRef(refreshVersion);
+  const seenRouteVersion = useRef(routeVersion);
 
   const load = useCallback(async (params: Record<string, string>) => {
     abortRef.current?.abort();
@@ -310,12 +319,22 @@ export default function DashboardPage({ page }: { page: string }) {
 
   useEffect(() => { void load(filtersFromUrl()); return () => abortRef.current?.abort(); }, [load]);
   useEffect(() => {
+    if (!active || seenRefreshVersion.current === refreshVersion) return;
+    seenRefreshVersion.current = refreshVersion;
+    void load(appliedParams);
+  }, [active, appliedParams, load, refreshVersion]);
+  useEffect(() => {
+    if (!active || seenRouteVersion.current === routeVersion) return;
+    seenRouteVersion.current = routeVersion;
+    void load(filtersFromUrl());
+  }, [active, load, routeVersion]);
+  useEffect(() => {
     const onPopState = () => {
       const urlPage = new URLSearchParams(window.location.search).get('page') || 'overview';
-      if (urlPage === page) void load(filtersFromUrl());
+      if (active && urlPage === page) void load(filtersFromUrl());
     };
     window.addEventListener('popstate', onPopState); return () => window.removeEventListener('popstate', onPopState);
-  }, [load, page]);
+  }, [active, load, page]);
 
   const applyFilters = () => { const params = selectionParams(selection); updateDashboardUrl(page, params); void load(params); };
   const matchedOptions = (key: string, options: string[]) => { const keyword = (searchTerms[key] || '').trim().toLocaleLowerCase(); return keyword ? options.filter(value => value.toLocaleLowerCase().includes(keyword)) : options; };
