@@ -1,5 +1,6 @@
 import unittest
 import tempfile
+from datetime import date
 from pathlib import Path
 from unittest.mock import patch
 
@@ -131,7 +132,7 @@ class ReportStoreTests(unittest.TestCase):
     def test_exported_full_month_date_range_normalizes_to_strict_month(self):
         self.assertEqual(normalize_uploaded_report_month("2026-07-01~2026-07-31"), "2026-07")
         self.assertEqual(normalize_uploaded_report_month("2024-02-01 ～ 2024-02-29"), "2024-02")
-        for value in ["2026-07-02~2026-07-31", "2026-07-01~2026-08-31", "2026-02-01~2026-02-30"]:
+        for value in ["2025-07-02~2025-07-31", "2026-07-01~2026-08-31", "2026-02-01~2026-02-30"]:
             with self.subTest(value=value), self.assertRaises(ValueError):
                 normalize_uploaded_report_month(value)
 
@@ -139,6 +140,24 @@ class ReportStoreTests(unittest.TestCase):
         result = persist_uploaded_reports([FakeUpload("july.csv", report_csv("2026-07-01~2026-07-31"))], data_dir)
         self.assertEqual(result[0].month, "2026-07")
         self.assertTrue((data_dir / "reports" / "2026-07.csv").exists())
+
+    def test_current_month_date_range_does_not_require_a_complete_natural_month(self):
+        current_day = date(2026, 7, 21)
+
+        self.assertEqual(
+            normalize_uploaded_report_month("2026-07-01~2026-07-21", today=current_day),
+            "2026-07",
+        )
+        self.assertEqual(
+            normalize_uploaded_report_month("2026-07-05~2026-07-20", today=current_day),
+            "2026-07",
+        )
+
+    def test_past_month_still_requires_a_complete_natural_month(self):
+        current_day = date(2026, 7, 21)
+
+        with self.assertRaises(ValueError):
+            normalize_uploaded_report_month("2026-06-01~2026-06-21", today=current_day)
 
     def test_batch_validation_finishes_before_any_report_is_written(self):
         data_dir = self.temporary_data_dir()

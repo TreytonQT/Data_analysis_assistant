@@ -67,6 +67,87 @@ class DashboardContractApiTests(unittest.TestCase):
         self.assertEqual(payload["total"], 3)
         self.assertEqual([row["姓名"] for row in payload["rows"]], ["安娜"])
 
+    def test_sales_store_summary_uses_all_filtered_rows_not_only_current_page(self) -> None:
+        frame = pd.DataFrame(
+            [
+                {
+                    "店铺编码": "KEEP-A",
+                    "店铺类型": "本土",
+                    "店铺状态": "正常",
+                    "在售个数": 100,
+                    "产品数占比": 0.6,
+                    "昨日D值": 1.2,
+                    "7天D值": 0.7,
+                    "昨日订单": 120,
+                    "-26订单": 20,
+                    "7天日均": 70,
+                    "30天日均": 60,
+                    "总库存": 1000,
+                    "占用资金": 10000,
+                },
+                {
+                    "店铺编码": "KEEP-B",
+                    "店铺类型": "中企",
+                    "店铺状态": "正常",
+                    "在售个数": 50,
+                    "产品数占比": 0.3,
+                    "昨日D值": 0.6,
+                    "7天D值": 0.4,
+                    "昨日订单": 30,
+                    "-26订单": 5,
+                    "7天日均": 20,
+                    "30天日均": 15,
+                    "总库存": 500,
+                    "占用资金": 5000,
+                },
+                {
+                    "店铺编码": "OTHER",
+                    "店铺类型": "中企",
+                    "店铺状态": "正常",
+                    "在售个数": 25,
+                    "产品数占比": 0.1,
+                    "昨日D值": 2,
+                    "7天D值": 1,
+                    "昨日订单": 50,
+                    "-26订单": 0,
+                    "7天日均": 25,
+                    "30天日均": 20,
+                    "总库存": 250,
+                    "占用资金": 2500,
+                },
+            ]
+        )
+        model = dashboard_api.section(
+            "stores",
+            "店铺明细",
+            frame,
+            summary_mode="sales_stores",
+        )
+        bundle = {**self._bundle(frame), "sections": [model]}
+
+        with patch("backend.dashboard_api._bundle", return_value=bundle):
+            response = self.client.get(
+                "/api/dashboard/sales/sections/stores",
+                params={"page": 1, "page_size": 1, "search": "KEEP"},
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        payload = response.json()
+        self.assertEqual(len(payload["rows"]), 1)
+        self.assertEqual(payload["total"], 2)
+        summary = payload["summary"]
+        self.assertEqual(summary["店铺编码"], "合计")
+        self.assertEqual(summary["在售个数"], 150)
+        self.assertAlmostEqual(summary["产品数占比"], 0.9)
+        self.assertAlmostEqual(summary["昨日D值"], 1)
+        self.assertAlmostEqual(summary["7天D值"], 0.6)
+        self.assertEqual(summary["昨日订单"], 150)
+        self.assertEqual(summary["-26订单"], 25)
+        self.assertEqual(summary["7天日均"], 90)
+        self.assertEqual(summary["30天日均"], 75)
+        self.assertEqual(summary["总库存"], 1500)
+        self.assertEqual(summary["占用资金"], 15000)
+
     def test_section_rejects_unknown_sort_column_and_oversized_page(self) -> None:
         bundle = self._bundle(self._frame())
         with patch("backend.dashboard_api._bundle", return_value=bundle):
@@ -117,6 +198,49 @@ class DashboardContractApiTests(unittest.TestCase):
         self.assertEqual(second_page.status_code, 200, second_page.text)
         self.assertEqual([row["person"] for row in first_page.json()["rows"]], ["乙", "丁"])
         self.assertEqual([row["person"] for row in second_page.json()["rows"]], ["甲", "丙"])
+
+    def test_replenishment_section_returns_structured_group_rows(self) -> None:
+        frame = pd.DataFrame([{
+            "补货组ID": "B001", "ASIN": "B001", "原SKU": "SKU-1", "跟卖SKU": "SKU-2；SKU-3",
+            "SKU数量": 3, "店铺编码": "ZXU", "店铺状态": "ZXU·正常", "开发员": "甲",
+            "产品标签": "爆款", "产品标签颜色": "#16A34A", "产品评价数": 120, "产品评分值": 4.5,
+            "德国单量": 20, "德国毛利率": 0.25, "德国原因": "",
+            "法国单量": 10, "法国毛利率": 0.15, "法国原因": "SKU-2: 广告炸",
+            "西班牙单量": 0, "西班牙毛利率": 0.05, "西班牙原因": "",
+            "意大利单量": 1, "意大利毛利率": -0.1, "意大利原因": "SKU-3: 退货多",
+            "亚马逊可售": 30, "总可售": 50, "跟卖总可售": 50, "库龄90天以上": 5,
+            "库龄180-365天": 2, "库龄365天以上": 1, "T值": 1.5, "校准日销量": 4,
+            "最大重量(g)": 120, "库存覆盖天数": 90, "最近促销开始日期": "2026-08-01",
+            "最近促销截止日期": "2026-08-10", "最近促销折扣": 10,
+            "DE总销量": 120, "FR总销量": 80, "ES总销量": 60, "IT总销量": 40,
+            **{
+                key: value
+                for month in range(1, 13)
+                for key, value in (
+                    (f"{month}月总销量", month * 10),
+                    (f"{month}月出单天数", month),
+                    (f"{month}月除0日均", 10),
+                )
+            },
+            "目标库存": 360, "测算建议补货数量": 310, "建议补货数量": 310,
+            "是否补货": True, "关闭原因": "", "数据状态": "正常", "数据异常": "",
+        }])
+        model = dashboard_api.section(
+            "detail",
+            "ASIN补货汇总",
+            frame,
+            row_serializer=dashboard_api._replenishment_group_rows,
+        )
+        payload = dashboard_api._serialized_section(model)
+
+        self.assertEqual(payload["group_rows"][0]["identity"]["follower_skus"], ["SKU-2", "SKU-3"])
+        self.assertEqual(payload["group_rows"][0]["identity"]["rating"], {"review_count": 120, "score": 4.5})
+        self.assertEqual(payload["group_rows"][0]["countries"]["FR"]["margin"], 0.15)
+        self.assertEqual(payload["group_rows"][0]["promotion"]["start_date"], "2026-08-01")
+        self.assertEqual(payload["group_rows"][0]["history"]["site_sales"]["DE"], 120)
+        self.assertEqual(payload["group_rows"][0]["history"]["peak_months"][0]["month"], 12)
+        self.assertNotIn("remarks", payload["group_rows"][0]["identity"])
+        self.assertEqual(payload["group_rows"][0]["recommendation"]["official_quantity"], 310)
 
     def test_numeric_sort_is_stable_and_percent_values_use_numeric_order(self) -> None:
         amount_frame = pd.DataFrame(

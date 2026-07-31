@@ -5,7 +5,7 @@ import re
 import tempfile
 import calendar
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Iterable
 
@@ -29,6 +29,7 @@ LATEST_SOURCE_DISPLAY_NAMES = {
     "rating": "Rating",
     "sales_volume_detail": "销量明细",
     "sales_amount_detail": "销售额明细",
+    "sales_history_2025": "25年销量明细",
 }
 ALLOWED_SOURCE_SUFFIXES = (".xlsx", ".xls", ".csv")
 STRICT_MONTH_PATTERN = re.compile(r"(?P<year>[1-9]\d{3})-(?P<month>0[1-9]|1[0-2])")
@@ -54,7 +55,7 @@ def validate_report_month(value: object) -> str:
     return text
 
 
-def normalize_uploaded_report_month(value: object) -> str:
+def normalize_uploaded_report_month(value: object, *, today: date | None = None) -> str:
     """Normalize an upload cell while rejecting ambiguous or partial dates."""
 
     text = str(value).strip()
@@ -68,8 +69,12 @@ def normalize_uploaded_report_month(value: object) -> str:
         end = datetime.strptime(match.group("end"), "%Y-%m-%d").date()
     except ValueError as exc:
         raise ValueError(f"月份日期范围不合法：{text}") from exc
+    if (start.year, start.month) != (end.year, end.month) or start > end:
+        raise ValueError(f"月份日期范围必须覆盖同一个完整自然月：{text}")
+    current_day = today or date.today()
+    is_current_month = (start.year, start.month) == (current_day.year, current_day.month)
     last_day = calendar.monthrange(start.year, start.month)[1]
-    if (start.year, start.month) != (end.year, end.month) or start.day != 1 or end.day != last_day:
+    if not is_current_month and (start.day != 1 or end.day != last_day):
         raise ValueError(f"月份日期范围必须覆盖同一个完整自然月：{text}")
     return f"{start.year:04d}-{start.month:02d}"
 

@@ -1,7 +1,9 @@
 import unittest
+from unittest.mock import patch
 
 import pandas as pd
 
+from backend import promotions as promotions_api
 from dashboard.promotions import (
     PROMOTION_AGED_INVENTORY_COLUMNS,
     PROMOTION_CANDIDATE_COLUMNS,
@@ -143,6 +145,32 @@ class PromotionDataTests(unittest.TestCase):
         self.assertEqual(row["average_7d"], 1)
         self.assertEqual(row["average_30d"], 2)
         self.assertEqual(row["daily_lift"], -1)
+
+    def test_candidate_frames_exclude_stores_configured_as_stopped(self):
+        source = pd.DataFrame(
+            [
+                {**operational_row("KEEP-SKU", sales_90d=5), "店铺名称": "1-ZXU 德国"},
+                {**operational_row("STOP-SKU", sales_90d=5), "店铺名称": "6-SGE 美国"},
+            ]
+        )
+        store_config = pd.DataFrame(
+            {
+                "店铺名": ["ZXU", "SGE"],
+                "店铺类型": ["中企", "本土"],
+                "停提款时间": ["", "2026-01"],
+                "店铺所属部门": ["运营部", "运营部"],
+            }
+        )
+        promotions_api.clear_promotion_caches()
+        with (
+            patch("backend.promotions.load_source_frame", return_value=source),
+            patch("backend.promotions.load_business_config", return_value=(store_config, pd.DataFrame())),
+        ):
+            metrics, candidates = promotions_api._cached_promotion_frames("test-source", "test-revision")
+        promotions_api.clear_promotion_caches()
+
+        self.assertEqual(metrics["sku"].tolist(), ["KEEP-SKU"])
+        self.assertEqual(candidates["sku"].tolist(), ["KEEP-SKU"])
 
     def test_empty_source_and_discount_filter_have_stable_contracts(self):
         columns = list(operational_row("empty").keys())

@@ -4,6 +4,7 @@ import csv
 import io
 import json
 import sqlite3
+import unicodedata
 import uuid
 from collections.abc import Iterator
 from datetime import date, datetime, timedelta, timezone
@@ -16,8 +17,11 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from backend.dashboard_api import load_source_frame, source_path
+import backend.db as db
 from backend.db import connect
+from dashboard.data_processing import CONFIG_DIR, exclude_stopped_store_operational_rows, load_business_config
 from dashboard.parquet_cache import revision_digest
+from dashboard.report_store import get_latest_source_path
 from dashboard.promotions import (
     PROMOTION_CANDIDATE_COLUMNS,
     PROMOTION_DISCOUNTS,
@@ -53,6 +57,7 @@ CANDIDATE_COLUMNS: list[dict[str, Any]] = [
 
 RECORD_COLUMNS: list[dict[str, Any]] = [
     {"key": "sku", "label": "SKU", "type": "string", "format": "text", "sortable": True},
+    {"key": "promotion_name", "label": "促销名称", "type": "string", "format": "text", "sortable": True},
     {"key": "asin_snapshot", "label": "ASIN（标记时）", "type": "string", "format": "text", "sortable": True},
     {"key": "developer_snapshot", "label": "开发员（标记时）", "type": "string", "format": "text", "sortable": True},
     {"key": "discount_percent", "label": "促销折扣", "type": "number", "format": "number", "unit": "%", "precision": 0, "sortable": True},
@@ -64,6 +69,16 @@ RECORD_COLUMNS: list[dict[str, Any]] = [
     {"key": "average_30d", "label": "30天日均", "type": "number", "format": "number", "precision": 2, "sortable": True},
     {"key": "daily_lift", "label": "日均提升", "type": "number", "format": "number", "precision": 2, "sortable": True},
     {"key": "source_missing", "label": "源数据缺失", "type": "boolean", "format": "boolean", "sortable": True},
+]
+
+LAST_PROMOTION_COLUMNS: list[dict[str, Any]] = [
+    {"key": "sku", "label": "SKU", "type": "string", "format": "text", "sortable": True},
+    {"key": "promotion_content", "label": "促销内容", "type": "string", "format": "text", "sortable": True},
+]
+
+LAST_PROMOTION_EXPORT_FIELDS = [
+    ("sku", "SKU"),
+    ("promotion_content", "促销内容"),
 ]
 
 CANDIDATE_EXPORT_FIELDS = [
@@ -82,6 +97,7 @@ CANDIDATE_EXPORT_FIELDS = [
 
 RECORD_EXPORT_FIELDS = [
     ("sku", "SKU"),
+    ("promotion_name", "促销名称"),
     ("asin_snapshot", "ASIN（标记时）"),
     ("developer_snapshot", "开发员（标记时）"),
     ("discount_percent", "促销折扣(%)"),
@@ -133,7 +149,25 @@ class PromotionDateInput(BaseModel):
         return self
 
 
-class PromotionCreate(PromotionDateInput):
+class PromotionNameInput(PromotionDateInput):
+    promotion_name: str = Field(min_length=1, max_length=100)
+
+    @field_validator("promotion_name")
+    @classmethod
+    def normalize_promotion_name(cls, value: str) -> str:
+        return _normalize_promotion_name(value)
+
+
+def _normalize_promotion_name(value: str) -> str:
+    normalized = unicodedata.normalize("NFKC", value).strip()
+    if not normalized:
+        raise ValueError("促销名称不能为空")
+    if len(normalized) > 100:
+        raise ValueError("促销名称不能超过 100 个字符")
+    return normalized
+
+
+class PromotionCreate(PromotionNameInput):
     skus: list[str] = Field(min_length=1, max_length=5000)
 
     @field_validator("skus")
@@ -155,6 +189,23 @@ class PromotionCreate(PromotionDateInput):
         return result
 
 
+class ManualPromotionCreate(PromotionCreate):
+    discount_percent: int = Field(ge=1, le=99)
+
+
+class PromotionUpdate(PromotionNameInput):
+    pass
+
+
+class PromotionActivityDelete(BaseModel):
+    promotion_name: str = Field(min_length=1, max_length=100)
+
+    @field_validator("promotion_name")
+    @classmethod
+    def normalize_promotion_name(cls, value: str) -> str:
+        return _normalize_promotion_name(value)
+
+
 def _frame_records(frame: pd.DataFrame) -> list[dict[str, Any]]:
     if frame.empty:
         return []
@@ -169,6 +220,8 @@ def _cached_promotion_frames(
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     del source_path_text, source_revision
     raw = load_source_frame("operational_sales", "运营原始表")
+    store_config, _ = load_business_config()
+    raw = exclude_stopped_store_operational_rows(raw, store_config)
     metrics = build_promotion_sku_metrics(raw)
     candidates = build_promotion_candidates(raw)
     return metrics, candidates
@@ -176,13 +229,23 @@ def _cached_promotion_frames(
 
 def load_promotion_frames() -> tuple[pd.DataFrame, pd.DataFrame]:
     path = source_path("operational_sales", "运营原始表")
-    revision = revision_digest("promotion-derived", [path])
+    revision = revision_digest("promotion-derived", [path, CONFIG_DIR / "store_config.csv"])
     metrics, candidates = _cached_promotion_frames(str(path), revision)
     return metrics.copy(deep=False), candidates.copy(deep=False)
 
 
 def clear_promotion_caches() -> None:
     _cached_promotion_frames.cache_clear()
+
+
+def promotion_revision() -> str:
+    """Revision for promotion views, including candidate inputs and SQLite records."""
+    paths = [CONFIG_DIR / "store_config.csv", db.DB_PATH]
+    operational = get_latest_source_path("operational_sales")
+    if operational:
+        paths.append(operational)
+    existing = [path for path in paths if path.is_file()]
+    return revision_digest("app-promotions", existing) if existing else "empty"
 
 
 def _promotion_frames() -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -323,8 +386,109 @@ def _records_frame() -> pd.DataFrame:
     metrics = _metrics_or_empty()
     current = _metrics_by_sku(metrics)
     rows = [_serialize_promotion(row, current) for row in _promotion_rows()]
-    columns = ["id", "sku", "asin_snapshot", "developer_snapshot", "discount_percent", "rule_key", "start_date", "end_date", "created_at", "updated_at", *[column for column in PROMOTION_SKU_METRIC_COLUMNS if column != "sku"], "source_missing", "status"]
+    columns = ["id", "sku", "promotion_name", "asin_snapshot", "developer_snapshot", "discount_percent", "rule_key", "start_date", "end_date", "created_at", "updated_at", *[column for column in PROMOTION_SKU_METRIC_COLUMNS if column != "sku"], "source_missing", "status"]
     return pd.DataFrame(rows, columns=list(dict.fromkeys(columns)))
+
+
+def _last_promotion_date(value: str) -> str:
+    parsed = date.fromisoformat(value)
+    if parsed.year != today().year:
+        return f"{parsed.year}/{parsed.month}/{parsed.day}"
+    return f"{parsed.month}/{parsed.day}"
+
+
+def _last_promotion_content(row: dict[str, Any]) -> str:
+    start = _last_promotion_date(str(row["start_date"]))
+    name = str(row.get("promotion_name") or "历史未命名促销")
+    discount = int(row["discount_percent"])
+    end_date = row.get("end_date")
+    if end_date:
+        return f"{start}~{_last_promotion_date(str(end_date))} {name} -{discount}%"
+    return f"{start}起 {name} -{discount}%（持续）"
+
+
+def _last_promotions_frame() -> pd.DataFrame:
+    with connect() as conn:
+        rows = [dict(row) for row in conn.execute(
+            """SELECT sku, promotion_id, promotion_name, discount_percent, start_date, end_date, updated_at
+            FROM sku_last_promotions"""
+        ).fetchall()]
+    for row in rows:
+        row["promotion_content"] = _last_promotion_content(row)
+    columns = [
+        "sku", "promotion_content", "promotion_id", "promotion_name", "discount_percent",
+        "start_date", "end_date", "updated_at",
+    ]
+    return pd.DataFrame(rows, columns=columns)
+
+
+def _upsert_last_promotion(
+    conn: sqlite3.Connection,
+    *,
+    promotion_id: str,
+    sku: str,
+    promotion_name: str,
+    discount_percent: int,
+    start_date: str,
+    end_date: str | None,
+    updated_at: str,
+) -> None:
+    conn.execute(
+        """INSERT INTO sku_last_promotions
+        (sku, promotion_id, promotion_name, discount_percent, start_date, end_date, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(sku) DO UPDATE SET
+            promotion_id = excluded.promotion_id,
+            promotion_name = excluded.promotion_name,
+            discount_percent = excluded.discount_percent,
+            start_date = excluded.start_date,
+            end_date = excluded.end_date,
+            updated_at = excluded.updated_at""",
+        (sku, promotion_id, promotion_name, discount_percent, start_date, end_date, updated_at),
+    )
+
+
+def _activity_status(rows: pd.DataFrame) -> PromotionStatus:
+    statuses = set(rows["status"].dropna().astype(str))
+    if "active" in statuses:
+        return "active"
+    if "pending" in statuses:
+        return "pending"
+    return "ended"
+
+
+def _promotion_activity_summaries(rows: pd.DataFrame) -> list[dict[str, Any]]:
+    """Build durable review rows for all promotion activities, including ended ones."""
+    if rows.empty:
+        return []
+
+    summaries: list[dict[str, Any]] = []
+    grouped = rows.groupby("promotion_name", sort=False, dropna=False)
+    for name, group in grouped:
+        promotion_name = str(name or "历史未命名促销")
+        status = _activity_status(group)
+        available = group[~group["source_missing"]].copy()
+        summaries.append(
+            {
+                "promotion_name": promotion_name,
+                "start_date": str(group["start_date"].min()),
+                "end_date": None if group["end_date"].isna().any() else str(group["end_date"].max()),
+                "status": status,
+                "sku_count": int(len(group)),
+                "discount_percents": sorted({int(value) for value in group["discount_percent"].dropna()}),
+                "source_missing_count": int(group["source_missing"].sum()),
+                "average_7d": round(float(available["average_7d"].sum()), 6) if not available.empty else 0.0,
+                "average_30d": round(float(available["average_30d"].sum()), 6) if not available.empty else 0.0,
+                "daily_lift": round(float(available["daily_lift"].sum()), 6) if not available.empty else 0.0,
+            }
+        )
+
+    status_order = {"active": 0, "pending": 1, "ended": 2}
+    return sorted(
+        summaries,
+        key=lambda item: (status_order[str(item["status"])], item["start_date"], item["promotion_name"]),
+        reverse=False,
+    )
 
 
 def _conflict(message: str, skus: list[str]) -> HTTPException:
@@ -377,38 +541,26 @@ def _csv_response(
 def promotion_overview(developers: str | None = Query(None, max_length=2000)):
     metrics = _metrics_or_empty()
     metrics_lookup = _metrics_by_sku(metrics)
-    reference_text = today().isoformat()
     with connect() as conn:
-        active_rows = conn.execute(
+        promotion_rows = conn.execute(
             """SELECT * FROM sku_promotions
-            WHERE start_date <= ? AND (end_date IS NULL OR end_date >= ?)
-            ORDER BY discount_percent DESC, sku""",
-            (reference_text, reference_text),
+            ORDER BY promotion_name, start_date, sku"""
         ).fetchall()
-    serialized = [_serialize_promotion(row, metrics_lookup) for row in active_rows]
-    all_active = pd.DataFrame(serialized)
-    developer_options = _developer_options(all_active, "developer_snapshot")
+    serialized = [_serialize_promotion(row, metrics_lookup) for row in promotion_rows]
+    all_records = pd.DataFrame(serialized)
+    developer_options = _developer_options(all_records, "developer_snapshot")
     selected = _selected_developers(developers)
-    if selected and not all_active.empty:
-        all_active = all_active[all_active["developer_snapshot"].fillna("").astype(str).isin(selected)]
+    if selected and not all_records.empty:
+        all_records = all_records[all_records["developer_snapshot"].fillna("").astype(str).isin(selected)]
+
+    activity_summaries = _promotion_activity_summaries(all_records)
+    all_active = all_records[all_records["status"].eq("active")].copy() if not all_records.empty else all_records
     source_missing_count = int(all_active["source_missing"].sum()) if not all_active.empty else 0
     available = all_active[~all_active["source_missing"]].copy() if not all_active.empty else all_active
     active_count = len(available)
     average_7d_total = float(available["average_7d"].sum()) if active_count else 0.0
     average_30d_total = float(available["average_30d"].sum()) if active_count else 0.0
     daily_lift_total = float(available["daily_lift"].sum()) if active_count else 0.0
-    by_discount: list[dict[str, Any]] = []
-    for discount in PROMOTION_DISCOUNTS:
-        group = available[available["discount_percent"].eq(discount)] if active_count else available
-        by_discount.append(
-            {
-                "discount_percent": discount,
-                "sku_count": len(group),
-                "average_7d": round(float(group["average_7d"].sum()), 6) if len(group) else 0.0,
-                "average_30d": round(float(group["average_30d"].sum()), 6) if len(group) else 0.0,
-                "daily_lift": round(float(group["daily_lift"].sum()), 6) if len(group) else 0.0,
-            }
-        )
     return {
         "active_sku_count": active_count,
         "average_7d_total": round(average_7d_total, 6),
@@ -416,7 +568,7 @@ def promotion_overview(developers: str | None = Query(None, max_length=2000)):
         "daily_lift_total": round(daily_lift_total, 6),
         "daily_lift_average": round(daily_lift_total / active_count, 6) if active_count else 0.0,
         "source_missing_count": source_missing_count,
-        "by_discount": by_discount,
+        "by_promotion": activity_summaries,
         "developers": developer_options,
         "selected_developers": selected,
         "updated_at": _promotion_data_updated_at(),
@@ -518,7 +670,7 @@ def _query_records(
         developer_column="developer_snapshot",
         sort_by=sort_by,
         sort_order=sort_order,
-        search_columns=["sku", "asin_snapshot", "developer_snapshot", "rule_key"],
+        search_columns=["sku", "promotion_name", "asin_snapshot", "developer_snapshot", "rule_key"],
     )
 
 
@@ -551,6 +703,73 @@ def promotion_records(
     }
 
 
+def _query_last_promotions(
+    *,
+    search: str | None,
+    sort_by: str,
+    sort_order: SortOrder,
+) -> pd.DataFrame:
+    frame = _last_promotions_frame()
+    if search and search.strip():
+        needle = search.strip()
+        mask = (
+            frame["sku"].fillna("").astype(str).str.contains(needle, case=False, regex=False)
+            | frame["promotion_content"].fillna("").astype(str).str.contains(needle, case=False, regex=False)
+        )
+        frame = frame[mask]
+    allowed_sort_columns = {"sku", "promotion_content", "start_date", "end_date", "promotion_name", "discount_percent", "updated_at"}
+    if sort_by not in allowed_sort_columns:
+        raise HTTPException(422, f"不支持按字段排序：{sort_by}")
+    return frame.sort_values(
+        sort_by,
+        ascending=sort_order == "asc",
+        kind="stable",
+        na_position="last",
+    ).reset_index(drop=True)
+
+
+@router.get("/last-promotions")
+def last_promotions(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
+    search: str | None = Query(None, max_length=200),
+    sort_by: str = Query("updated_at", max_length=64),
+    sort_order: SortOrder = "desc",
+):
+    frame = _query_last_promotions(
+        search=search,
+        sort_by=sort_by,
+        sort_order=sort_order,
+    )
+    total = len(frame)
+    start = (page - 1) * page_size
+    return {
+        "columns": LAST_PROMOTION_COLUMNS,
+        "rows": _frame_records(frame.iloc[start : start + page_size]),
+        "page": page,
+        "page_size": page_size,
+        "total": total,
+    }
+
+
+@router.get("/last-promotions/export.csv")
+def export_last_promotions(
+    search: str | None = Query(None, max_length=200),
+    sort_by: str = Query("updated_at", max_length=64),
+    sort_order: SortOrder = "desc",
+):
+    frame = _query_last_promotions(
+        search=search,
+        sort_by=sort_by,
+        sort_order=sort_order,
+    )
+    return _csv_response(
+        _frame_records(frame),
+        LAST_PROMOTION_EXPORT_FIELDS,
+        "last-promotions.csv",
+    )
+
+
 @router.get("/records/export.csv")
 def export_promotion_records(
     status: PromotionStatusFilter = "active",
@@ -577,54 +796,118 @@ def create_promotions(payload: PromotionCreate):
     if invalid:
         raise _conflict("所选 SKU 已不再满足促销策略，请刷新后重试", invalid)
 
+    return _persist_promotions(payload, candidate_lookup)
+
+
+@router.post("/manual", status_code=201)
+def create_manual_promotions(payload: ManualPromotionCreate):
+    metrics_lookup = _metrics_by_sku(_metrics_or_empty())
+    manual_lookup: dict[str, dict[str, Any]] = {}
+    for sku in payload.skus:
+        metric = metrics_lookup.get(sku) or {}
+        manual_lookup[sku] = {
+            "asin": metric.get("asin") or "",
+            "developer": metric.get("developer") or "",
+            "discount_percent": payload.discount_percent,
+            "rule_key": "manual",
+        }
+    return _persist_promotions(payload, manual_lookup, replace_current=True)
+
+
+def _persist_promotions(
+    payload: PromotionCreate,
+    promotion_lookup: dict[str, dict[str, Any]],
+    replace_current: bool = False,
+) -> dict[str, Any]:
+
     timestamp = now_iso()
     start_text = payload.start_date.isoformat()
     end_text = payload.end_date.isoformat() if payload.end_date else None
     placeholders = ",".join("?" for _ in payload.skus)
     created_ids: list[str] = []
+    replaced_count = 0
     try:
         with connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             current_rows = conn.execute(
-                f"""SELECT DISTINCT sku FROM sku_promotions
-                WHERE sku IN ({placeholders}) AND (end_date IS NULL OR end_date >= ?)""",
+                f"""SELECT id, sku FROM sku_promotions
+                WHERE sku IN ({placeholders}) AND (end_date IS NULL OR end_date >= ?)
+                ORDER BY updated_at DESC, start_date DESC, id DESC""",
                 [*payload.skus, today().isoformat()],
             ).fetchall()
-            current_skus = [row["sku"] for row in current_rows]
-            if current_skus:
-                raise _conflict("所选 SKU 已存在正在促销或待开始的记录", current_skus)
+            current_by_sku: dict[str, Any] = {}
+            for row in current_rows:
+                current_by_sku.setdefault(str(row["sku"]), row)
+            if current_by_sku and not replace_current:
+                raise _conflict("所选 SKU 已存在正在促销或待开始的记录", sorted(current_by_sku))
 
             overlap_rows = conn.execute(
-                f"""SELECT DISTINCT sku FROM sku_promotions
+                f"""SELECT id, sku FROM sku_promotions
                 WHERE sku IN ({placeholders})
                   AND start_date <= ?
                   AND COALESCE(end_date, '9999-12-31') >= ?""",
                 [*payload.skus, end_text or "9999-12-31", start_text],
             ).fetchall()
-            overlap_skus = [row["sku"] for row in overlap_rows]
+            replace_ids = {str(row["id"]) for row in current_by_sku.values()} if replace_current else set()
+            overlap_skus = sorted(
+                {str(row["sku"]) for row in overlap_rows if str(row["id"]) not in replace_ids}
+            )
             if overlap_skus:
                 raise _conflict("所选 SKU 的促销日期与已有记录重叠", overlap_skus)
 
             for sku in payload.skus:
-                candidate = candidate_lookup[sku]
-                promotion_id = str(uuid.uuid4())
-                conn.execute(
-                    """INSERT INTO sku_promotions
-                    (id, sku, asin_snapshot, developer_snapshot, discount_percent, rule_key,
-                     start_date, end_date, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        promotion_id,
-                        sku,
-                        candidate.get("asin") or "",
-                        candidate.get("developer") or "",
-                        int(candidate["discount_percent"]),
-                        str(candidate["rule_key"]),
-                        start_text,
-                        end_text,
-                        timestamp,
-                        timestamp,
-                    ),
+                candidate = promotion_lookup[sku]
+                current = current_by_sku.get(sku) if replace_current else None
+                if current is not None:
+                    promotion_id = str(current["id"])
+                    conn.execute(
+                        """UPDATE sku_promotions
+                        SET promotion_name = ?, asin_snapshot = ?, developer_snapshot = ?, discount_percent = ?,
+                            rule_key = ?, start_date = ?, end_date = ?, updated_at = ?
+                        WHERE id = ?""",
+                        (
+                            payload.promotion_name,
+                            candidate.get("asin") or "",
+                            candidate.get("developer") or "",
+                            int(candidate["discount_percent"]),
+                            str(candidate["rule_key"]),
+                            start_text,
+                            end_text,
+                            timestamp,
+                            promotion_id,
+                        ),
+                    )
+                    replaced_count += 1
+                else:
+                    promotion_id = str(uuid.uuid4())
+                    conn.execute(
+                        """INSERT INTO sku_promotions
+                        (id, sku, promotion_name, asin_snapshot, developer_snapshot, discount_percent, rule_key,
+                         start_date, end_date, created_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            promotion_id,
+                            sku,
+                            payload.promotion_name,
+                            candidate.get("asin") or "",
+                            candidate.get("developer") or "",
+                            int(candidate["discount_percent"]),
+                            str(candidate["rule_key"]),
+                            start_text,
+                            end_text,
+                            timestamp,
+                            timestamp,
+                        ),
+                    )
+                _upsert_last_promotion(
+                    conn,
+                    promotion_id=promotion_id,
+                    sku=sku,
+                    promotion_name=payload.promotion_name,
+                    discount_percent=int(candidate["discount_percent"]),
+                    start_date=start_text,
+                    end_date=end_text,
+                    updated_at=timestamp,
                 )
                 created_ids.append(promotion_id)
     except HTTPException:
@@ -640,7 +923,10 @@ def create_promotions(payload: PromotionCreate):
             f"SELECT * FROM sku_promotions WHERE id IN ({placeholders}) ORDER BY id",
             created_ids,
         ).fetchall()
-    return {"created": [_serialize_promotion(row, metrics_lookup) for row in rows]}
+    return {
+        "created": [_serialize_promotion(row, metrics_lookup) for row in rows],
+        "replaced": replaced_count,
+    }
 
 
 def _get_promotion(promotion_id: str):
@@ -651,11 +937,27 @@ def _get_promotion(promotion_id: str):
     return row
 
 
+@router.delete("/activities", status_code=200)
+def delete_promotion_activity(payload: PromotionActivityDelete):
+    """Delete every SKU record belonging to one named promotion activity."""
+    with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        deleted = conn.execute(
+            "DELETE FROM sku_promotions WHERE promotion_name = ?",
+            (payload.promotion_name,),
+        ).rowcount
+    if not deleted:
+        raise HTTPException(404, "促销活动不存在或已删除")
+    clear_promotion_caches()
+    return {"deleted": deleted, "promotion_name": payload.promotion_name}
+
+
 @router.put("/{promotion_id}")
-def update_promotion(promotion_id: str, payload: PromotionDateInput):
+def update_promotion(promotion_id: str, payload: PromotionUpdate):
     old = _get_promotion(promotion_id)
     start_text = payload.start_date.isoformat()
     end_text = payload.end_date.isoformat() if payload.end_date else None
+    timestamp = now_iso()
     try:
         with connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -671,9 +973,15 @@ def update_promotion(promotion_id: str, payload: PromotionDateInput):
                 raise _conflict("修改后的促销日期与已有记录重叠", [old["sku"]])
             conn.execute(
                 """UPDATE sku_promotions
-                SET start_date = ?, end_date = ?, updated_at = ?
+                SET promotion_name = ?, start_date = ?, end_date = ?, updated_at = ?
                 WHERE id = ?""",
-                (start_text, end_text, now_iso(), promotion_id),
+                (payload.promotion_name, start_text, end_text, timestamp, promotion_id),
+            )
+            conn.execute(
+                """UPDATE sku_last_promotions
+                SET promotion_name = ?, start_date = ?, end_date = ?, updated_at = ?
+                WHERE sku = ? AND promotion_id = ?""",
+                (payload.promotion_name, start_text, end_text, timestamp, old["sku"], promotion_id),
             )
     except HTTPException:
         raise

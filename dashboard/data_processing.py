@@ -5,6 +5,7 @@ import calendar
 import math
 import re
 import unicodedata
+from datetime import date, datetime
 from pathlib import Path
 from typing import Iterable
 
@@ -21,9 +22,30 @@ STORE_COLUMNS = ["店铺名", "店铺类型", "停提款时间", "店铺所属�
 TARGET_COLUMNS = ["开发员", "目标业绩", "目标毛利率"]
 COMMISSION_COLUMNS = ["月份", "开发员", "库存计提", "弃置", "职位提点"]
 DEPARTMENT_FEE_COLUMNS = ["月份", "部门", "费用率"]
+# Deprecated compatibility constants.  The replenishment page now gets its
+# target coverage from rules instead of an ASIN-level target/case-pack table.
 REPLENISHMENT_TARGET_COLUMNS = ["ASIN", "目标可售天数"]
 DEFAULT_REPLENISHMENT_TARGET_DAYS = 70
 DEFAULT_REPLENISHMENT_CASE_PACK = 10
+REPLENISHMENT_COVERAGE_RULE_COLUMNS = [
+    "运输方式", "重量下限", "重量上限", "头程时效", "预警天数", "补货频次", "是否启用",
+]
+REPLENISHMENT_SWITCH_COLUMNS = ["ASIN", "是否补货", "关闭原因"]
+REPLENISHMENT_PRODUCT_TAG_COLUMNS = ["ASIN", "产品标签", "标签颜色", "是否启用", "备注"]
+SALES_HISTORY_2025_SHEETS = [f"{month}月" for month in range(1, 13)]
+SALES_HISTORY_2025_COUNTRIES = {
+    "德国": "DE",
+    "法国": "FR",
+    "西班牙": "ES",
+    "意大利": "IT",
+}
+SALES_HISTORY_2025_SITE_COLUMNS = [f"{code}总销量" for code in SALES_HISTORY_2025_COUNTRIES.values()]
+SALES_HISTORY_2025_MONTH_COLUMNS = [
+    column
+    for month in range(1, 13)
+    for column in (f"{month}月总销量", f"{month}月出单天数", f"{month}月除0日均")
+]
+SALES_HISTORY_2025_COLUMNS = ["ASIN", *SALES_HISTORY_2025_SITE_COLUMNS, *SALES_HISTORY_2025_MONTH_COLUMNS]
 OPERATIONAL_SALES_REQUIRED_COLUMNS = [
     "MSKU",
     "店铺名称",
@@ -74,6 +96,10 @@ AGING_CAPITAL_COLUMNS = [
 ]
 OPERATIONAL_AGING_REQUIRED_COLUMNS = ["MSKU", "开发员", "ASIN"] + AGING_STOCK_COLUMNS + AGING_CAPITAL_COLUMNS
 REPLENISHMENT_STOCK_COMPONENT_COLUMNS = ["可售", "待入库", "采购在途", "本地库存", "在途", "计划入库"]
+REPLENISHMENT_FORMULA_STOCK_COLUMNS = [
+    "可售", "待调仓", "调仓中", "待入库", "采购在途", "本地库存", "在途", "计划入库",
+]
+REPLENISHMENT_SALES_COLUMNS = ["7天销量", "14天销量", "30天销量"]
 AVAILABLE_INVENTORY_STOCK_COLUMNS = [
     "可售",
     "待调仓",
@@ -105,9 +131,9 @@ REPLENISHMENT_OPERATIONAL_REQUIRED_COLUMNS = [
     "MSKU",
     "店铺名称",
     "开发员",
-    "日均销量",
     "单品重量(g)",
-] + REPLENISHMENT_STOCK_COMPONENT_COLUMNS + AGING_STOCK_COLUMNS
+    "上架时间",
+] + REPLENISHMENT_SALES_COLUMNS + REPLENISHMENT_FORMULA_STOCK_COLUMNS
 DISCARD_THRESHOLD_SEGMENTS = {
     "90天以上": ["91-180", "181-330", "331-365", "366-455", "456天以上"],
     "180天以上": ["181-330", "331-365", "366-455", "456天以上"],
@@ -395,9 +421,9 @@ def load_reports(files: Iterable) -> pd.DataFrame:
     return normalize_report(df)
 
 
-def normalize_report(df: pd.DataFrame) -> pd.DataFrame:
+def normalize_report(df: pd.DataFrame, *, today: date | None = None) -> pd.DataFrame:
     result = df.copy()
-    result["月份"] = result["月份"].map(normalize_month)
+    result["月份"] = result["月份"].map(lambda value: normalize_month(value, today=today))
     result["店铺编码"] = result["店铺"].map(extract_store_code)
     for col in result.columns:
         if col in {"销售专员", "月份", "国家", "店铺", "店铺编码", "来源文件"}:
@@ -406,7 +432,7 @@ def normalize_report(df: pd.DataFrame) -> pd.DataFrame:
     return result
 
 
-def normalize_month(value) -> str | None:
+def normalize_month(value, *, today: date | None = None) -> str | None:
     if pd.isna(value):
         return None
     text = str(value)
@@ -416,13 +442,17 @@ def normalize_month(value) -> str | None:
     range_match = re.fullmatch(r"(\d{4})-(\d{2})-(\d{2})\s*[~～]\s*(\d{4})-(\d{2})-(\d{2})", text)
     if range_match:
         start_year, start_month, start_day, end_year, end_month, end_day = map(int, range_match.groups())
-        if (
-            start_year == end_year
-            and start_month == end_month
-            and 1 <= start_month <= 12
-            and start_day == 1
-            and end_day == calendar.monthrange(start_year, start_month)[1]
-        ):
+        try:
+            start = date(start_year, start_month, start_day)
+            end = date(end_year, end_month, end_day)
+        except ValueError:
+            return None
+        if (start.year, start.month) != (end.year, end.month) or start > end:
+            return None
+        current_day = today or date.today()
+        is_current_month = (start.year, start.month) == (current_day.year, current_day.month)
+        last_day = calendar.monthrange(start.year, start.month)[1]
+        if is_current_month or (start.day == 1 and end.day == last_day):
             return f"{start_year:04d}-{start_month:02d}"
         return None
     chinese_match = re.fullmatch(r"(\d{2,4})\s*年\s*(\d{1,2})\s*月", text)
@@ -553,6 +583,36 @@ def merge_operational_store_config(df: pd.DataFrame, store_config: pd.DataFrame)
     result["是否封店"] = result["停提款时间"].ne("")
     result["店铺状态"] = result["是否封店"].map(lambda value: "已封店" if value else "正常")
     return result
+
+
+def exclude_stopped_store_operational_rows(
+    df: pd.DataFrame, store_config: pd.DataFrame | None
+) -> pd.DataFrame:
+    """Remove raw operational rows belonging to stores configured with a stop month.
+
+    Slow-moving inventory and promotion candidates are calculated from the raw
+    operational file, before the normal store-expansion step.  A configured
+    stop month means the store is no longer actionable, regardless of the
+    specific month value, so its rows must not contribute inventory or sales to
+    these operational reminders.
+    """
+    if df.empty or "店铺名称" not in df.columns or store_config is None:
+        return df.copy()
+
+    config = normalize_store_config(store_config)
+    stop_month = config["停提款时间"].fillna("").astype(str).str.strip()
+    stopped_codes = {
+        extract_store_code(store_name)
+        for store_name in config.loc[stop_month.ne(""), "店铺名"]
+        if extract_store_code(store_name)
+    }
+    if not stopped_codes:
+        return df.copy()
+
+    is_stopped = df["店铺名称"].map(
+        lambda value: any(code in stopped_codes for code, _ in extract_operational_store_codes(value))
+    )
+    return df.loc[~is_stopped].copy()
 
 
 def safe_ratio(numerator, denominator):
@@ -1176,43 +1236,106 @@ def normalize_replenishment_operational(df: pd.DataFrame) -> pd.DataFrame:
     if missing:
         raise ValueError(f"运营原始表缺少补货管理列：{', '.join(missing)}")
 
-    base = df[REPLENISHMENT_OPERATIONAL_REQUIRED_COLUMNS].copy()
+    optional_columns = AGING_STOCK_COLUMNS + ["备注"]
+    base = df[
+        REPLENISHMENT_OPERATIONAL_REQUIRED_COLUMNS
+        + [column for column in optional_columns if column in df.columns]
+    ].copy()
+    for column in optional_columns:
+        if column not in base.columns:
+            base[column] = pd.NA
     for col in ["ASIN", "MSKU", "店铺名称", "开发员"]:
         base[col] = base[col].fillna("").astype(str).str.strip()
-    base = base[base["ASIN"].ne("")].copy()
-    for col in REPLENISHMENT_STOCK_COMPONENT_COLUMNS + AGING_STOCK_COLUMNS + ["日均销量", "单品重量(g)"]:
-        base[col] = normalize_config_number(base[col]).fillna(0)
+    base["ASIN"] = base["ASIN"].str.upper()
+    base["备注"] = base["备注"].fillna("").astype(str).str.strip()
+    for col in REPLENISHMENT_SALES_COLUMNS + REPLENISHMENT_FORMULA_STOCK_COLUMNS + AGING_STOCK_COLUMNS + ["单品重量(g)"]:
+        # Do not replace invalid/missing inputs with zero.  A replenishment
+        # recommendation is unsafe unless every calculation input is present.
+        base[col] = normalize_config_number(base[col])
+    base["上架时间"] = normalize_replenishment_listing_dates(base["上架时间"])
     return base
 
 
+def normalize_replenishment_listing_dates(values: pd.Series) -> pd.Series:
+    """Parse listing dates as local calendar dates without timezone shifting.
+
+    Operational exports currently mix Excel datetimes, European
+    ``DD/MM/YYYY`` strings and ISO ``YYYY-MM-DD`` strings, commonly followed
+    by MET/MEST/CET/CEST/GMT.  Replenishment age is calendar-day based, so the
+    suffix must not move a record into another date through UTC conversion.
+    """
+
+    result = pd.Series(pd.NaT, index=values.index, dtype="datetime64[ns]")
+    non_empty = values.notna() & values.astype(str).str.strip().ne("")
+    if not non_empty.any():
+        return result
+
+    numeric = pd.to_numeric(values.where(non_empty), errors="coerce")
+    excel_serial = numeric.between(20_000, 80_000, inclusive="both")
+    if excel_serial.any():
+        result.loc[excel_serial] = pd.to_datetime(
+            numeric.loc[excel_serial],
+            unit="D",
+            origin="1899-12-30",
+            errors="coerce",
+        ).dt.normalize()
+
+    text = values.where(non_empty & ~excel_serial).astype("string").str.strip()
+    text = text.str.replace(r"\s+(?:MET|MEST|CET|CEST|GMT)$", "", regex=True, case=False)
+    iso_date = text.str.extract(r"^(\d{4}-\d{2}-\d{2})", expand=False)
+    european_date = text.str.extract(r"^(\d{2}/\d{2}/\d{4})", expand=False)
+    iso_mask = iso_date.notna()
+    european_mask = european_date.notna() & ~iso_mask
+    if iso_mask.any():
+        result.loc[iso_mask] = pd.to_datetime(
+            iso_date.loc[iso_mask], format="%Y-%m-%d", errors="coerce"
+        )
+    if european_mask.any():
+        result.loc[european_mask] = pd.to_datetime(
+            european_date.loc[european_mask], format="%d/%m/%Y", errors="coerce"
+        )
+
+    fallback_mask = non_empty & result.isna() & ~excel_serial
+    if fallback_mask.any():
+        fallback = pd.to_datetime(
+            text.loc[fallback_mask],
+            errors="coerce",
+            format="mixed",
+            dayfirst=True,
+        )
+        if isinstance(fallback.dtype, pd.DatetimeTZDtype):
+            fallback = fallback.dt.tz_localize(None)
+        result.loc[fallback_mask] = fallback
+    return result.dt.normalize()
+
+
 def build_replenishment_operational_summary(df: pd.DataFrame) -> pd.DataFrame:
+    """Legacy flat summary retained for callers outside the new page.
+
+    The replenishment page itself uses ``build_replenishment_management_tables``
+    so it can retain SKU evidence and data-quality status.
+    """
     operational = normalize_replenishment_operational(df)
     if operational.empty:
         return pd.DataFrame(columns=replenishment_operational_columns())
 
-    grouped = (
-        operational.groupby("ASIN", dropna=False, sort=False)
-        .agg(
-            MSKU=("MSKU", join_non_empty_values),
-            店铺编码=("店铺名称", join_operational_store_codes),
-            开发员=("开发员", join_non_empty_values),
-            **{"亚马逊可售库存数量": ("可售", "sum")},
-            待入库=("待入库", "sum"),
-            采购在途=("采购在途", "sum"),
-            本地库存=("本地库存", "sum"),
-            在途=("在途", "sum"),
-            计划入库=("计划入库", "sum"),
-            **{"库龄超90天库存数": (AGING_STOCK_COLUMNS[0], "sum")},
-            日均销量=("日均销量", "sum"),
-            重量=("单品重量(g)", "max"),
-        )
-        .reset_index()
-    )
-    grouped["库龄超90天库存数"] = operational.groupby("ASIN", sort=False)[AGING_STOCK_COLUMNS].sum().sum(axis=1).to_numpy()
-    grouped["总库存数量"] = grouped[
-        ["亚马逊可售库存数量", "待入库", "采购在途", "本地库存", "在途", "计划入库"]
-    ].sum(axis=1)
-    grouped["建议补货方式"] = grouped["重量"].map(lambda value: "卡航" if value > 100 else "空运")
+    grouped = operational.groupby("ASIN", dropna=False, sort=False).agg(
+        MSKU=("MSKU", join_non_empty_values),
+        店铺编码=("店铺名称", join_operational_store_codes),
+        开发员=("开发员", join_non_empty_values),
+        重量=("单品重量(g)", "max"),
+    ).reset_index()
+    numeric = operational.groupby("ASIN", dropna=False, sort=False)[REPLENISHMENT_FORMULA_STOCK_COLUMNS].sum(min_count=1)
+    grouped["亚马逊可售库存数量"] = numeric[["可售", "待调仓", "调仓中", "待入库"]].sum(axis=1).to_numpy()
+    grouped["总库存数量"] = (
+        numeric["可售"] + numeric["待调仓"] + numeric["调仓中"] + numeric["待入库"] * 2
+        + numeric["采购在途"] + numeric["本地库存"] + numeric["在途"] + numeric["计划入库"]
+    ).to_numpy()
+    grouped["日均销量"] = (
+        operational.groupby("ASIN", dropna=False, sort=False)[REPLENISHMENT_SALES_COLUMNS].sum(min_count=1).sum(axis=1) / 30
+    ).to_numpy()
+    grouped["库龄超90天库存数"] = pd.NA
+    grouped["建议补货方式"] = grouped["重量"].map(lambda value: "空运" if pd.notna(value) and value < 100 else "卡航")
     return grouped[replenishment_operational_columns()].reset_index(drop=True)
 
 
@@ -1242,6 +1365,257 @@ def replenishment_operational_columns() -> list[str]:
     ]
 
 
+def default_replenishment_coverage_rules() -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {"运输方式": "空运", "重量下限": 0, "重量上限": 100, "头程时效": 30, "预警天数": 40, "补货频次": 10, "是否启用": True},
+            {"运输方式": "卡航", "重量下限": 100, "重量上限": pd.NA, "头程时效": 40, "预警天数": 40, "补货频次": 10, "是否启用": True},
+        ],
+        columns=REPLENISHMENT_COVERAGE_RULE_COLUMNS,
+    )
+
+
+def normalize_replenishment_coverage_rules(rules: pd.DataFrame | None) -> pd.DataFrame:
+    if rules is None or rules.empty:
+        return pd.DataFrame(columns=REPLENISHMENT_COVERAGE_RULE_COLUMNS)
+    data = rules.copy()
+    for column in REPLENISHMENT_COVERAGE_RULE_COLUMNS:
+        if column not in data.columns:
+            data[column] = pd.NA
+    data = data[REPLENISHMENT_COVERAGE_RULE_COLUMNS].copy()
+    data["运输方式"] = data["运输方式"].fillna("").astype(str).str.strip()
+    for column in ["重量下限", "重量上限", "头程时效", "预警天数", "补货频次"]:
+        data[column] = normalize_config_number(data[column])
+    data["是否启用"] = data["是否启用"].map(is_enabled)
+    invalid = data["运输方式"].eq("") | data["重量下限"].isna() | data[["头程时效", "预警天数", "补货频次"]].isna().any(axis=1)
+    if invalid.any():
+        raise ValueError("库存覆盖规则必须填写运输方式、重量下限、头程时效、预警天数和补货频次")
+    if (data[["重量下限", "头程时效", "预警天数", "补货频次"]] < 0).any().any():
+        raise ValueError("库存覆盖规则的重量和天数不能为负数")
+    bounded = data["重量上限"].notna()
+    if (data.loc[bounded, "重量上限"] < data.loc[bounded, "重量下限"]).any():
+        raise ValueError("库存覆盖规则的重量上限不能小于重量下限")
+    enabled = data[data["是否启用"]].sort_values(["重量下限", "重量上限"], na_position="last", kind="stable")
+    if enabled.empty:
+        raise ValueError("至少需要启用一条库存覆盖规则")
+    if float(enabled.iloc[0]["重量下限"]) != 0:
+        raise ValueError("启用的库存覆盖规则必须从0g开始")
+    last_upper: float | None = None
+    for _, row in enabled.iterrows():
+        lower = float(row["重量下限"])
+        if last_upper is not None and lower < last_upper:
+            raise ValueError("启用的库存覆盖规则重量区间不能重叠")
+        if last_upper is not None and lower > last_upper:
+            raise ValueError("启用的库存覆盖规则重量区间不能留空档")
+        upper = row["重量上限"]
+        last_upper = None if pd.isna(upper) else float(upper)
+    if last_upper is not None:
+        raise ValueError("启用的库存覆盖规则最后一条必须不填写重量上限")
+    return data.reset_index(drop=True)
+
+
+def normalize_replenishment_switches(switches: pd.DataFrame | None) -> pd.DataFrame:
+    if switches is None or switches.empty:
+        return pd.DataFrame(columns=REPLENISHMENT_SWITCH_COLUMNS)
+    data = switches.copy()
+    if "ASIN" not in data.columns and "补货组ID" in data.columns:
+        data = data.rename(columns={"补货组ID": "ASIN"})
+    elif "ASIN" in data.columns and "补货组ID" in data.columns:
+        asin = data["ASIN"].fillna("").astype(str).str.strip()
+        data.loc[asin.eq(""), "ASIN"] = data.loc[asin.eq(""), "补货组ID"]
+    for column in REPLENISHMENT_SWITCH_COLUMNS:
+        if column not in data.columns:
+            data[column] = pd.NA
+    data = data[REPLENISHMENT_SWITCH_COLUMNS].copy()
+    data["ASIN"] = data["ASIN"].fillna("").astype(str).str.strip().str.upper()
+    data["关闭原因"] = data["关闭原因"].fillna("").astype(str).str.strip()
+    data["是否补货"] = data["是否补货"].map(is_enabled)
+    if data["ASIN"].eq("").any():
+        raise ValueError("补货开关必须填写ASIN")
+    if ((~data["是否补货"]) & data["关闭原因"].eq("")).any():
+        raise ValueError("关闭补货时必须填写关闭原因")
+    return data.drop_duplicates(subset=["ASIN"], keep="last").reset_index(drop=True)
+
+
+def normalize_replenishment_product_tags(tags: pd.DataFrame | None) -> pd.DataFrame:
+    if tags is None or tags.empty:
+        return pd.DataFrame(columns=REPLENISHMENT_PRODUCT_TAG_COLUMNS)
+    data = tags.copy()
+    for column in REPLENISHMENT_PRODUCT_TAG_COLUMNS:
+        if column not in data.columns:
+            data[column] = pd.NA
+    data = data[REPLENISHMENT_PRODUCT_TAG_COLUMNS].copy()
+    for column in ["ASIN", "产品标签", "标签颜色", "备注"]:
+        data[column] = data[column].fillna("").astype(str).str.strip()
+    data["ASIN"] = data["ASIN"].str.upper()
+    data["是否启用"] = data["是否启用"].map(is_enabled)
+    if data["ASIN"].eq("").any() or data["产品标签"].eq("").any():
+        raise ValueError("ASIN产品标签必须填写ASIN和产品标签")
+    invalid_colors = data["标签颜色"].ne("") & ~data["标签颜色"].str.fullmatch(r"#[0-9A-Fa-f]{6}")
+    if invalid_colors.any():
+        raise ValueError("标签颜色必须为空或使用#RRGGBB格式")
+    return data.drop_duplicates(subset=["ASIN", "产品标签"], keep="last").reset_index(drop=True)
+
+
+def normalize_sales_history_2025(df: pd.DataFrame) -> pd.DataFrame:
+    """Validate the canonical ASIN-level summary derived from the 12-sheet workbook."""
+    missing = [column for column in SALES_HISTORY_2025_COLUMNS if column not in df.columns]
+    if missing:
+        raise ValueError(f"25年销量明细汇总缺少列：{', '.join(missing)}")
+    data = df[SALES_HISTORY_2025_COLUMNS].copy()
+    data["ASIN"] = data["ASIN"].fillna("").astype(str).str.strip().str.upper()
+    if data["ASIN"].eq("").any():
+        raise ValueError("25年销量明细汇总存在空ASIN")
+    if data["ASIN"].duplicated().any():
+        raise ValueError("25年销量明细汇总的ASIN必须唯一")
+    for column in SALES_HISTORY_2025_COLUMNS[1:]:
+        original = data[column]
+        numeric = pd.to_numeric(original, errors="coerce")
+        invalid = original.notna() & original.astype(str).str.strip().ne("") & numeric.isna()
+        if invalid.any():
+            raise ValueError(f"25年销量明细汇总列“{column}”存在非数字")
+        data[column] = numeric.fillna(0)
+    return data.reset_index(drop=True)
+
+
+def _history_number(value, *, sheet_name: str, row_number: int, column: str) -> float:
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return 0.0
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{sheet_name}第{row_number}行“{column}”不是有效数字：{value}") from exc
+    if not math.isfinite(number):
+        raise ValueError(f"{sheet_name}第{row_number}行“{column}”不是有限数字")
+    if number < 0:
+        raise ValueError(f"{sheet_name}第{row_number}行“{column}”不能为负数")
+    return number
+
+
+def _history_output_number(value: float) -> int | float:
+    return int(round(value)) if math.isclose(value, round(value), abs_tol=1e-9) else round(value, 6)
+
+
+def build_sales_history_2025_summary(
+    source: Path | bytes | bytearray | io.BytesIO,
+) -> tuple[pd.DataFrame, dict[str, int]]:
+    """Parse and aggregate the authoritative 1–12月 workbook in one streaming pass."""
+    from openpyxl import load_workbook
+
+    workbook_source = io.BytesIO(bytes(source)) if isinstance(source, (bytes, bytearray)) else source
+    workbook = load_workbook(workbook_source, read_only=True, data_only=True)
+    try:
+        actual_sheets = list(workbook.sheetnames)
+        missing_sheets = [name for name in SALES_HISTORY_2025_SHEETS if name not in actual_sheets]
+        unexpected_sheets = [name for name in actual_sheets if name not in SALES_HISTORY_2025_SHEETS]
+        if missing_sheets or unexpected_sheets or len(actual_sheets) != 12:
+            issues = []
+            if missing_sheets:
+                issues.append(f"缺少sheet：{', '.join(missing_sheets)}")
+            if unexpected_sheets:
+                issues.append(f"存在额外sheet：{', '.join(unexpected_sheets)}")
+            raise ValueError(f"25年销量明细必须且只能包含1月至12月十二个sheet；{'；'.join(issues)}")
+
+        all_asins: set[str] = set()
+        site_totals: dict[str, dict[str, float]] = {}
+        month_metrics: dict[tuple[str, int], tuple[float, int, float]] = {}
+        total_rows = 0
+        maximum_columns = 0
+
+        for month in range(1, 13):
+            sheet_name = f"{month}月"
+            sheet = workbook[sheet_name]
+            header_row = next(sheet.iter_rows(min_row=1, max_row=1, values_only=True), ())
+            headers = [str(value).strip() if value is not None else "" for value in header_row]
+            maximum_columns = max(maximum_columns, len(headers))
+            duplicate_headers = sorted({name for name in headers if name and headers.count(name) > 1})
+            if duplicate_headers:
+                raise ValueError(f"{sheet_name}存在重复列名：{', '.join(duplicate_headers[:10])}")
+            header_index = {name: index for index, name in enumerate(headers)}
+            expected_days = calendar.monthrange(2025, month)[1]
+            day_columns = [f"{month:02d}-{day:02d}销量" for day in range(1, expected_days + 1)]
+            required_columns = ["asin", "msku", "国家", "小计", *day_columns]
+            missing_columns = [column for column in required_columns if column not in header_index]
+            if missing_columns:
+                raise ValueError(f"{sheet_name}缺少列：{', '.join(missing_columns[:12])}")
+            actual_day_columns = {
+                name for name in headers if re.fullmatch(r"\d{2}-\d{2}销量", name)
+            }
+            unexpected_days = sorted(actual_day_columns.difference(day_columns))
+            if unexpected_days:
+                raise ValueError(f"{sheet_name}包含不属于该月的销量列：{', '.join(unexpected_days[:10])}")
+
+            daily_by_asin: dict[str, list[float]] = {}
+            for row_number, row in enumerate(sheet.iter_rows(min_row=2, values_only=True), start=2):
+                total_rows += 1
+                asin = str(row[header_index["asin"]] or "").strip().upper()
+                if not asin:
+                    raise ValueError(f"{sheet_name}第{row_number}行ASIN为空")
+                all_asins.add(asin)
+                daily_values = [
+                    _history_number(
+                        row[header_index[column]],
+                        sheet_name=sheet_name,
+                        row_number=row_number,
+                        column=column,
+                    )
+                    for column in day_columns
+                ]
+                subtotal = _history_number(
+                    row[header_index["小计"]],
+                    sheet_name=sheet_name,
+                    row_number=row_number,
+                    column="小计",
+                )
+                daily_sum = sum(daily_values)
+                if not math.isclose(subtotal, daily_sum, abs_tol=1e-6):
+                    raise ValueError(
+                        f"{sheet_name}第{row_number}行小计与每日销量合计不一致："
+                        f"小计={_history_output_number(subtotal)}，每日合计={_history_output_number(daily_sum)}"
+                    )
+
+                country = str(row[header_index["国家"]] or "").strip()
+                country_code = SALES_HISTORY_2025_COUNTRIES.get(country)
+                if country_code is None:
+                    continue
+                asin_sites = site_totals.setdefault(
+                    asin, {code: 0.0 for code in SALES_HISTORY_2025_COUNTRIES.values()}
+                )
+                asin_sites[country_code] += daily_sum
+                asin_daily = daily_by_asin.setdefault(asin, [0.0] * expected_days)
+                for index, value in enumerate(daily_values):
+                    asin_daily[index] += value
+
+            for asin, daily_values in daily_by_asin.items():
+                total_sales = sum(daily_values)
+                active_days = sum(value > 0 for value in daily_values)
+                nonzero_average = round(total_sales / active_days, 2) if active_days else 0.0
+                month_metrics[(asin, month)] = (total_sales, active_days, nonzero_average)
+
+        rows: list[dict[str, object]] = []
+        for asin in sorted(all_asins):
+            row: dict[str, object] = {"ASIN": asin}
+            asin_sites = site_totals.get(
+                asin, {code: 0.0 for code in SALES_HISTORY_2025_COUNTRIES.values()}
+            )
+            for code in SALES_HISTORY_2025_COUNTRIES.values():
+                row[f"{code}总销量"] = _history_output_number(asin_sites[code])
+            for month in range(1, 13):
+                total_sales, active_days, nonzero_average = month_metrics.get((asin, month), (0.0, 0, 0.0))
+                row[f"{month}月总销量"] = _history_output_number(total_sales)
+                row[f"{month}月出单天数"] = active_days
+                row[f"{month}月除0日均"] = nonzero_average
+            rows.append(row)
+        summary = normalize_sales_history_2025(pd.DataFrame(rows, columns=SALES_HISTORY_2025_COLUMNS))
+        return summary, {
+            "rows": total_rows,
+            "effective_rows": len(summary),
+            "columns": maximum_columns,
+        }
+    finally:
+        workbook.close()
+
+
 def normalize_replenishment_gross_profit_source(df: pd.DataFrame) -> pd.DataFrame:
     missing = [col for col in REPLENISHMENT_GROSS_REQUIRED_COLUMNS if col not in df.columns]
     if missing:
@@ -1251,6 +1625,7 @@ def normalize_replenishment_gross_profit_source(df: pd.DataFrame) -> pd.DataFram
     base = df[["ASIN", "MSKU", "国家", "毛利润"] + GROSS_PROFIT_VOLUME_COLUMNS + sales_columns + REPLENISHMENT_GROSS_RATIO_COLUMNS].copy()
     for col in ["ASIN", "MSKU", "国家"]:
         base[col] = base[col].fillna("").astype(str).str.strip()
+    base["ASIN"] = base["ASIN"].str.upper()
     for col in set(["毛利润"] + GROSS_PROFIT_VOLUME_COLUMNS + sales_columns):
         base[col] = normalize_config_number(base[col]).fillna(0)
     for col in REPLENISHMENT_GROSS_RATIO_COLUMNS:
@@ -1345,99 +1720,374 @@ def replenishment_reason_columns() -> list[str]:
 def build_replenishment_rating_summary(df: pd.DataFrame) -> pd.DataFrame:
     rating = normalize_rating_source(df)
     if rating.empty:
-        return pd.DataFrame(columns=["ASIN", "产品评分"])
+        return pd.DataFrame(columns=["ASIN", "产品评价数", "产品评分值"])
 
+    rating["ASIN"] = rating["ASIN"].fillna("").astype(str).str.strip().str.upper()
     data = rating[rating["国家"].isin(PRODUCT_COUNTRIES)].copy()
     if data.empty:
-        return pd.DataFrame(columns=["ASIN", "产品评分"])
+        return pd.DataFrame(columns=["ASIN", "产品评价数", "产品评分值"])
     country_order = {country: index for index, country in enumerate(PRODUCT_COUNTRIES)}
     data["_国家排序"] = data["国家"].map(country_order).fillna(len(country_order))
     data = data.sort_values(["ASIN", "Rating总数", "_国家排序"], ascending=[True, False, True], kind="stable")
     best = data.drop_duplicates(subset=["ASIN"], keep="first").copy()
-    best["产品评分"] = best.apply(format_product_rating, axis=1)
-    return best[["ASIN", "产品评分"]].reset_index(drop=True)
+    best["产品评价数"] = pd.to_numeric(best["Rating总数"], errors="coerce")
+    best["产品评分值"] = pd.to_numeric(best["评分"], errors="coerce")
+    return best[["ASIN", "产品评价数", "产品评分值"]].reset_index(drop=True)
 
 
 def build_replenishment_management_tables(
     operational_df: pd.DataFrame,
-    gross_profit_df: pd.DataFrame,
-    rating_df: pd.DataFrame,
+    gross_profit_df: pd.DataFrame | None = None,
+    rating_df: pd.DataFrame | None = None,
     target_config: pd.DataFrame | None = None,
+    *,
+    coverage_rules: pd.DataFrame | None = None,
+    replenishment_switches: pd.DataFrame | None = None,
+    product_tags: pd.DataFrame | None = None,
+    store_config: pd.DataFrame | None = None,
+    sales_history_2025: pd.DataFrame | None = None,
+    promotions: pd.DataFrame | None = None,
     only_needed: bool = True,
-    default_case_pack: int = DEFAULT_REPLENISHMENT_CASE_PACK,
+    today: date | datetime | pd.Timestamp | None = None,
 ) -> dict[str, pd.DataFrame]:
-    if isinstance(default_case_pack, bool) or not isinstance(default_case_pack, int) or default_case_pack <= 0:
-        raise ValueError("默认箱规必须是正整数")
-    operational = build_replenishment_operational_summary(operational_df)
-    gross_profit = build_replenishment_gross_summary(gross_profit_df)
-    rating = build_replenishment_rating_summary(rating_df)
-    targets = normalize_replenishment_targets(target_config)
+    """Build Excel-compatible, ASIN-group replenishment recommendations.
+
+    ``target_config`` remains accepted so older integrations keep calling the
+    function successfully, but target days and case packs intentionally no
+    longer participate in the calculation.
+    """
+    del target_config
+    operational = normalize_replenishment_operational(operational_df)
+    rules = normalize_replenishment_coverage_rules(coverage_rules)
+    if rules.empty:
+        rules = default_replenishment_coverage_rules()
+    switches = normalize_replenishment_switches(replenishment_switches)
+    tags = normalize_replenishment_product_tags(product_tags)
+    stores = normalize_store_config(store_config if store_config is not None else pd.DataFrame())
+    history = normalize_sales_history_2025(sales_history_2025) if sales_history_2025 is not None and not sales_history_2025.empty else pd.DataFrame(columns=SALES_HISTORY_2025_COLUMNS)
 
     if operational.empty:
-        empty_detail = pd.DataFrame(columns=replenishment_management_columns())
-        return {"detail": empty_detail, "store_distribution": pd.DataFrame(columns=["店铺编码", "需补货ASIN数"])}
+        return {
+            "detail": pd.DataFrame(columns=replenishment_management_columns()),
+            "sku_detail": pd.DataFrame(columns=replenishment_sku_detail_columns()),
+            "history": history,
+        }
 
-    result = operational.merge(targets, on="ASIN", how="left")
-    result["目标可售天数"] = result["目标可售天数"].fillna(DEFAULT_REPLENISHMENT_TARGET_DAYS).astype(int)
-    if "箱规" not in result.columns:
-        result["箱规"] = default_case_pack
-    result["箱规"] = normalize_config_number(result["箱规"]).fillna(default_case_pack)
-    result["箱规"] = result["箱规"].where(result["箱规"].gt(0), default_case_pack).round().astype(int)
-    result["原始缺口"] = (
-        result["日均销量"] * result["目标可售天数"] - result["总库存数量"]
-    ).clip(lower=0)
-    result["建议补货数量"] = result.apply(
-        lambda row: int(math.ceil(row["原始缺口"] / row["箱规"]) * row["箱规"]) if row["原始缺口"] > 0 else 0,
+    data = operational.copy()
+    data["补货组ID"] = data.apply(
+        lambda row: str(row["ASIN"])
+        if str(row["ASIN"]).strip()
+        else f"异常-{str(row['MSKU']).strip() or row.name + 1}",
         axis=1,
     )
-    result = result.merge(gross_profit, on="ASIN", how="left").merge(rating, on="ASIN", how="left")
-    for col in replenishment_management_columns():
-        if col not in result.columns:
-            result[col] = pd.NA
+    calculation_day = pd.Timestamp(today).normalize() if today is not None else pd.Timestamp.today().normalize()
+    data["上架天数"] = (calculation_day - data["上架时间"].dt.normalize()).dt.days
+    numeric_required = REPLENISHMENT_SALES_COLUMNS + REPLENISHMENT_FORMULA_STOCK_COLUMNS + ["单品重量(g)"]
+    data["数据异常"] = ""
+    for index, row in data.iterrows():
+        issues: list[str] = []
+        if not str(row["ASIN"]).strip():
+            issues.append("缺少ASIN")
+        if not str(row["MSKU"]).strip():
+            issues.append("缺少MSKU")
+        if pd.isna(row["上架时间"]):
+            issues.append("缺少上架时间")
+        elif pd.isna(row["上架天数"]) or row["上架天数"] < 0:
+            issues.append("上架时间无效")
+        for column in numeric_required:
+            if pd.isna(row[column]):
+                issues.append(f"缺少{column}")
+        data.at[index, "数据异常"] = "；".join(issues)
 
-    result = result[replenishment_management_columns()].copy()
+    valid = data["数据异常"].eq("")
+    data["校准日销量"] = pd.NA
+    new_sku = valid & data["上架天数"].lt(90)
+    old_sku = valid & ~new_sku
+    data.loc[new_sku, "校准日销量"] = (
+        data.loc[new_sku, "7天销量"] / 7 * 0.90
+        + data.loc[new_sku, "14天销量"] / 14 * 0.09
+        + data.loc[new_sku, "30天销量"] / 30 * 0.01
+    )
+    data.loc[old_sku, "校准日销量"] = (
+        data.loc[old_sku, "7天销量"] / 7 * 0.60
+        + data.loc[old_sku, "14天销量"] / 14 * 0.30
+        + data.loc[old_sku, "30天销量"] / 30 * 0.10
+    )
+    data["SKU总库存"] = (
+        data["可售"] + data["待调仓"] + data["调仓中"] + data["待入库"] * 2
+        + data["采购在途"] + data["本地库存"] + data["在途"] + data["计划入库"]
+    )
+    data["SKU亚马逊可售"] = data[["可售", "待调仓", "调仓中", "待入库"]].sum(axis=1, min_count=4)
+    data["T值"] = data["7天销量"] / 7 - data["30天销量"] / 30
+    data["库龄90天以上"] = data[AGING_STOCK_COLUMNS].sum(axis=1, min_count=1)
+    data["库龄180-365天"] = data[["181-330天库存数", "331-365天库存数"]].sum(axis=1, min_count=1)
+    data["库龄365天以上"] = data[["366-455天库存数", "456天以上库存数"]].sum(axis=1, min_count=1)
+    stopped_codes = {
+        extract_store_code(value)
+        for value in stores.loc[stores["停提款时间"].fillna("").astype(str).str.strip().ne(""), "店铺名"]
+        if extract_store_code(value)
+    }
+
+    def store_status_text(value: object) -> str:
+        codes = [code for code, _ in extract_operational_store_codes(value) if code]
+        if not codes:
+            return str(value or "").strip()
+        return "；".join(f"{code}·{'停运' if code in stopped_codes else '正常'}" for code in dict.fromkeys(codes))
+
+    def join_store_statuses(values: pd.Series) -> str:
+        parts: list[str] = []
+        seen: set[str] = set()
+        for value in values:
+            for part in str(value or "").split("；"):
+                part = part.strip()
+                if part and part not in seen:
+                    parts.append(part)
+                    seen.add(part)
+        return "；".join(parts)
+
+    data["店铺状态"] = data["店铺名称"].map(store_status_text)
+    data["SKU角色"] = "跟卖SKU"
+    asin_inventory = data.groupby("ASIN", dropna=False, sort=False)["SKU总库存"].agg(
+        lambda values: values.sum(min_count=len(values))
+    )
+
+    switch_map = {
+        str(row["ASIN"]): (bool(row["是否补货"]), str(row["关闭原因"]))
+        for _, row in switches.iterrows()
+    }
+    parent_rows: list[dict] = []
+    sku_rows: list[dict] = []
+    enabled_rules = rules[rules["是否启用"]].copy()
+    enabled_rules["重量上限排序"] = enabled_rules["重量上限"].fillna(float("inf"))
+    enabled_rules = enabled_rules.sort_values(["重量下限", "重量上限排序"], kind="stable")
+
+    for group_id, group in data.groupby("补货组ID", sort=False, dropna=False):
+        group = group.copy()
+        group_issues = [item for item in group["数据异常"].tolist() if item]
+        original_index = group.sort_values(["上架时间", "MSKU"], kind="stable", na_position="last").index[0]
+        group.loc[original_index, "SKU角色"] = "原SKU"
+        max_weight = group["单品重量(g)"].max(skipna=True)
+        rule = pd.DataFrame()
+        if not group_issues and pd.notna(max_weight):
+            rule = enabled_rules[(enabled_rules["重量下限"] <= max_weight) & (enabled_rules["重量上限"].isna() | (enabled_rules["重量上限"] > max_weight))]
+            if len(rule) != 1:
+                group_issues.append("未匹配唯一库存覆盖规则")
+        coverage_days = pd.NA
+        transportation = ""
+        if len(rule) == 1:
+            matched = rule.iloc[0]
+            transportation = str(matched["运输方式"])
+            coverage_days = int(matched["头程时效"] + matched["预警天数"] + matched["补货频次"])
+        calibrated = group["校准日销量"].sum(min_count=len(group)) if not group_issues else pd.NA
+        inventory = group["SKU总库存"].sum(min_count=len(group)) if not group_issues else pd.NA
+        amazon_available = group["SKU亚马逊可售"].sum(min_count=len(group))
+        trend = group["T值"].sum(min_count=len(group))
+        asin_reference_inventory = sum(
+            (asin_inventory.get(asin, pd.NA) for asin in group["ASIN"].dropna().astype(str).unique()),
+            start=0,
+        )
+        if any(pd.isna(asin_inventory.get(asin, pd.NA)) for asin in group["ASIN"].dropna().astype(str).unique()):
+            asin_reference_inventory = pd.NA
+        target_stock = calibrated * coverage_days if not group_issues else pd.NA
+        measured = excel_round_to_ten(target_stock - inventory) if not group_issues else pd.NA
+        replenishment_enabled, close_reason = switch_map.get(str(group_id), (True, ""))
+        official = measured if replenishment_enabled and not group_issues else (0 if not group_issues else pd.NA)
+        status = "数据异常" if group_issues else ("已关闭补货" if not replenishment_enabled else "正常")
+        asin_values = join_non_empty_values(group["ASIN"])
+        follower_skus = join_non_empty_values(group.loc[group.index != original_index, "MSKU"])
+        parent_rows.append(
+            {
+                "补货组ID": str(group_id), "ASIN": asin_values, "原SKU": str(group.loc[original_index, "MSKU"]),
+                "跟卖SKU": follower_skus, "SKU数量": int(group["MSKU"].nunique()), "店铺编码": join_operational_store_codes(group["店铺名称"]),
+                "店铺状态": join_store_statuses(group["店铺状态"]),
+                "开发员": join_non_empty_values(group["开发员"]), "最大重量(g)": max_weight,
+                "库存覆盖天数": coverage_days, "T值": trend, "校准日销量": calibrated,
+                "亚马逊可售": amazon_available, "总可售": inventory, "跟卖总可售": asin_reference_inventory,
+                "ASIN总库存": inventory,
+                "库龄90天以上": group["库龄90天以上"].sum(min_count=len(group)),
+                "库龄180-365天": group["库龄180-365天"].sum(min_count=len(group)),
+                "库龄365天以上": group["库龄365天以上"].sum(min_count=len(group)),
+                "目标库存": target_stock, "测算建议补货数量": measured, "建议补货数量": official,
+                "是否补货": replenishment_enabled, "关闭原因": close_reason,
+                "数据状态": status, "数据异常": "；".join(dict.fromkeys(group_issues)),
+                "运输方式": transportation,
+            }
+        )
+        for _, row in group.sort_values(["上架时间", "MSKU"], kind="stable", na_position="last").iterrows():
+            sku_rows.append(
+                {
+                    "补货组ID": str(group_id), "ASIN": row["ASIN"], "SKU角色": row["SKU角色"], "MSKU": row["MSKU"],
+                    "店铺名称": row["店铺名称"], "店铺状态": row["店铺状态"], "开发员": row["开发员"],
+                    "上架时间": row["上架时间"], "上架天数": row["上架天数"],
+                    "单品重量(g)": row["单品重量(g)"], "7天销量": row["7天销量"], "14天销量": row["14天销量"],
+                    "30天销量": row["30天销量"], "T值": row["T值"], "校准日销量": row["校准日销量"],
+                    "SKU亚马逊可售": row["SKU亚马逊可售"], "SKU总库存": row["SKU总库存"],
+                    "库龄90天以上": row["库龄90天以上"], "库龄180-365天": row["库龄180-365天"],
+                    "库龄365天以上": row["库龄365天以上"],
+                    **{column: row[column] for column in REPLENISHMENT_FORMULA_STOCK_COLUMNS},
+                    "数据异常": row["数据异常"],
+                }
+            )
+
+    detail = pd.DataFrame(parent_rows)
+    sku_detail = pd.DataFrame(sku_rows)
+    if promotions is not None and not promotions.empty and not sku_detail.empty:
+        # These optional output columns are part of the canonical schema and
+        # therefore start as NA.  Remove the placeholders before merging so a
+        # matching promotion does not become pandas' _x/_y duplicate columns.
+        sku_detail = sku_detail.drop(
+            columns=[
+                "最近促销开始日期", "最近促销截止日期", "最近促销折扣",
+                "promotion_name", "promotion_updated_at",
+            ],
+            errors="ignore",
+        )
+        promo = promotions.copy()
+        promo = promo.rename(
+            columns={
+                "sku": "MSKU",
+                "start_date": "最近促销开始日期",
+                "end_date": "最近促销截止日期",
+                "discount_percent": "最近促销折扣",
+                "updated_at": "promotion_updated_at",
+            }
+        )
+        keep = [
+            column
+            for column in [
+                "MSKU", "最近促销开始日期", "最近促销截止日期", "最近促销折扣",
+                "promotion_name", "promotion_updated_at",
+            ]
+            if column in promo.columns
+        ]
+        sku_detail = sku_detail.merge(promo[keep].drop_duplicates("MSKU", keep="last"), on="MSKU", how="left")
+    for column in [
+        "最近促销开始日期", "最近促销截止日期", "最近促销折扣",
+        "promotion_name", "promotion_updated_at",
+    ]:
+        if column not in sku_detail.columns:
+            sku_detail[column] = pd.NA
+    if not sku_detail.empty:
+        promotion_rows: list[dict[str, object]] = []
+        for group_id, group in sku_detail.groupby("补货组ID", sort=False, dropna=False):
+            candidates = group[
+                group[
+                    [
+                        "最近促销开始日期", "最近促销截止日期", "最近促销折扣",
+                        "promotion_name", "promotion_updated_at",
+                    ]
+                ]
+                .notna()
+                .any(axis=1)
+            ].copy()
+            if candidates.empty:
+                continue
+            candidates["_开始日期"] = pd.to_datetime(candidates["最近促销开始日期"], errors="coerce")
+            candidates["_截止日期"] = pd.to_datetime(candidates["最近促销截止日期"], errors="coerce")
+            candidates["_更新时间"] = pd.to_datetime(candidates["promotion_updated_at"], errors="coerce")
+            active = candidates[
+                candidates["_开始日期"].le(calculation_day)
+                & (candidates["_截止日期"].isna() | candidates["_截止日期"].ge(calculation_day))
+            ]
+            if not active.empty:
+                selected = active.sort_values(
+                    ["_截止日期", "_开始日期", "_更新时间"],
+                    ascending=[True, False, False],
+                    na_position="last",
+                    kind="stable",
+                ).iloc[0]
+            else:
+                ended = candidates[candidates["_截止日期"].lt(calculation_day)]
+                if ended.empty:
+                    continue
+                selected = ended.sort_values(
+                    ["_截止日期", "_开始日期", "_更新时间"],
+                    ascending=[False, False, False],
+                    na_position="last",
+                    kind="stable",
+                ).iloc[0]
+            promotion_rows.append(
+                {
+                    "补货组ID": str(group_id),
+                    "最近促销开始日期": selected.get("最近促销开始日期"),
+                    "最近促销截止日期": selected.get("最近促销截止日期"),
+                    "最近促销折扣": selected.get("最近促销折扣"),
+                }
+            )
+        if promotion_rows:
+            detail = detail.merge(pd.DataFrame(promotion_rows), on="补货组ID", how="left")
+
+    enabled_tags = tags[tags["是否启用"]].copy()
+    if not enabled_tags.empty:
+        tag_summary = (
+            enabled_tags.groupby("ASIN", sort=False, dropna=False)
+            .agg(
+                产品标签=("产品标签", join_non_empty_values),
+                产品标签颜色=("标签颜色", lambda values: "；".join(str(value).strip() for value in values)),
+            )
+            .reset_index()
+        )
+        detail = detail.merge(tag_summary, on="ASIN", how="left")
+        sku_detail = sku_detail.merge(tag_summary, on="ASIN", how="left")
+
+    if not history.empty:
+        detail = detail.merge(history[SALES_HISTORY_2025_COLUMNS], on="ASIN", how="left")
+    for column in replenishment_sku_detail_columns():
+        if column not in sku_detail.columns:
+            sku_detail[column] = pd.NA
+    sku_detail = sku_detail[replenishment_sku_detail_columns()]
+    if gross_profit_df is not None and not gross_profit_df.empty and not detail.empty:
+        detail = detail.merge(build_replenishment_gross_summary(gross_profit_df), on="ASIN", how="left")
+    if rating_df is not None and not rating_df.empty and not detail.empty:
+        detail = detail.merge(build_replenishment_rating_summary(rating_df), on="ASIN", how="left")
+    for column in replenishment_management_columns():
+        if column not in detail.columns:
+            detail[column] = pd.NA
+    detail = detail[replenishment_management_columns()]
     if only_needed:
-        result = result[pd.to_numeric(result["建议补货数量"], errors="coerce").fillna(0).gt(0)].copy()
-    result = result.sort_values(["建议补货数量", "ASIN"], ascending=[False, True], kind="stable").reset_index(drop=True)
-    return {"detail": result, "store_distribution": build_replenishment_store_distribution(result)}
+        detail = detail[detail["建议补货数量"].fillna(0).gt(0) | detail["数据状态"].eq("数据异常")].copy()
+        sku_detail = sku_detail[sku_detail["补货组ID"].isin(set(detail["补货组ID"]))].copy()
+    detail = detail.sort_values(["建议补货数量", "ASIN", "补货组ID"], ascending=[False, True, True], kind="stable", na_position="last").reset_index(drop=True)
+    return {"detail": detail, "sku_detail": sku_detail.reset_index(drop=True), "history": history}
 
 
 def build_replenishment_store_distribution(detail: pd.DataFrame) -> pd.DataFrame:
-    if detail.empty or "店铺编码" not in detail.columns:
-        return pd.DataFrame(columns=["店铺编码", "需补货ASIN数"])
-    rows = []
-    for _, row in detail.iterrows():
-        asin = str(row.get("ASIN", "")).strip()
-        for store_code in [code.strip() for code in str(row.get("店铺编码", "")).split("；") if code.strip()]:
-            rows.append({"ASIN": asin, "店铺编码": store_code})
-    if not rows:
-        return pd.DataFrame(columns=["店铺编码", "需补货ASIN数"])
-    data = pd.DataFrame(rows).drop_duplicates(subset=["ASIN", "店铺编码"])
-    return (
-        data.groupby("店铺编码", dropna=False, as_index=False)
-        .agg(需补货ASIN数=("ASIN", "nunique"))
-        .sort_values(["需补货ASIN数", "店铺编码"], ascending=[False, True], kind="stable")
-        .reset_index(drop=True)
-    )
+    # Recommendations are product-level purchase quantities and are not
+    # allocated to stores in this version.
+    return pd.DataFrame(columns=["店铺编码", "需补货ASIN数"])
 
 
 def replenishment_management_columns() -> list[str]:
-    base_columns = [
-        "ASIN",
-        "MSKU",
-        "店铺编码",
-        "目标可售天数",
-        "亚马逊可售库存数量",
-        "总库存数量",
-        "库龄超90天库存数",
-        "日均销量",
-        "重量",
-        "建议补货方式",
-        "原始缺口",
-        "箱规",
-        "建议补货数量",
+    return [
+        "补货组ID", "ASIN", "原SKU", "跟卖SKU", "SKU数量", "店铺编码", "店铺状态", "开发员",
+        "最大重量(g)", "库存覆盖天数", "T值", "校准日销量", "亚马逊可售", "总可售",
+        "跟卖总可售", "ASIN总库存", "库龄90天以上", "库龄180-365天", "库龄365天以上",
+        "目标库存", "测算建议补货数量", "建议补货数量", "是否补货", "关闭原因",
+        "数据状态", "数据异常", "最近促销开始日期", "最近促销截止日期", "最近促销折扣",
+        "产品标签", "产品标签颜色", *SALES_HISTORY_2025_SITE_COLUMNS,
+        *SALES_HISTORY_2025_MONTH_COLUMNS,
+    ] + replenishment_gross_columns() + ["产品评价数", "产品评分值"]
+
+
+def replenishment_sku_detail_columns() -> list[str]:
+    return [
+        "补货组ID", "ASIN", "SKU角色", "MSKU", "店铺名称", "店铺状态", "开发员",
+        "上架时间", "上架天数", "单品重量(g)", "7天销量", "14天销量", "30天销量",
+        "T值", "校准日销量", "SKU亚马逊可售", "SKU总库存", "库龄90天以上",
+        "库龄180-365天", "库龄365天以上", *REPLENISHMENT_FORMULA_STOCK_COLUMNS,
+        "最近促销开始日期", "最近促销截止日期", "最近促销折扣", "promotion_name",
+        "产品标签", "产品标签颜色", "数据异常",
     ]
-    return base_columns + replenishment_gross_columns() + ["产品评分"]
+
+
+def excel_round_to_ten(gap: float | int | pd.NA) -> int:
+    """Excel ROUND(gap/10, 0) * 10, then MAX(..., 0)."""
+    if pd.isna(gap) or float(gap) <= 0:
+        return 0
+    # Weighted daily sales can produce values such as 34.99999999999999 even
+    # when the business value is exactly 35. Excel rounds that up, so retain a
+    # tiny numerical tolerance before applying the half-up rule.
+    return int(math.floor(float(gap) / 10 + 0.5 + 1e-9) * 10)
 
 
 def normalize_product_operational(df: pd.DataFrame) -> pd.DataFrame:

@@ -20,11 +20,13 @@ from dashboard.data_processing import (
     REPLENISHMENT_GROSS_RATIO_COLUMNS,
     REPLENISHMENT_STOCK_COMPONENT_COLUMNS,
     build_replenishment_gross_summary,
+    build_sales_history_2025_summary,
     duplicate_row_issues,
     normalize_config_number,
     normalize_gross_profit_source,
     normalize_operational_sales,
     normalize_product_operational,
+    normalize_sales_history_2025,
     normalize_rating_source,
     normalize_replenishment_operational,
     normalize_sales_amount_detail,
@@ -33,6 +35,7 @@ from dashboard.data_processing import (
     read_local_table,
     read_upload_table,
 )
+from dashboard.parquet_cache import load_or_build_parquet
 from dashboard.report_store import (
     DATA_DIR,
     delete_upload_record,
@@ -83,6 +86,7 @@ SOURCE_DEFINITIONS: dict[str, tuple[str, Callable[[pd.DataFrame], pd.DataFrame]]
     "rating": ("Rating", normalize_rating_source),
     "sales_volume_detail": ("销量明细", normalize_sales_volume_detail),
     "sales_amount_detail": ("销售额明细", normalize_sales_amount_detail),
+    "sales_history_2025": ("25年销量明细", normalize_sales_history_2025),
 }
 
 
@@ -134,6 +138,8 @@ def _numeric_columns(source_key: str, frame: pd.DataFrame) -> list[str]:
         ]
     if source_key == "rating":
         return [column for column in ["Rating总数", "评分"] if column in frame.columns]
+    if source_key == "sales_history_2025":
+        return [column for column in frame.columns if column not in {"ASIN", "25年主出单站点", "峰值3个月份"}]
     suffix = "销量" if source_key == "sales_volume_detail" else "销售额"
     return [column for column in frame.columns if re.fullmatch(rf"\d{{2}}-\d{{2}}{suffix}", str(column).strip())]
 
@@ -263,6 +269,32 @@ async def upload_source(source_key: str, file: Annotated[UploadFile, File(...)])
     )
     upload = MemoryUpload(name, data)
     try:
+        if source_key == "sales_history_2025":
+            if Path(name).suffix.lower() != ".xlsx":
+                raise HTTPException(422, "25年销量明细仅接受 .xlsx 十二-sheet原始表")
+            normalized, stats = build_sales_history_2025_summary(data)
+            _validate_table_limits(normalized, "25年销量ASIN汇总")
+            if int(stats["rows"]) > MAX_TABLE_ROWS:
+                raise HTTPException(422, f"{title}明细行数超过 {MAX_TABLE_ROWS} 限制")
+            path = persist_latest_source(upload, source_key, title)
+            _invalidate_dashboard_cache()
+            # The workbook has already been parsed and validated above. Persist
+            # that exact derived ASIN summary so the first dashboard read does
+            # not parse twelve sheets a second time.
+            load_or_build_parquet(
+                "source-sales_history_2025-raw",
+                [path],
+                lambda: normalized,
+            )
+            return {
+                "source": source_key,
+                "file": path.name,
+                "rows": int(stats["rows"]),
+                "effective_rows": int(stats["effective_rows"]),
+                "duplicate_rows_ignored": 0,
+                "columns": int(stats["columns"]),
+                "warnings": [],
+            }
         raw = read_upload_table(upload)
         _validate_table_limits(raw, title)
         _raise_bad_numbers(_bad_numeric_issues(raw, _numeric_columns(source_key, raw)))

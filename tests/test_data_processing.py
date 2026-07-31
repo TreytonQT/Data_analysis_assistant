@@ -1,6 +1,9 @@
 import unittest
+import io
+from datetime import date
 
 import pandas as pd
+from openpyxl import Workbook
 
 from dashboard.data_processing import (
     build_available_inventory_monitor_table,
@@ -8,7 +11,9 @@ from dashboard.data_processing import (
     build_low_margin_product_table,
     build_person_commission_summary,
     build_product_management_table,
+    build_replenishment_rating_summary,
     build_replenishment_management_tables,
+    build_sales_history_2025_summary,
     build_sales_dashboard_tables,
     build_slow_moving_inventory_table,
     compute_commission_table,
@@ -25,11 +30,17 @@ from dashboard.data_processing import (
     latest_department_detail_date,
     normalize_product_operational,
     normalize_operational_aging,
+    exclude_stopped_store_operational_rows,
     normalize_operational_sales,
     normalize_sales_amount_detail,
     normalize_sales_volume_detail,
     normalize_report,
     normalize_replenishment_targets,
+    normalize_replenishment_coverage_rules,
+    normalize_replenishment_listing_dates,
+    normalize_replenishment_product_tags,
+    normalize_replenishment_switches,
+    normalize_sales_history_2025,
     with_department_performance_total,
     normalize_store_config,
     product_level_for_daily_sales,
@@ -40,6 +51,33 @@ from dashboard.data_processing import (
 
 
 class DataProcessingTests(unittest.TestCase):
+    def test_current_month_partial_range_remains_available_to_dashboards(self):
+        report = pd.DataFrame(
+            {
+                "销售专员": ["A"],
+                "月份": ["2026-07-01~2026-07-21"],
+                "店铺": ["6-ZXU 德国"],
+                "销售额--FBA销售额": [100],
+            }
+        )
+
+        normalized = normalize_report(report, today=date(2026, 7, 21))
+
+        self.assertEqual(normalized.loc[0, "月份"], "2026-07")
+
+    def test_past_month_partial_range_is_still_excluded_from_dashboards(self):
+        report = pd.DataFrame(
+            {
+                "销售专员": ["A"],
+                "月份": ["2026-06-01~2026-06-21"],
+                "店铺": ["6-ZXU 德国"],
+            }
+        )
+
+        normalized = normalize_report(report, today=date(2026, 7, 21))
+
+        self.assertTrue(pd.isna(normalized.loc[0, "月份"]))
+
     def commission_metrics(self):
         return pd.DataFrame(
             [
@@ -755,6 +793,8 @@ class DataProcessingTests(unittest.TestCase):
                 "店铺名称": ["6-ZXU 德国,7-YIP 本土法国", "6-ZXU 德国", "7-YIP 法国", "8-TIS 意大利"],
                 "开发员": ["A", "A", "A", "A"],
                 "可售": [10, 5, 100, 0],
+                "待调仓": [1, 0, 0, 0],
+                "调仓中": [1, 0, 0, 0],
                 "待入库": [1, 0, 0, 0],
                 "采购在途": [2, 1, 0, 0],
                 "本地库存": [3, 0, 0, 0],
@@ -765,8 +805,11 @@ class DataProcessingTests(unittest.TestCase):
                 "331-365天库存数": [3, 0, 0, 0],
                 "366-455天库存数": [4, 0, 0, 0],
                 "456天以上库存数": [5, 0, 0, 0],
-                "日均销量": [2, 1, 1, 1],
+                "7天销量": [70, 35, 0, 7],
+                "14天销量": [140, 70, 0, 14],
+                "30天销量": [300, 150, 0, 30],
                 "单品重量(g)": [80, 120, 50, 20],
+                "上架时间": ["2025-01-01", "2026-07-01", "2025-01-01", "2025-01-01"],
             }
         )
 
@@ -1003,83 +1046,219 @@ class DataProcessingTests(unittest.TestCase):
         self.assertTrue(pd.isna(result.loc[0, "目标可售天数"]))
         self.assertEqual(result.loc[0, "箱规"], 12)
 
-    def test_replenishment_management_calculates_asin_inventory_and_filters_needed(self):
+    def test_replenishment_aggregates_skus_and_keeps_excel_pending_inbound_formula(self):
         tables = build_replenishment_management_tables(
-            self.replenishment_operational_source(),
-            self.replenishment_gross_source(),
-            self.replenishment_rating_source(),
-            pd.DataFrame({"ASIN": ["B001"], "目标可售天数": [20]}),
-        )
-        detail = tables["detail"].set_index("ASIN")
-
-        self.assertEqual(detail.index.tolist(), ["B003", "B001"])
-        self.assertEqual(detail.loc["B001", "MSKU"], "SKU1；SKU2")
-        self.assertEqual(detail.loc["B001", "店铺编码"], "ZXU；YIP")
-        self.assertEqual(detail.loc["B001", "亚马逊可售库存数量"], 15)
-        self.assertEqual(detail.loc["B001", "总库存数量"], 31)
-        self.assertEqual(detail.loc["B001", "库龄超90天库存数"], 15)
-        self.assertEqual(detail.loc["B001", "重量"], 120)
-        self.assertEqual(detail.loc["B001", "建议补货方式"], "卡航")
-        self.assertEqual(detail.loc["B001", "目标可售天数"], 20)
-        self.assertEqual(detail.loc["B001", "原始缺口"], 29)
-        self.assertEqual(detail.loc["B001", "箱规"], 10)
-        self.assertEqual(detail.loc["B001", "建议补货数量"], 30)
-        self.assertEqual(detail.loc["B003", "目标可售天数"], 70)
-        self.assertEqual(detail.loc["B003", "建议补货方式"], "空运")
-        self.assertNotIn("B002", detail.index)
-
-    def test_replenishment_uses_configured_case_pack_and_rounds_up_small_gap(self):
-        tables = build_replenishment_management_tables(
-            self.replenishment_operational_source(),
-            self.replenishment_gross_source(),
-            self.replenishment_rating_source(),
-            pd.DataFrame(
-                {
-                    "ASIN": ["B001", "B003"],
-                    "目标可售天数": [20, 5],
-                    "箱规": [12, pd.NA],
-                }
-            ),
-        )
-        detail = tables["detail"].set_index("ASIN")
-
-        self.assertEqual(detail.loc["B001", "原始缺口"], 29)
-        self.assertEqual(detail.loc["B001", "箱规"], 12)
-        self.assertEqual(detail.loc["B001", "建议补货数量"], 36)
-        self.assertEqual(detail.loc["B003", "原始缺口"], 5)
-        self.assertEqual(detail.loc["B003", "箱规"], 10)
-        self.assertEqual(detail.loc["B003", "建议补货数量"], 10)
-
-    def test_replenishment_management_builds_store_distribution_without_stock_duplication(self):
-        tables = build_replenishment_management_tables(
-            self.replenishment_operational_source(),
-            self.replenishment_gross_source(),
-            self.replenishment_rating_source(),
-            pd.DataFrame({"ASIN": ["B001"], "目标可售天数": [20]}),
-        )
-        distribution = tables["store_distribution"].set_index("店铺编码")
-
-        self.assertEqual(distribution.loc["ZXU", "需补货ASIN数"], 1)
-        self.assertEqual(distribution.loc["YIP", "需补货ASIN数"], 1)
-        self.assertEqual(distribution.loc["TIS", "需补货ASIN数"], 1)
-        self.assertEqual(tables["detail"].set_index("ASIN").loc["B001", "总库存数量"], 31)
-
-    def test_replenishment_management_merges_gross_reasons_by_msku_and_best_rating(self):
-        tables = build_replenishment_management_tables(
-            self.replenishment_operational_source(),
-            self.replenishment_gross_source(),
-            self.replenishment_rating_source(),
-            pd.DataFrame({"ASIN": ["B001"], "目标可售天数": [20]}),
+            self.replenishment_operational_source(), self.replenishment_gross_source(), self.replenishment_rating_source(),
+            store_config=pd.DataFrame({"店铺名": ["6-ZXU"], "店铺类型": ["中企"], "停提款时间": ["2026-01"], "店铺所属部门": ["测试"]}),
+            today="2026-07-29", only_needed=False,
         )
         row = tables["detail"].set_index("ASIN").loc["B001"]
 
-        self.assertEqual(row["德国单量"], 10)
-        self.assertAlmostEqual(row["德国毛利率"], 40 / 200)
-        self.assertEqual(row["德国原因"], "SKU1: 广告炸、退货多、FBA配送费炸")
-        self.assertEqual(row["法国单量"], 3)
-        self.assertAlmostEqual(row["法国毛利率"], 30 / 100)
-        self.assertEqual(row["法国原因"], "SKU2: FBA配送费炸")
-        self.assertEqual(row["产品评分"], "230(4.5)")
+        self.assertEqual(row["原SKU"], "SKU1")
+        self.assertEqual(row["SKU数量"], 2)
+        self.assertEqual(row["最大重量(g)"], 120)
+        self.assertEqual(row["库存覆盖天数"], 90)
+        self.assertEqual(row["ASIN总库存"], 34)
+        self.assertEqual(row["亚马逊可售"], 18)
+        self.assertEqual(row["总可售"], 34)
+        self.assertEqual(row["跟卖总可售"], 34)
+        self.assertAlmostEqual(row["T值"], 0)
+        self.assertEqual(row["库龄90天以上"], 15)
+        self.assertEqual(row["库龄180-365天"], 5)
+        self.assertEqual(row["库龄365天以上"], 9)
+        self.assertEqual(row["店铺状态"], "ZXU·停运；YIP·正常")
+        self.assertAlmostEqual(row["校准日销量"], 15)
+        self.assertEqual(row["目标库存"], 1350)
+        self.assertEqual(row["测算建议补货数量"], 1320)
+        self.assertEqual(row["建议补货数量"], 1320)
+        sku = tables["sku_detail"].set_index("MSKU")
+        self.assertEqual(sku.loc["SKU1", "SKU总库存"], 28)
+        self.assertEqual(sku.loc["SKU1", "SKU亚马逊可售"], 13)
+        self.assertEqual(sku.loc["SKU1", "SKU角色"], "原SKU")
+
+    def test_replenishment_uses_excel_rounding_weight_boundary_and_switch(self):
+        source = pd.DataFrame({
+            "ASIN": ["B100"], "MSKU": ["S100"], "店铺名称": ["6-ZXU 德国"], "开发员": ["A"],
+            "上架时间": ["2025-01-01"], "单品重量(g)": [100], "7天销量": [7], "14天销量": [14], "30天销量": [30],
+            "可售": [55], "待调仓": [0], "调仓中": [0], "待入库": [0], "采购在途": [0], "本地库存": [0], "在途": [0], "计划入库": [0],
+        })
+        tables = build_replenishment_management_tables(source, replenishment_switches=pd.DataFrame({"补货组ID": ["B100"], "是否补货": ["否"], "关闭原因": ["停售"]}), today="2026-07-29", only_needed=False)
+        row = tables["detail"].iloc[0]
+        self.assertEqual(row["库存覆盖天数"], 90)
+        self.assertEqual(row["测算建议补货数量"], 40)
+        self.assertEqual(row["建议补货数量"], 0)
+        self.assertEqual(row["数据状态"], "已关闭补货")
+
+    def test_replenishment_groups_all_skus_by_asin_and_blocks_missing_inputs(self):
+        source = self.replenishment_operational_source()
+        source.loc[source["MSKU"].eq("SKU2"), "单品重量(g)"] = pd.NA
+        tables = build_replenishment_management_tables(
+            source,
+            today="2026-07-29", only_needed=False,
+        )
+        detail = tables["detail"].set_index("补货组ID")
+        self.assertNotIn("B001-FOLLOW", detail.index)
+        self.assertEqual(detail.loc["B001", "数据状态"], "数据异常")
+        self.assertIn("缺少单品重量(g)", detail.loc["B001", "数据异常"])
+
+    def test_replenishment_listing_dates_support_export_formats_without_timezone_shift(self):
+        parsed = normalize_replenishment_listing_dates(pd.Series([
+            "28/02/2026 05:21:03 MET",
+            "04/06/2026 09:01:31 MEST",
+            "2026-04-13 04:07:24 CET",
+            "2026-04-14 00:05:00 CEST",
+            "2026-04-15 23:55:00 GMT",
+            45292,
+            pd.Timestamp("2026-07-29 23:59:00"),
+            "无效日期",
+        ]))
+
+        self.assertEqual(parsed.iloc[0], pd.Timestamp("2026-02-28"))
+        self.assertEqual(parsed.iloc[1], pd.Timestamp("2026-06-04"))
+        self.assertEqual(parsed.iloc[2], pd.Timestamp("2026-04-13"))
+        self.assertEqual(parsed.iloc[3], pd.Timestamp("2026-04-14"))
+        self.assertEqual(parsed.iloc[4], pd.Timestamp("2026-04-15"))
+        self.assertEqual(parsed.iloc[5], pd.Timestamp("2024-01-01"))
+        self.assertEqual(parsed.iloc[6], pd.Timestamp("2026-07-29"))
+        self.assertTrue(pd.isna(parsed.iloc[7]))
+
+    def test_replenishment_switches_use_asin_and_accept_legacy_group_id(self):
+        switches = normalize_replenishment_switches(pd.DataFrame({
+            "补货组ID": [" b001 "], "是否补货": ["否"], "关闭原因": ["停售"],
+        }))
+        self.assertEqual(switches.to_dict(orient="records"), [
+            {"ASIN": "B001", "是否补货": False, "关闭原因": "停售"},
+        ])
+        with self.assertRaisesRegex(ValueError, "关闭原因"):
+            normalize_replenishment_switches(pd.DataFrame({
+                "ASIN": ["B002"], "是否补货": ["否"], "关闭原因": [""],
+            }))
+
+    def test_replenishment_rating_matches_trimmed_case_insensitive_asin(self):
+        result = build_replenishment_rating_summary(pd.DataFrame({
+            "ASIN": [" b001 ", "B001"], "国家": ["德国", "法国"],
+            "Rating总数": [10, 20], "评分": [4.1, 4.7],
+        }))
+        self.assertEqual(result.to_dict(orient="records"), [
+            {"ASIN": "B001", "产品评价数": 20, "产品评分值": 4.7},
+        ])
+
+    def test_replenishment_history_and_promotion_are_supporting_data_only(self):
+        history = pd.DataFrame([{
+            "ASIN": "B001", "DE总销量": 80, "FR总销量": 10, "ES总销量": 5, "IT总销量": 5,
+            **{
+                key: value
+                for month in range(1, 13)
+                for key, value in (
+                    (f"{month}月总销量", month),
+                    (f"{month}月出单天数", 1),
+                    (f"{month}月除0日均", float(month)),
+                )
+            },
+        }])
+        tables = build_replenishment_management_tables(
+            self.replenishment_operational_source(), sales_history_2025=history,
+            promotions=pd.DataFrame({
+                "sku": ["SKU1"], "start_date": ["2026-07-01"], "end_date": ["2026-08-01"],
+                "discount_percent": [10], "promotion_name": ["清仓"],
+            }),
+            product_tags=pd.DataFrame({
+                "ASIN": ["B001", "B001"], "产品标签": ["爆款", "季节品"], "标签颜色": ["#16A34A", ""],
+                "是否启用": ["是", "否"], "备注": ["重点", "暂不展示"],
+            }),
+            today="2026-07-29", only_needed=False,
+        )
+        self.assertEqual(tables["history"].loc[0, "12月总销量"], 12)
+        parent = tables["detail"].set_index("ASIN").loc["B001"]
+        self.assertEqual(parent["最近促销开始日期"], "2026-07-01")
+        self.assertEqual(parent["最近促销截止日期"], "2026-08-01")
+        self.assertEqual(parent["最近促销折扣"], 10)
+        self.assertEqual(parent["产品标签"], "爆款")
+        self.assertEqual(parent["DE总销量"], 80)
+        self.assertNotIn("备注", tables["detail"].columns)
+        sku = tables["sku_detail"].set_index("MSKU")
+        self.assertEqual(sku.loc["SKU1", "最近促销开始日期"], "2026-07-01")
+        self.assertEqual(sku.loc["SKU1", "最近促销截止日期"], "2026-08-01")
+        self.assertEqual(sku.loc["SKU1", "最近促销折扣"], 10)
+        self.assertEqual(sku.loc["SKU1", "产品标签"], "爆款")
+        self.assertNotIn("备注", tables["sku_detail"].columns)
+
+    def test_replenishment_t_value_uses_seven_day_minus_thirty_day_average(self):
+        source = self.replenishment_operational_source()
+        source.loc[source["ASIN"].eq("B001"), "7天销量"] = [84, 21]
+        source.loc[source["ASIN"].eq("B001"), "30天销量"] = [300, 120]
+        tables = build_replenishment_management_tables(source, today="2026-07-29", only_needed=False)
+
+        parent = tables["detail"].set_index("ASIN").loc["B001"]
+        sku = tables["sku_detail"].set_index("MSKU")
+        self.assertAlmostEqual(sku.loc["SKU1", "T值"], 2)
+        self.assertAlmostEqual(sku.loc["SKU2", "T值"], -1)
+        self.assertAlmostEqual(parent["T值"], 1)
+
+    def test_replenishment_product_tag_validation(self):
+        tags = normalize_replenishment_product_tags(pd.DataFrame({
+            "ASIN": [" B001 "], "产品标签": [" 爆款 "], "标签颜色": ["#16A34A"], "是否启用": ["是"], "备注": [""],
+        }))
+        self.assertEqual(tags.loc[0, "ASIN"], "B001")
+        self.assertTrue(tags.loc[0, "是否启用"])
+        with self.assertRaisesRegex(ValueError, "#RRGGBB"):
+            normalize_replenishment_product_tags(pd.DataFrame({
+                "ASIN": ["B001"], "产品标签": ["爆款"], "标签颜色": ["green"], "是否启用": ["是"], "备注": [""],
+            }))
+
+    def test_replenishment_rule_validation_rejects_overlap_and_history_requires_unique_asin(self):
+        with self.assertRaisesRegex(ValueError, "不能重叠"):
+            normalize_replenishment_coverage_rules(pd.DataFrame([
+                {"运输方式": "空运", "重量下限": 0, "重量上限": 100, "头程时效": 1, "预警天数": 1, "补货频次": 1, "是否启用": "是"},
+                {"运输方式": "卡航", "重量下限": 99, "重量上限": None, "头程时效": 1, "预警天数": 1, "补货频次": 1, "是否启用": "是"},
+            ]))
+        history_row = {
+            "ASIN": "B1", "DE总销量": 1, "FR总销量": 0, "ES总销量": 0, "IT总销量": 0,
+            **{
+                key: 0
+                for month in range(1, 13)
+                for key in (f"{month}月总销量", f"{month}月出单天数", f"{month}月除0日均")
+            },
+        }
+        with self.assertRaisesRegex(ValueError, "ASIN必须唯一"):
+            normalize_sales_history_2025(pd.DataFrame([history_row, history_row]))
+
+    def test_sales_history_workbook_aggregates_daily_before_nonzero_average(self):
+        workbook = Workbook()
+        workbook.remove(workbook.active)
+        for month in range(1, 13):
+            sheet = workbook.create_sheet(f"{month}月")
+            days = pd.Period(f"2025-{month:02d}").days_in_month
+            day_columns = [f"{month:02d}-{day:02d}销量" for day in range(1, days + 1)]
+            sheet.append(["asin", "msku", "国家", "小计", *day_columns])
+            de_values = [0] * days
+            fr_values = [0] * days
+            it_values = [0] * days
+            if month == 1:
+                de_values[0] = 1
+                fr_values[0] = 2
+            if month == 2:
+                it_values[0:2] = [2, 2]
+            sheet.append([" b001 ", "SKU-DE", "德国", sum(de_values), *de_values])
+            sheet.append(["B001", "SKU-FR", "法国", sum(fr_values), *fr_values])
+            sheet.append(["B001", "SKU-IT", "意大利", sum(it_values), *it_values])
+            sheet.append(["B001", "SKU-NL", "荷兰", 9, 9, *([0] * (days - 1))])
+        buffer = io.BytesIO()
+        workbook.save(buffer)
+
+        summary, stats = build_sales_history_2025_summary(buffer.getvalue())
+        row = summary.iloc[0]
+
+        self.assertEqual(stats["rows"], 48)
+        self.assertEqual(row["DE总销量"], 1)
+        self.assertEqual(row["FR总销量"], 2)
+        self.assertEqual(row["IT总销量"], 4)
+        self.assertEqual(row["1月总销量"], 3)
+        self.assertEqual(row["1月出单天数"], 1)
+        self.assertEqual(row["1月除0日均"], 3)
+        self.assertEqual(row["2月总销量"], 4)
+        self.assertEqual(row["2月出单天数"], 2)
+        self.assertEqual(row["2月除0日均"], 2)
 
     def test_product_operational_requires_expected_columns(self):
         with self.assertRaisesRegex(ValueError, "运营原始表缺少产品管理列"):
@@ -1187,6 +1366,26 @@ class DataProcessingTests(unittest.TestCase):
         self.assertEqual(result.loc[0, "91-180天库存数"], 10)
         self.assertEqual(result.loc[1, "181-330天占用资金"], 0)
         self.assertEqual(result.loc[2, "91-180天占用资金"], 1000)
+
+    def test_stopped_store_rows_are_excluded_from_operational_reminders(self):
+        source = pd.DataFrame(
+            {
+                "MSKU": ["KEEP-SKU", "STOP-SKU", "UNCONFIGURED-SKU"],
+                "店铺名称": ["1-ZXU 德国", "6-SGE 美国", "3-NEW 英国"],
+            }
+        )
+        store_config = pd.DataFrame(
+            {
+                "店铺名": ["ZXU", "SGE"],
+                "店铺类型": ["中企", "本土"],
+                "停提款时间": ["", "2026-01"],
+                "店铺所属部门": ["运营部", "运营部"],
+            }
+        )
+
+        result = exclude_stopped_store_operational_rows(source, store_config)
+
+        self.assertEqual(result["MSKU"].tolist(), ["KEEP-SKU", "UNCONFIGURED-SKU"])
 
     def test_slow_moving_inventory_calculates_accrual_and_discard_thresholds(self):
         ninety = build_slow_moving_inventory_table(self.aging_source(), "90天以上")

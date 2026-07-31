@@ -11,6 +11,8 @@ from backend.db import initialize_database
 from backend.config_api import router as config_router
 from backend.dashboard_api import router as dashboard_router
 from backend.promotions import router as promotions_router
+from backend.batch_monitor import router as batch_monitor_router
+from backend.app_revisions import router as app_revisions_router
 from backend.reports_api import router as reports_router
 from backend.tasks import router as tasks_router
 
@@ -23,6 +25,8 @@ app.include_router(reports_router)
 app.include_router(config_router)
 app.include_router(dashboard_router)
 app.include_router(promotions_router)
+app.include_router(batch_monitor_router)
+app.include_router(app_revisions_router)
 # Keep embedded runners and test clients usable even when they do not emit a lifespan event.
 initialize_database()
 
@@ -44,6 +48,8 @@ async def cache_headers(request: Request, call_next):
     path = request.url.path
     if path.startswith("/api/reports/source/"):
         upload_limit = 52 * 1024 * 1024
+    elif path in {"/api/batch-monitor/batches", "/api/batch-monitor/shipments"}:
+        upload_limit = 22 * 1024 * 1024
     elif path.startswith("/api/config/") and path.endswith("/upload"):
         upload_limit = 12 * 1024 * 1024
     else:
