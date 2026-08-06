@@ -46,6 +46,17 @@ SALES_HISTORY_2025_MONTH_COLUMNS = [
     for column in (f"{month}月总销量", f"{month}月出单天数", f"{month}月除0日均")
 ]
 SALES_HISTORY_2025_COLUMNS = ["ASIN", *SALES_HISTORY_2025_SITE_COLUMNS, *SALES_HISTORY_2025_MONTH_COLUMNS]
+SALES_HISTORY_GENERIC_MONTH_COLUMNS = [
+    column
+    for index in range(1, 13)
+    for column in (
+        f"历史月份{index}",
+        f"历史{index}月总销量",
+        f"历史{index}月计入天数",
+        f"历史{index}月日均销量",
+    )
+]
+SALES_HISTORY_GENERIC_COLUMNS = ["ASIN", *SALES_HISTORY_2025_SITE_COLUMNS, *SALES_HISTORY_GENERIC_MONTH_COLUMNS]
 OPERATIONAL_SALES_REQUIRED_COLUMNS = [
     "MSKU",
     "店铺名称",
@@ -120,7 +131,7 @@ AVAILABLE_INVENTORY_MONITOR_COLUMNS = ["开发员", "库存总数", "日均订�
 SALES_VOLUME_DETAIL_REQUIRED_COLUMNS = ["msku", "店铺", "开发专员"]
 SALES_AMOUNT_DETAIL_REQUIRED_COLUMNS = ["msku", "店铺", "开发专员"]
 DEPARTMENT_PERFORMANCE_FIXED_COLUMNS = [
-    "在售产品数",
+    "在售SKU数量",
     "销售额贡献占比",
     "近7天日均订单",
     "近7天日均销售额（元）",
@@ -949,6 +960,7 @@ def normalize_sales_metric_detail(df: pd.DataFrame, required_columns: list[str],
     result["msku"] = result["msku"].str.replace(r"^\t+", "", regex=True)
     result["人员"] = result["开发专员"].map(normalize_department_person_name)
     result["店铺前缀"] = result["店铺"].map(extract_department_store_prefix)
+    result["店铺编码"] = result["店铺"].map(extract_department_store_code)
     result["店铺部门"] = result["店铺"].map(department_name_from_store)
     for col in date_columns:
         result[col] = normalize_config_number(result[col]).fillna(0)
@@ -974,8 +986,16 @@ def normalize_department_developer_text(value) -> str:
 
 
 def extract_department_store_prefix(value) -> str:
-    match = re.match(r"^\s*(\d+)-", str(value).strip())
+    text = normalize_department_developer_text(value)
+    match = re.match(r"^\s*(\d+)\s*-", text)
     return match.group(1) if match else ""
+
+
+def extract_department_store_code(value) -> str:
+    """Return the normalized store code for a ``20-`` store, otherwise blank."""
+    text = normalize_department_developer_text(value)
+    match = re.match(r"^\s*20\s*-\s*([A-Za-z0-9]+)", text, flags=re.IGNORECASE)
+    return match.group(1).upper() if match else ""
 
 
 def department_name_from_store(value) -> str:
@@ -1048,7 +1068,7 @@ def with_department_performance_total(frame: pd.DataFrame) -> pd.DataFrame:
     """Prepend a total row for either department or developer performance."""
     if frame.empty:
         return frame
-    label_col = "部门" if "部门" in frame.columns else "开发员"
+    label_col = next((column for column in ("部门", "店铺", "开发员") if column in frame.columns), "开发员")
     total = {label_col: "合计"}
     for column in frame.columns:
         if column != label_col:
@@ -1086,6 +1106,9 @@ def build_department_performance_tables(
     onsale_counts = build_department_onsale_counts(operational_df)
     department_volume = volume[volume["店铺部门"].ne("")].copy()
     department_amount = amount[amount["店铺部门"].ne("")].copy()
+    store_codes = build_department_store_codes(operational_df)
+    store_volume = volume[volume["店铺编码"].isin(store_codes)].copy()
+    store_amount = amount[amount["店铺编码"].isin(store_codes)].copy()
     return {
         "开发员业绩排行": build_department_performance_table_for_group(
             "开发员",
@@ -1113,6 +1136,20 @@ def build_department_performance_tables(
             remaining_days,
             onsale_counts,
         ),
+        "店铺业绩排行": build_department_performance_table_for_group(
+            "店铺",
+            "店铺编码",
+            "store",
+            store_volume,
+            store_amount,
+            window_dates,
+            volume_date_cols,
+            amount_date_cols,
+            month_amount_cols,
+            remaining_days,
+            onsale_counts,
+            labels=store_codes,
+        ),
     }
 
 
@@ -1128,8 +1165,13 @@ def build_department_performance_table_for_group(
     month_amount_cols: list[str],
     remaining_days: int,
     onsale_counts: dict[tuple[str, str | None], int],
+    labels: Iterable[str] | None = None,
 ) -> pd.DataFrame:
-    labels = sorted({label for label in volume[group_col].tolist() + amount[group_col].tolist() if label})
+    if labels is None:
+        labels = {label for label in volume[group_col].tolist() + amount[group_col].tolist() if label}
+    else:
+        labels = {label for label in labels if label}
+    labels = sorted(labels)
     rows = []
     for label in labels:
         rows.append(
@@ -1174,7 +1216,7 @@ def build_department_performance_row(
     month_amount = amount[month_amount_cols].sum().sum() if month_amount_cols and not amount.empty else 0
     row = {
         label_col: label,
-        "在售产品数": onsale_counts.get((count_kind, label), 0),
+        "在售SKU数量": onsale_counts.get((count_kind, label), 0),
         "销售额贡献占比": 0,
         "近7天日均订单": total_volume_7 / 7,
         "近7天日均销售额（元）": total_amount_7 / 7,
@@ -1195,7 +1237,7 @@ def build_department_onsale_counts(operational_df: pd.DataFrame) -> dict[tuple[s
 
     counts: dict[tuple[str, str | None], set[str]] = {}
     base = operational_df[required].copy()
-    base["MSKU"] = base["MSKU"].fillna("").astype(str).str.strip()
+    base["MSKU"] = base["MSKU"].fillna("").astype(str).str.strip().str.upper()
     base["开发员"] = base["开发员"].map(normalize_department_person_name)
     base["店铺部门"] = base["店铺名称"].map(department_name_from_store)
     base["可售"] = normalize_config_number(base["可售"]).fillna(0)
@@ -1205,7 +1247,24 @@ def build_department_onsale_counts(operational_df: pd.DataFrame) -> dict[tuple[s
             counts.setdefault(("person", row["开发员"]), set()).add(row["MSKU"])
         if row["店铺部门"]:
             counts.setdefault(("department", row["店铺部门"]), set()).add(row["MSKU"])
+        for _, store_name in extract_operational_store_codes(row["店铺名称"]):
+            store_code = extract_department_store_code(store_name)
+            if store_code:
+                counts.setdefault(("store", store_code), set()).add(row["MSKU"])
     return {key: len(value) for key, value in counts.items()}
+
+
+def build_department_store_codes(operational_df: pd.DataFrame) -> list[str]:
+    """Return all unique ``20-`` store codes present in the operational source."""
+    if "店铺名称" not in operational_df.columns:
+        raise ValueError("运营原始表缺少部门监控店铺列：店铺名称")
+    codes: set[str] = set()
+    for value in operational_df["店铺名称"].fillna("").astype(str):
+        for _, store_name in extract_operational_store_codes(value):
+            code = extract_department_store_code(store_name)
+            if code:
+                codes.add(code)
+    return sorted(codes)
 
 
 def normalize_replenishment_targets(targets: pd.DataFrame | None) -> pd.DataFrame:
@@ -1478,6 +1537,86 @@ def normalize_sales_history_2025(df: pd.DataFrame) -> pd.DataFrame:
     return data.reset_index(drop=True)
 
 
+def normalize_sales_history_summary(df: pd.DataFrame) -> pd.DataFrame:
+    """Validate the ASIN-level, fixed-width history used by replenishment."""
+    missing = [column for column in SALES_HISTORY_GENERIC_COLUMNS if column not in df.columns]
+    if missing:
+        raise ValueError(f"销量历史汇总缺少列：{', '.join(missing)}")
+    data = df[SALES_HISTORY_GENERIC_COLUMNS].copy()
+    data["ASIN"] = data["ASIN"].fillna("").astype(str).str.strip().str.upper()
+    if data["ASIN"].eq("").any():
+        raise ValueError("销量历史汇总存在空ASIN")
+    if data["ASIN"].duplicated().any():
+        raise ValueError("销量历史汇总的ASIN必须唯一")
+    for column in [f"历史月份{index}" for index in range(1, 13)]:
+        values = data[column].fillna("").astype(str).str.strip()
+        invalid = values.ne("") & ~values.str.fullmatch(r"\d{4}-(0[1-9]|1[0-2])")
+        if invalid.any():
+            raise ValueError(f"销量历史汇总列“{column}”存在非法月份")
+        data[column] = values
+    for column in [column for column in SALES_HISTORY_GENERIC_COLUMNS if column != "ASIN" and not column.startswith("历史月份")]:
+        original = data[column]
+        numeric = pd.to_numeric(original, errors="coerce")
+        invalid = original.notna() & original.astype(str).str.strip().ne("") & numeric.isna()
+        if invalid.any():
+            raise ValueError(f"销量历史汇总列“{column}”存在非数字")
+        data[column] = numeric.fillna(0)
+    for index in range(1, 13):
+        data[f"历史{index}月计入天数"] = data[f"历史{index}月计入天数"].round().astype(int)
+    return data.reset_index(drop=True)
+
+
+def normalize_sales_history_month_source(df: pd.DataFrame, month: str) -> pd.DataFrame:
+    """Validate one complete monthly sales-history CSV without changing the raw upload."""
+
+    match = re.fullmatch(r"(\d{4})-(0[1-9]|1[0-2])", str(month).strip())
+    if not match:
+        raise ValueError(f"销量历史月份必须是合法的 YYYY-MM：{month}")
+    year, month_number = int(match.group(1)), int(match.group(2))
+    data = df.copy()
+    data.columns = [str(column).strip().lstrip("\ufeff") for column in data.columns]
+    if data.empty:
+        raise ValueError(f"{month}销量历史没有数据行")
+    duplicate_columns = data.columns[data.columns.duplicated()].astype(str).tolist()
+    if duplicate_columns:
+        raise ValueError(f"{month}销量历史包含重复列名：{', '.join(duplicate_columns[:10])}")
+    required = ["asin", "msku", "国家", "小计"]
+    day_columns = [f"{month_number:02d}-{day:02d}销量" for day in range(1, calendar.monthrange(year, month_number)[1] + 1)]
+    missing = [column for column in [*required, *day_columns] if column not in data.columns]
+    if missing:
+        raise ValueError(f"{month}销量历史缺少列：{', '.join(missing[:12])}")
+    actual_day_columns = {
+        str(column) for column in data.columns if re.fullmatch(r"\d{2}-\d{2}销量", str(column))
+    }
+    unexpected = sorted(actual_day_columns.difference(day_columns))
+    if unexpected:
+        raise ValueError(f"{month}销量历史包含不属于该月的销量列：{', '.join(unexpected[:10])}")
+
+    result = data.copy()
+    result["asin"] = result["asin"].fillna("").astype(str).str.strip().str.upper()
+    if result["asin"].eq("").any():
+        row_number = int(result.index[result["asin"].eq("")][0]) + 2
+        raise ValueError(f"{month}销量历史第{row_number}行ASIN为空")
+    numeric_columns = ["小计", *day_columns]
+    for column in numeric_columns:
+        original = result[column]
+        values = pd.to_numeric(original, errors="coerce")
+        invalid = original.notna() & original.astype(str).str.strip().ne("") & values.isna()
+        if invalid.any():
+            row_number = int(result.index[invalid][0]) + 2
+            raise ValueError(f"{month}销量历史第{row_number}行“{column}”不是有效数字")
+        if values.fillna(0).lt(0).any():
+            row_number = int(result.index[values.fillna(0).lt(0)][0]) + 2
+            raise ValueError(f"{month}销量历史第{row_number}行“{column}”不能为负数")
+        result[column] = values.fillna(0).astype(float)
+    daily_total = result[day_columns].sum(axis=1)
+    mismatch = ~daily_total.sub(result["小计"]).abs().le(1e-6)
+    if mismatch.any():
+        row_number = int(result.index[mismatch][0]) + 2
+        raise ValueError(f"{month}销量历史第{row_number}行小计与每日销量合计不一致")
+    return result
+
+
 def _history_number(value, *, sheet_name: str, row_number: int, column: str) -> float:
     if value is None or (isinstance(value, str) and not value.strip()):
         return 0.0
@@ -1496,34 +1635,55 @@ def _history_output_number(value: float) -> int | float:
     return int(round(value)) if math.isclose(value, round(value), abs_tol=1e-9) else round(value, 6)
 
 
-def build_sales_history_2025_summary(
+def _month_label(year: int, month: int) -> str:
+    return f"{year:04d}-{month:02d}"
+
+
+def _shift_month(year: int, month: int, offset: int) -> tuple[int, int]:
+    month_index = year * 12 + month - 1 + offset
+    return month_index // 12, month_index % 12 + 1
+
+
+def _rolling_window_labels(today: date | datetime | pd.Timestamp | None = None) -> list[str]:
+    current = pd.Timestamp(today).date() if today is not None else pd.Timestamp.now(tz="Asia/Shanghai").date()
+    anchor_year, anchor_month = _shift_month(current.year, current.month, -1)
+    return [
+        _month_label(*_shift_month(anchor_year, anchor_month, offset))
+        for offset in range(-11, 1)
+    ]
+
+
+def _build_sales_history_workbook_summary(
     source: Path | bytes | bytearray | io.BytesIO,
+    sheet_dates: list[tuple[str, int, int]],
+    *,
+    title: str,
 ) -> tuple[pd.DataFrame, dict[str, int]]:
-    """Parse and aggregate the authoritative 1–12月 workbook in one streaming pass."""
+    """Parse a twelve-sheet workbook and apply the cross-month stockout rule."""
     from openpyxl import load_workbook
 
     workbook_source = io.BytesIO(bytes(source)) if isinstance(source, (bytes, bytearray)) else source
     workbook = load_workbook(workbook_source, read_only=True, data_only=True)
     try:
-        actual_sheets = list(workbook.sheetnames)
-        missing_sheets = [name for name in SALES_HISTORY_2025_SHEETS if name not in actual_sheets]
-        unexpected_sheets = [name for name in actual_sheets if name not in SALES_HISTORY_2025_SHEETS]
+        actual_sheets = set(workbook.sheetnames)
+        expected_sheets = {name for name, _, _ in sheet_dates}
+        missing_sheets = sorted(expected_sheets.difference(actual_sheets))
+        unexpected_sheets = sorted(actual_sheets.difference(expected_sheets))
         if missing_sheets or unexpected_sheets or len(actual_sheets) != 12:
             issues = []
             if missing_sheets:
                 issues.append(f"缺少sheet：{', '.join(missing_sheets)}")
             if unexpected_sheets:
                 issues.append(f"存在额外sheet：{', '.join(unexpected_sheets)}")
-            raise ValueError(f"25年销量明细必须且只能包含1月至12月十二个sheet；{'；'.join(issues)}")
+            raise ValueError(f"{title}必须且只能包含连续12个月的sheet；{'；'.join(issues)}")
 
         all_asins: set[str] = set()
         site_totals: dict[str, dict[str, float]] = {}
-        month_metrics: dict[tuple[str, int], tuple[float, int, float]] = {}
+        daily_by_asin: dict[str, dict[date, float]] = {}
         total_rows = 0
         maximum_columns = 0
 
-        for month in range(1, 13):
-            sheet_name = f"{month}月"
+        for sheet_name, year, month in sheet_dates:
             sheet = workbook[sheet_name]
             header_row = next(sheet.iter_rows(min_row=1, max_row=1, values_only=True), ())
             headers = [str(value).strip() if value is not None else "" for value in header_row]
@@ -1532,7 +1692,7 @@ def build_sales_history_2025_summary(
             if duplicate_headers:
                 raise ValueError(f"{sheet_name}存在重复列名：{', '.join(duplicate_headers[:10])}")
             header_index = {name: index for index, name in enumerate(headers)}
-            expected_days = calendar.monthrange(2025, month)[1]
+            expected_days = calendar.monthrange(year, month)[1]
             day_columns = [f"{month:02d}-{day:02d}销量" for day in range(1, expected_days + 1)]
             required_columns = ["asin", "msku", "国家", "小计", *day_columns]
             missing_columns = [column for column in required_columns if column not in header_index]
@@ -1545,7 +1705,6 @@ def build_sales_history_2025_summary(
             if unexpected_days:
                 raise ValueError(f"{sheet_name}包含不属于该月的销量列：{', '.join(unexpected_days[:10])}")
 
-            daily_by_asin: dict[str, list[float]] = {}
             for row_number, row in enumerate(sheet.iter_rows(min_row=2, values_only=True), start=2):
                 total_rows += 1
                 asin = str(row[header_index["asin"]] or "").strip().upper()
@@ -1582,15 +1741,32 @@ def build_sales_history_2025_summary(
                     asin, {code: 0.0 for code in SALES_HISTORY_2025_COUNTRIES.values()}
                 )
                 asin_sites[country_code] += daily_sum
-                asin_daily = daily_by_asin.setdefault(asin, [0.0] * expected_days)
+                asin_daily = daily_by_asin.setdefault(asin, {})
                 for index, value in enumerate(daily_values):
-                    asin_daily[index] += value
+                    asin_daily[date(year, month, index + 1)] = asin_daily.get(date(year, month, index + 1), 0.0) + value
 
-            for asin, daily_values in daily_by_asin.items():
-                total_sales = sum(daily_values)
-                active_days = sum(value > 0 for value in daily_values)
-                nonzero_average = round(total_sales / active_days, 2) if active_days else 0.0
-                month_metrics[(asin, month)] = (total_sales, active_days, nonzero_average)
+        all_dates = [
+            date(year, month, day)
+            for _, year, month in sheet_dates
+            for day in range(1, calendar.monthrange(year, month)[1] + 1)
+        ]
+        month_labels = [_month_label(year, month) for _, year, month in sheet_dates]
+        month_dates = [
+            [date(year, month, day) for day in range(1, calendar.monthrange(year, month)[1] + 1)]
+            for _, year, month in sheet_dates
+        ]
+
+        def excluded_stockout_dates(values: list[float]) -> set[date]:
+            excluded: set[date] = set()
+            run_start: int | None = None
+            for index, value in enumerate(values + [1.0]):
+                if value == 0 and run_start is None:
+                    run_start = index
+                elif value != 0 and run_start is not None:
+                    if index - run_start >= 10:
+                        excluded.update(all_dates[run_start:index])
+                    run_start = None
+            return excluded
 
         rows: list[dict[str, object]] = []
         for asin in sorted(all_asins):
@@ -1600,13 +1776,18 @@ def build_sales_history_2025_summary(
             )
             for code in SALES_HISTORY_2025_COUNTRIES.values():
                 row[f"{code}总销量"] = _history_output_number(asin_sites[code])
-            for month in range(1, 13):
-                total_sales, active_days, nonzero_average = month_metrics.get((asin, month), (0.0, 0, 0.0))
-                row[f"{month}月总销量"] = _history_output_number(total_sales)
-                row[f"{month}月出单天数"] = active_days
-                row[f"{month}月除0日均"] = nonzero_average
+            daily_values = [daily_by_asin.get(asin, {}).get(day, 0.0) for day in all_dates]
+            excluded = excluded_stockout_dates(daily_values)
+            for index, (label, dates) in enumerate(zip(month_labels, month_dates), start=1):
+                total_sales = sum(daily_by_asin.get(asin, {}).get(day, 0.0) for day in dates)
+                included_days = sum(day not in excluded for day in dates)
+                adjusted_average = round(total_sales / included_days, 2) if total_sales and included_days else 0.0
+                row[f"历史月份{index}"] = label
+                row[f"历史{index}月总销量"] = _history_output_number(total_sales)
+                row[f"历史{index}月计入天数"] = included_days
+                row[f"历史{index}月日均销量"] = adjusted_average
             rows.append(row)
-        summary = normalize_sales_history_2025(pd.DataFrame(rows, columns=SALES_HISTORY_2025_COLUMNS))
+        summary = normalize_sales_history_summary(pd.DataFrame(rows, columns=SALES_HISTORY_GENERIC_COLUMNS))
         return summary, {
             "rows": total_rows,
             "effective_rows": len(summary),
@@ -1614,6 +1795,183 @@ def build_sales_history_2025_summary(
         }
     finally:
         workbook.close()
+
+
+def _generic_to_legacy_history(summary: pd.DataFrame) -> pd.DataFrame:
+    data = normalize_sales_history_summary(summary)
+    rows: list[dict[str, object]] = []
+    for _, source_row in data.iterrows():
+        row: dict[str, object] = {"ASIN": source_row["ASIN"]}
+        for code in SALES_HISTORY_2025_COUNTRIES.values():
+            row[f"{code}总销量"] = source_row[f"{code}总销量"]
+        for index in range(1, 13):
+            row[f"{index}月总销量"] = source_row[f"历史{index}月总销量"]
+            row[f"{index}月出单天数"] = source_row[f"历史{index}月计入天数"]
+            row[f"{index}月除0日均"] = source_row[f"历史{index}月日均销量"]
+        rows.append(row)
+    return normalize_sales_history_2025(pd.DataFrame(rows, columns=SALES_HISTORY_2025_COLUMNS))
+
+
+def _legacy_to_generic_history(summary: pd.DataFrame) -> pd.DataFrame:
+    data = normalize_sales_history_2025(summary)
+    rows: list[dict[str, object]] = []
+    for _, source_row in data.iterrows():
+        row: dict[str, object] = {"ASIN": source_row["ASIN"]}
+        for code in SALES_HISTORY_2025_COUNTRIES.values():
+            row[f"{code}总销量"] = source_row[f"{code}总销量"]
+        for index in range(1, 13):
+            row[f"历史月份{index}"] = f"2025-{index:02d}"
+            row[f"历史{index}月总销量"] = source_row[f"{index}月总销量"]
+            row[f"历史{index}月计入天数"] = source_row[f"{index}月出单天数"]
+            row[f"历史{index}月日均销量"] = source_row[f"{index}月除0日均"]
+        rows.append(row)
+    return normalize_sales_history_summary(pd.DataFrame(rows, columns=SALES_HISTORY_GENERIC_COLUMNS))
+
+
+def _history_with_legacy_aliases(summary: pd.DataFrame) -> pd.DataFrame:
+    """Keep the old monthly columns in the supporting return frame only."""
+    data = normalize_sales_history_summary(summary).copy()
+    legacy = _generic_to_legacy_history(data)
+    for column in SALES_HISTORY_2025_MONTH_COLUMNS:
+        data[column] = legacy[column]
+    return data
+
+
+def build_sales_history_2025_summary(
+    source: Path | bytes | bytearray | io.BytesIO,
+) -> tuple[pd.DataFrame, dict[str, int]]:
+    """Parse the legacy 1–12月 workbook using the corrected stockout rule."""
+    sheet_dates = [(f"{month}月", 2025, month) for month in range(1, 13)]
+    generic, stats = _build_sales_history_workbook_summary(source, sheet_dates, title="25年销量明细")
+    return _generic_to_legacy_history(generic), stats
+
+
+def build_sales_history_rolling_summary(
+    source: Path | bytes | bytearray | io.BytesIO,
+    *,
+    today: date | datetime | pd.Timestamp | None = None,
+    require_latest: bool = False,
+) -> tuple[pd.DataFrame, dict[str, int]]:
+    """Parse a rolling YYYY-MM workbook and return the generic history summary."""
+    from openpyxl import load_workbook
+
+    workbook_source = io.BytesIO(bytes(source)) if isinstance(source, (bytes, bytearray)) else source
+    workbook = load_workbook(workbook_source, read_only=True, data_only=True)
+    try:
+        actual_sheets = list(workbook.sheetnames)
+    finally:
+        workbook.close()
+    parsed: list[tuple[str, int, int]] = []
+    for name in actual_sheets:
+        match = re.fullmatch(r"(\d{4})-(0[1-9]|1[0-2])", str(name).strip())
+        if not match:
+            raise ValueError("往月销量原始表的sheet必须使用YYYY-MM格式")
+        parsed.append((str(name).strip(), int(match.group(1)), int(match.group(2))))
+    parsed.sort(key=lambda item: (item[1], item[2]))
+    if len(parsed) != 12:
+        raise ValueError("往月销量原始表必须且只能包含连续12个月的sheet")
+    labels = [_month_label(year, month) for _, year, month in parsed]
+    expected = [_month_label(*_shift_month(parsed[0][1], parsed[0][2], offset)) for offset in range(12)]
+    if labels != expected:
+        raise ValueError("往月销量原始表的sheet必须是连续的12个月")
+    if require_latest and labels != _rolling_window_labels(today):
+        window = _rolling_window_labels(today)
+        raise ValueError(f"往月销量原始表必须覆盖最近12个完整月：{window[0]}至{window[-1]}")
+    return _build_sales_history_workbook_summary(source, parsed, title="往月销量原始表")
+
+
+def build_sales_history_monthly_summary(
+    sources: Iterable[tuple[str, Path | bytes | bytearray | io.BytesIO]],
+) -> tuple[pd.DataFrame, dict[str, int]]:
+    """Build the generic history summary from the rolling monthly CSV files."""
+
+    ordered_sources = sorted(
+        [(str(month).strip(), source) for month, source in sources],
+        key=lambda item: item[0],
+    )
+    if len(ordered_sources) != 12:
+        raise ValueError("往月销量原始表必须包含连续12个月")
+    labels = [month for month, _ in ordered_sources]
+    parsed = [
+        (int(month[:4]), int(month[5:7]))
+        for month in labels
+        if re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", month)
+    ]
+    if len(parsed) != 12 or any(
+        (parsed[index][0] * 12 + parsed[index][1]) != (parsed[index - 1][0] * 12 + parsed[index - 1][1] + 1)
+        for index in range(1, len(parsed))
+    ):
+        raise ValueError("往月销量原始表必须是连续的12个月")
+
+    all_asins: set[str] = set()
+    site_totals: dict[str, dict[str, float]] = {}
+    daily_by_asin: dict[str, dict[date, float]] = {}
+    total_rows = 0
+    maximum_columns = 0
+    month_dates: list[list[date]] = []
+
+    for month, source in ordered_sources:
+        year, month_number = int(month[:4]), int(month[5:7])
+        frame = read_local_table(source) if isinstance(source, Path) else read_csv_bytes(bytes(source))
+        frame = normalize_sales_history_month_source(frame, month)
+        day_columns = [
+            f"{month_number:02d}-{day:02d}销量"
+            for day in range(1, calendar.monthrange(year, month_number)[1] + 1)
+        ]
+        maximum_columns = max(maximum_columns, len(frame.columns))
+        dates = [date(year, month_number, day) for day in range(1, calendar.monthrange(year, month_number)[1] + 1)]
+        month_dates.append(dates)
+        total_rows += len(frame)
+        for _, source_row in frame.iterrows():
+            asin = str(source_row["asin"]).strip().upper()
+            all_asins.add(asin)
+            daily_values = [float(source_row[column]) for column in day_columns]
+            country_code = SALES_HISTORY_2025_COUNTRIES.get(str(source_row["国家"] or "").strip())
+            if country_code is None:
+                continue
+            asin_sites = site_totals.setdefault(
+                asin,
+                {code: 0.0 for code in SALES_HISTORY_2025_COUNTRIES.values()},
+            )
+            daily_sum = sum(daily_values)
+            asin_sites[country_code] += daily_sum
+            asin_daily = daily_by_asin.setdefault(asin, {})
+            for day, value in zip(dates, daily_values):
+                asin_daily[day] = asin_daily.get(day, 0.0) + value
+
+    all_dates = [day for dates in month_dates for day in dates]
+
+    def excluded_stockout_dates(values: list[float]) -> set[date]:
+        excluded: set[date] = set()
+        run_start: int | None = None
+        for index, value in enumerate(values + [1.0]):
+            if value == 0 and run_start is None:
+                run_start = index
+            elif value != 0 and run_start is not None:
+                if index - run_start >= 10:
+                    excluded.update(all_dates[run_start:index])
+                run_start = None
+        return excluded
+
+    rows: list[dict[str, object]] = []
+    for asin in sorted(all_asins):
+        row: dict[str, object] = {"ASIN": asin}
+        asin_sites = site_totals.get(asin, {code: 0.0 for code in SALES_HISTORY_2025_COUNTRIES.values()})
+        for code in SALES_HISTORY_2025_COUNTRIES.values():
+            row[f"{code}总销量"] = _history_output_number(asin_sites[code])
+        daily_values = [daily_by_asin.get(asin, {}).get(day, 0.0) for day in all_dates]
+        excluded = excluded_stockout_dates(daily_values)
+        for index, (label, dates) in enumerate(zip(labels, month_dates), start=1):
+            total_sales = sum(daily_by_asin.get(asin, {}).get(day, 0.0) for day in dates)
+            included_days = sum(day not in excluded for day in dates)
+            adjusted_average = round(total_sales / included_days, 2) if total_sales and included_days else 0.0
+            row[f"历史月份{index}"] = label
+            row[f"历史{index}月总销量"] = _history_output_number(total_sales)
+            row[f"历史{index}月计入天数"] = included_days
+            row[f"历史{index}月日均销量"] = adjusted_average
+        rows.append(row)
+    summary = normalize_sales_history_summary(pd.DataFrame(rows, columns=SALES_HISTORY_GENERIC_COLUMNS))
+    return summary, {"rows": total_rows, "effective_rows": len(summary), "columns": maximum_columns}
 
 
 def normalize_replenishment_gross_profit_source(df: pd.DataFrame) -> pd.DataFrame:
@@ -1746,6 +2104,7 @@ def build_replenishment_management_tables(
     product_tags: pd.DataFrame | None = None,
     store_config: pd.DataFrame | None = None,
     sales_history_2025: pd.DataFrame | None = None,
+    sales_history_rolling: pd.DataFrame | None = None,
     promotions: pd.DataFrame | None = None,
     only_needed: bool = True,
     today: date | datetime | pd.Timestamp | None = None,
@@ -1764,7 +2123,12 @@ def build_replenishment_management_tables(
     switches = normalize_replenishment_switches(replenishment_switches)
     tags = normalize_replenishment_product_tags(product_tags)
     stores = normalize_store_config(store_config if store_config is not None else pd.DataFrame())
-    history = normalize_sales_history_2025(sales_history_2025) if sales_history_2025 is not None and not sales_history_2025.empty else pd.DataFrame(columns=SALES_HISTORY_2025_COLUMNS)
+    if sales_history_rolling is not None and not sales_history_rolling.empty:
+        history = normalize_sales_history_summary(sales_history_rolling)
+    elif sales_history_2025 is not None and not sales_history_2025.empty:
+        history = _legacy_to_generic_history(sales_history_2025)
+    else:
+        history = pd.DataFrame(columns=SALES_HISTORY_GENERIC_COLUMNS)
 
     if operational.empty:
         return {
@@ -2031,7 +2395,7 @@ def build_replenishment_management_tables(
         sku_detail = sku_detail.merge(tag_summary, on="ASIN", how="left")
 
     if not history.empty:
-        detail = detail.merge(history[SALES_HISTORY_2025_COLUMNS], on="ASIN", how="left")
+        detail = detail.merge(history[SALES_HISTORY_GENERIC_COLUMNS], on="ASIN", how="left")
     for column in replenishment_sku_detail_columns():
         if column not in sku_detail.columns:
             sku_detail[column] = pd.NA
@@ -2048,7 +2412,11 @@ def build_replenishment_management_tables(
         detail = detail[detail["建议补货数量"].fillna(0).gt(0) | detail["数据状态"].eq("数据异常")].copy()
         sku_detail = sku_detail[sku_detail["补货组ID"].isin(set(detail["补货组ID"]))].copy()
     detail = detail.sort_values(["建议补货数量", "ASIN", "补货组ID"], ascending=[False, True, True], kind="stable", na_position="last").reset_index(drop=True)
-    return {"detail": detail, "sku_detail": sku_detail.reset_index(drop=True), "history": history}
+    return {
+        "detail": detail,
+        "sku_detail": sku_detail.reset_index(drop=True),
+        "history": _history_with_legacy_aliases(history),
+    }
 
 
 def build_replenishment_store_distribution(detail: pd.DataFrame) -> pd.DataFrame:
@@ -2064,8 +2432,7 @@ def replenishment_management_columns() -> list[str]:
         "跟卖总可售", "ASIN总库存", "库龄90天以上", "库龄180-365天", "库龄365天以上",
         "目标库存", "测算建议补货数量", "建议补货数量", "是否补货", "关闭原因",
         "数据状态", "数据异常", "最近促销开始日期", "最近促销截止日期", "最近促销折扣",
-        "产品标签", "产品标签颜色", *SALES_HISTORY_2025_SITE_COLUMNS,
-        *SALES_HISTORY_2025_MONTH_COLUMNS,
+        "产品标签", "产品标签颜色", *SALES_HISTORY_GENERIC_COLUMNS[1:],
     ] + replenishment_gross_columns() + ["产品评价数", "产品评分值"]
 
 
@@ -2183,8 +2550,17 @@ def build_low_margin_product_table(
     threshold: float = LOW_MARGIN_PRODUCT_THRESHOLD,
     min_sales: float = LOW_MARGIN_PRODUCT_MIN_SALES,
     developers: Iterable[str] | None = None,
+    allowed_skus: Iterable[str] | None = None,
 ) -> pd.DataFrame:
     gross_profit = normalize_low_margin_gross_profit_source(gross_profit_df)
+    if allowed_skus is not None:
+        normalized_allowed_skus = {
+            str(sku).strip().upper()
+            for sku in allowed_skus
+            if str(sku).strip()
+        }
+        normalized_skus = gross_profit["MSKU"].fillna("").astype(str).str.strip().str.upper()
+        gross_profit = gross_profit[normalized_skus.isin(normalized_allowed_skus)].copy()
     if developers:
         selected_developers = {str(developer).strip() for developer in developers if str(developer).strip()}
         gross_profit = gross_profit[gross_profit["开发员"].isin(selected_developers)].copy()

@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from datetime import date
 from pathlib import Path
 from unittest.mock import patch
 
 import pandas as pd
 from fastapi.testclient import TestClient
 
+from backend import db
 from backend import dashboard_api
 from backend.dashboard_api import explicit_selected_values, latest_detail_date, performance_with_total, selected_values
 from backend.main import app
@@ -25,6 +27,19 @@ class DashboardApiTests(unittest.TestCase):
     def test_explicit_selected_values_keeps_an_omitted_filter_visually_empty(self):
         self.assertEqual(explicit_selected_values(None, ["A", "B"]), [])
         self.assertEqual(explicit_selected_values("B", ["A", "B"]), ["B"])
+
+    def test_section_search_handles_nullable_integer_columns(self):
+        frame = pd.DataFrame(
+            {
+                "ASIN": ["B0D9L92YXY", "B000000000"],
+                "开售天数": pd.Series([pd.NA, 3], dtype="Int64"),
+            }
+        )
+
+        result = dashboard_api._query_frame(frame, search="b0d9l92yxy")
+
+        self.assertEqual(result["ASIN"].tolist(), ["B0D9L92YXY"])
+        self.assertTrue(pd.isna(result.loc[0, "开售天数"]))
 
     def test_overview_defaults_to_all_data_with_empty_visible_filters(self):
         home = pd.DataFrame(
@@ -104,6 +119,93 @@ class DashboardApiTests(unittest.TestCase):
         self.assertEqual(build_table.call_args.args[1], "90天以上")
         self.assertFalse(payload["has_data"])
 
+    def test_product_launch_data_unions_sources_and_preserves_product_rows(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            db, "DB_PATH", Path(directory) / "app.db"
+        ):
+            db.initialize_database()
+            with db.connect() as conn:
+                conn.execute(
+                    """INSERT INTO batch_monitor_batches
+                    (batch_no, artwork_completed_date, source_file_name, source_file_hash, created_at, updated_at)
+                    VALUES ('BATCH-001', NULL, 'batch.xlsx', 'hash', '2026-08-01T00:00:00+08:00', '2026-08-01T00:00:00+08:00')"""
+                )
+                conn.executemany(
+                    """INSERT INTO batch_monitor_skus
+                    (sku, batch_no, de_price, fr_price, es_price, it_price,
+                     developer_snapshot, monitor_basis, created_at)
+                    VALUES (?, 'BATCH-001', ?, ?, ?, ?, '', 'creation_match', '2026-08-01T00:00:00+08:00')""",
+                    [
+                        ("SKU-A", 5.9, 6.99, 7.99, 8.99),
+                        ("SKU-B", 9.9, None, None, None),
+                    ],
+                )
+                conn.executemany(
+                    """INSERT INTO sku_first_shipments
+                    (sku, shipment_no, asin, arrival_date, updated_at)
+                    VALUES (?, ?, ?, ?, '2026-08-03T00:00:00+08:00')""",
+                    [
+                        ("SKU-A", "FBA-A", "B000000001", "2026-08-03"),
+                        ("SKU-C", "FBA-C", "B000000003", "2026-07-30"),
+                    ],
+                )
+                conn.executemany(
+                    """INSERT INTO sku_launch_prices
+                    (sku, de_price, fr_price, es_price, it_price, source_file_hash, updated_at)
+                    VALUES (?, ?, ?, ?, ?, 'legacy-hash', '2026-08-03T00:00:00+08:00')""",
+                    [
+                        ("SKU-B", 8.8, 8.49, 8.59, 8.69),
+                        ("SKU-D", 4.99, 5.99, 6.99, 7.99),
+                    ],
+                )
+
+            launch_rows = dashboard_api._product_launch_rows()
+
+        detail = pd.DataFrame(
+            [
+                {"SKU": " sku-a ", "ASIN": "B000000001", "Rating": "10(4.5)", "德国销量": 1},
+                {"SKU": "SKU-B", "ASIN": "B000000002", "Rating": "", "德国销量": 2},
+                {"SKU": "sku-c", "ASIN": "B000000003", "Rating": "", "德国销量": 3},
+                {"SKU": "SKU-D", "ASIN": "B000000004", "Rating": "", "德国销量": 4},
+            ]
+        )
+        result = dashboard_api.merge_product_launch_data(
+            detail,
+            launch_rows,
+            today=date(2026, 8, 3),
+        )
+
+        self.assertEqual(result["SKU"].tolist(), [" sku-a ", "SKU-B", "sku-c", "SKU-D"])
+        self.assertEqual(len(result), len(detail))
+        self.assertEqual(result.loc[0, "德国开售价格"], 5.9)
+        self.assertEqual(result.loc[0, "开售时间"], "2026-08-03")
+        self.assertEqual(result.loc[0, "开售天数"], 0)
+        self.assertEqual(result.loc[1, "德国开售价格"], 9.9)
+        self.assertEqual(result.loc[1, "法国开售价格"], 8.49)
+        self.assertTrue(pd.isna(result.loc[1, "开售时间"]))
+        self.assertTrue(pd.isna(result.loc[1, "开售天数"]))
+        self.assertTrue(pd.isna(result.loc[2, "德国开售价格"]))
+        self.assertEqual(result.loc[2, "开售时间"], "2026-07-30")
+        self.assertEqual(result.loc[2, "开售天数"], 4)
+        self.assertEqual(result.loc[3, "德国开售价格"], 4.99)
+        self.assertEqual(result.loc[3, "意大利开售价格"], 7.99)
+        self.assertTrue(pd.isna(result.loc[3, "开售时间"]))
+        self.assertTrue(pd.isna(result.loc[3, "开售天数"]))
+
+    def test_product_page_revision_includes_batch_monitor_only_for_products(self):
+        with (
+            patch("backend.dashboard_api.dashboard_revision", return_value="dashboard-v1"),
+            patch("backend.dashboard_api.batch_monitor_revision", return_value="batch-v2"),
+        ):
+            self.assertEqual(
+                dashboard_api._page_revision("products"),
+                "dashboard-v1:batch-v2",
+            )
+            self.assertEqual(
+                dashboard_api._page_revision("sales"),
+                "dashboard-v1",
+            )
+
     def test_latest_detail_date_uses_latest_common_metric_day(self):
         volume = pd.DataFrame(columns=["07-06销量", "07-05销量"])
         amount = pd.DataFrame(columns=["07-06销售额", "07-04销售额"])
@@ -112,14 +214,20 @@ class DashboardApiTests(unittest.TestCase):
 
     def test_performance_total_row_is_inserted_first(self):
         frame = pd.DataFrame([
-            {"开发员": "A", "在售产品数": 2, "销售额贡献占比": 0.6, "7月12日销量": 10},
-            {"开发员": "B", "在售产品数": 3, "销售额贡献占比": 0.4, "7月12日销量": 20},
+            {"开发员": "A", "在售SKU数量": 2, "销售额贡献占比": 0.6, "7月12日销量": 10},
+            {"开发员": "B", "在售SKU数量": 3, "销售额贡献占比": 0.4, "7月12日销量": 20},
         ])
         result = performance_with_total(frame)
         self.assertEqual(result.iloc[0]["开发员"], "合计")
-        self.assertEqual(result.iloc[0]["在售产品数"], 5)
+        self.assertEqual(result.iloc[0]["在售SKU数量"], 5)
         self.assertEqual(result.iloc[0]["销售额贡献占比"], 1)
         self.assertEqual(result.iloc[0]["7月12日销量"], 30)
+
+        store_result = performance_with_total(
+            pd.DataFrame([{"店铺": "AEU", "在售SKU数量": 1, "销售额贡献占比": 1, "7月12日销量": 10}])
+        )
+        self.assertEqual(store_result.iloc[0]["店铺"], "合计")
+        self.assertEqual(store_result.iloc[0]["在售SKU数量"], 1)
 
     def test_current_workspace_dashboard_pages_return_business_sections(self):
         required_sources = ["operational_sales", "gross_profit", "rating", "sales_volume_detail", "sales_amount_detail"]
@@ -132,6 +240,26 @@ class DashboardApiTests(unittest.TestCase):
                 payload = response.json()
                 self.assertTrue(payload["has_data"])
                 self.assertGreater(len(payload["sections"]), 0)
+                if page == "products":
+                    detail = next(section for section in payload["sections"] if section["key"] == "detail")
+                    asin = next(row["ASIN"] for row in detail["rows"] if row.get("ASIN"))
+                    searched = self.client.get(
+                        "/api/dashboard/products/sections/detail",
+                        params={"search": asin, "page": 1, "page_size": 20},
+                    )
+                    self.assertEqual(searched.status_code, 200, searched.text)
+                    self.assertTrue(any(row.get("ASIN") == asin for row in searched.json()["rows"]))
+                if page == "department":
+                    titles = [section["title"] for section in payload["sections"]]
+                    self.assertTrue(titles[0].endswith("人员提成汇总"))
+                    self.assertEqual(titles[1:], ["开发员业绩排行", "部门业绩", "店铺业绩排行"])
+                    for section in payload["sections"][1:]:
+                        column_keys = [column["key"] for column in section["columns"]]
+                        self.assertIn("在售SKU数量", column_keys)
+                        self.assertNotIn("在售产品数", column_keys)
+                    exported = self.client.get("/api/dashboard/department/sections/performance-0/export.csv")
+                    self.assertEqual(exported.status_code, 200, exported.text)
+                    self.assertIn("在售SKU数量", exported.content.decode("utf-8-sig").splitlines()[0])
 
     def test_replenishment_min_qty_filters_disabled_rows_before_metrics(self):
         detail = pd.DataFrame([

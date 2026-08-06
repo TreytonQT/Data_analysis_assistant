@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import io
 import json
+import math
 import re
 import uuid
 from datetime import date, datetime
@@ -27,6 +28,13 @@ BATCH_UPLOAD_DIR = ROOT / "data" / "batch_monitor" / "uploads"
 MAX_BATCH_FILE_BYTES = 20 * 1024 * 1024
 REQUIRED_BATCH_COLUMNS = ("SKU", "DE_PRICE", "FR_PRICE", "ES_PRICE", "IT_PRICE")
 REQUIRED_SHIPMENT_COLUMNS = ("货件单号", "MSKU", "ASIN")
+REQUIRED_LAUNCH_PRICE_COLUMNS = ("SKU", "DE开售价格", "FR开售价格", "ES开售价格", "IT开售价格")
+LAUNCH_PRICE_DB_COLUMNS = {
+    "DE开售价格": "de_price",
+    "FR开售价格": "fr_price",
+    "ES开售价格": "es_price",
+    "IT开售价格": "it_price",
+}
 IDENTIFIER_PATTERN = re.compile(r"^[A-Z0-9][A-Z0-9._-]{2,63}$")
 BATCH_PATTERN = re.compile(r"^[A-Z0-9][A-Z0-9_-]{2,31}$")
 ASIN_PATTERN = re.compile(r"^[A-Z0-9]{10}$")
@@ -500,6 +508,123 @@ def _parse_date_cell(value: Any, *, context: str) -> str | None:
         return parsed.date().isoformat()
     except Exception as exc:
         raise ValueError(f"{context}日期无效：{value}") from exc
+
+
+def _parse_launch_price_cell(value: Any, *, context: str) -> float | None:
+    if value is None or pd.isna(value) or (isinstance(value, str) and not value.strip()):
+        return None
+    parsed = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+    if pd.isna(parsed) or not math.isfinite(float(parsed)):
+        raise ValueError(f"{context}价格无效：{value}")
+    number = float(parsed)
+    if number == 0:
+        return None
+    if number < 0:
+        raise ValueError(f"{context}价格不能为负数：{value}")
+    return number
+
+
+def _parse_launch_price_workbook(data: bytes) -> list[dict[str, Any]]:
+    try:
+        frame = pd.read_excel(io.BytesIO(data), dtype=object)
+    except Exception as exc:
+        raise ValueError(f"开售价文件无法读取：{exc}") from exc
+
+    frame.columns = [str(column).strip() for column in frame.columns]
+    missing = [column for column in REQUIRED_LAUNCH_PRICE_COLUMNS if column not in frame.columns]
+    if missing:
+        raise ValueError("开售价文件缺少列：" + "、".join(missing))
+
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for index, source in frame.iterrows():
+        values = [source.get(column) for column in REQUIRED_LAUNCH_PRICE_COLUMNS]
+        if all(value is None or pd.isna(value) or (isinstance(value, str) and not value.strip()) for value in values):
+            continue
+        sku = _normalize_text(source.get("SKU"))
+        if not sku:
+            raise ValueError(f"开售价文件第{int(index) + 2}行 SKU 不能为空")
+        if sku in seen:
+            raise ValueError(f"开售价文件 SKU 重复：{sku}")
+        seen.add(sku)
+        prices = {
+            db_column: _parse_launch_price_cell(
+                source.get(source_column),
+                context=f"开售价文件第{int(index) + 2}行 {source_column}",
+            )
+            for source_column, db_column in LAUNCH_PRICE_DB_COLUMNS.items()
+        }
+        rows.append({"sku": sku, **prices})
+    return rows
+
+
+def import_launch_price_file(path: Path) -> dict[str, Any]:
+    """Persist a price-only historical workbook without creating fake batches."""
+
+    initialize_database()
+    data = path.read_bytes()
+    digest = _file_hash(data)
+    with connect() as conn:
+        existing = conn.execute(
+            """SELECT stats_json FROM batch_monitor_imports
+            WHERE file_hash = ? AND import_type = 'launch_prices'""",
+            (digest,),
+        ).fetchone()
+        if existing:
+            return json.loads(str(existing["stats_json"]))
+
+    rows = _parse_launch_price_workbook(data)
+    timestamp = _now_iso()
+    inserted = 0
+    updated = 0
+    with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        for row in rows:
+            current = conn.execute(
+                "SELECT 1 FROM sku_launch_prices WHERE sku = ?",
+                (row["sku"],),
+            ).fetchone()
+            conn.execute(
+                """INSERT INTO sku_launch_prices
+                (sku, de_price, fr_price, es_price, it_price, source_file_hash, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(sku) DO UPDATE SET
+                    de_price = excluded.de_price,
+                    fr_price = excluded.fr_price,
+                    es_price = excluded.es_price,
+                    it_price = excluded.it_price,
+                    source_file_hash = excluded.source_file_hash,
+                    updated_at = excluded.updated_at""",
+                (
+                    row["sku"],
+                    row["de_price"],
+                    row["fr_price"],
+                    row["es_price"],
+                    row["it_price"],
+                    digest,
+                    timestamp,
+                ),
+            )
+            if current:
+                updated += 1
+            else:
+                inserted += 1
+        stats = {
+            "rows": len(rows),
+            "inserted": inserted,
+            "updated": updated,
+        }
+        _write_import_record(
+            conn,
+            digest=digest,
+            import_type="launch_prices",
+            file_name=path.name,
+            stats=stats,
+        )
+        if rows:
+            _touch_revision(conn)
+    _archive_file("launch-prices", path.name, data, digest)
+    return stats
 
 
 def _parse_history_workbook(data: bytes) -> tuple[
@@ -1126,11 +1251,13 @@ def update_sku_arrival(sku: str, payload: ArrivalUpdate):
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="批次监控历史数据迁移")
-    parser.add_argument("command", choices=["import-history"])
+    parser.add_argument("command", choices=["import-history", "import-launch-prices"])
     parser.add_argument("path", type=Path)
     args = parser.parse_args()
     if args.command == "import-history":
         print(json.dumps(import_history_file(args.path), ensure_ascii=False, indent=2))
+    elif args.command == "import-launch-prices":
+        print(json.dumps(import_launch_price_file(args.path), ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":

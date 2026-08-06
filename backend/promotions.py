@@ -977,12 +977,6 @@ def update_promotion(promotion_id: str, payload: PromotionUpdate):
                 WHERE id = ?""",
                 (payload.promotion_name, start_text, end_text, timestamp, promotion_id),
             )
-            conn.execute(
-                """UPDATE sku_last_promotions
-                SET promotion_name = ?, start_date = ?, end_date = ?, updated_at = ?
-                WHERE sku = ? AND promotion_id = ?""",
-                (payload.promotion_name, start_text, end_text, timestamp, old["sku"], promotion_id),
-            )
     except HTTPException:
         raise
     except sqlite3.IntegrityError as exc:
