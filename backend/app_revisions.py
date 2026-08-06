@@ -9,7 +9,7 @@ from backend.promotions import promotion_revision
 from backend.batch_monitor import batch_monitor_revision
 from dashboard.data_processing import CONFIG_DIR
 from dashboard.parquet_cache import revision_digest
-from dashboard.report_store import DATA_DIR
+from dashboard.report_store import DATA_DIR, get_sales_history_paths, sales_history_index_path
 
 
 router = APIRouter(prefix="/api", tags=["app-revisions"])
@@ -28,6 +28,10 @@ def reports_revision() -> str:
     paths = [DATA_DIR / "upload_records.csv"]
     paths.extend((DATA_DIR / "reports").glob("*.csv"))
     paths.extend((DATA_DIR / "sources").glob("*_source.csv"))
+    history_index = sales_history_index_path()
+    if history_index.exists():
+        paths.append(history_index)
+    paths.extend(get_sales_history_paths())
     return revision_digest("app-reports", _existing_paths(paths))
 
 

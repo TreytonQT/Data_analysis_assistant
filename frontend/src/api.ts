@@ -47,15 +47,19 @@ export interface ReplenishmentCountryMetric { units: number | null; margin: numb
 export interface ReplenishmentRating { review_count: number | null; score: number | null }
 export interface ReplenishmentPromotion { start_date: unknown; end_date: unknown; discount_percent: number | null }
 export interface ReplenishmentHistoryMonth {
-  month: number;
+  month: string;
   total_sales: number;
-  active_days: number;
-  nonzero_daily_average: number;
+  included_days: number;
+  adjusted_daily_average: number;
 }
 export interface ReplenishmentHistory {
   available: boolean;
   site_sales: Record<'DE' | 'FR' | 'ES' | 'IT', number>;
   peak_months: ReplenishmentHistoryMonth[];
+  source?: 'rolling' | 'legacy_2025' | null;
+  title?: string;
+  period_start?: string | null;
+  period_end?: string | null;
   months?: ReplenishmentHistoryMonth[];
 }
 export interface ReplenishmentGroupRow {
@@ -104,7 +108,7 @@ export interface ReplenishmentGroupDetails {
   group: Record<string, unknown>;
   sku_columns: DashboardColumn[];
   sku_rows: Record<string, unknown>[];
-  sales_history_2025: ReplenishmentHistory | null;
+  sales_history: ReplenishmentHistory | null;
 }
 export interface ReplenishmentSwitchResult {
   ASIN: string;
@@ -465,6 +469,7 @@ export const api = {
     ),
   reports: () => request<ReportsResponse>('/api/reports'),
   deleteReport: (month: string) => request<{ ok: boolean }>(`/api/reports/performance/${encodeURIComponent(month)}`, { method: 'DELETE' }),
+  deleteSalesHistory: () => request<{ ok: boolean; deleted: boolean }>('/api/reports/sales-history', { method: 'DELETE' }),
   deleteSource: (key: string) => request<{ ok: boolean }>(`/api/reports/source/${key}`, { method: 'DELETE' }),
   previewSource: (key: string) => request<{ title: string; columns: string[]; rows: Record<string, unknown>[]; total: number }>(`/api/reports/source/${key}/preview`),
   configs: () => request<{ configs: ConfigData[] }>('/api/configs'),

@@ -397,6 +397,66 @@ class BatchMonitorTests(unittest.TestCase):
         self.assertIn("developer_snapshot", batch_columns)
         self.assertIn("monitor_basis", batch_columns)
 
+    def test_launch_price_import_is_validated_and_idempotent(self):
+        path = Path(self.temp.name) / "开售价.xlsx"
+        path.write_bytes(
+            workbook_bytes(
+                [
+                    {
+                        "SKU": " sku-a01 ",
+                        "DE开售价格": 5.99,
+                        "FR开售价格": 6.99,
+                        "ES开售价格": 0,
+                        "IT开售价格": 8.99,
+                    },
+                    {
+                        "SKU": "SKU-A02",
+                        "DE开售价格": 7.99,
+                        "FR开售价格": None,
+                        "ES开售价格": 9.99,
+                        "IT开售价格": 10.99,
+                    },
+                ]
+            )
+        )
+
+        stats = batch_monitor.import_launch_price_file(path)
+        self.assertEqual(stats, {"rows": 2, "inserted": 2, "updated": 0})
+        with db.connect() as conn:
+            rows = conn.execute(
+                "SELECT sku, de_price, fr_price, es_price, it_price FROM sku_launch_prices ORDER BY sku"
+            ).fetchall()
+        self.assertEqual([tuple(row) for row in rows], [
+            ("SKU-A01", 5.99, 6.99, None, 8.99),
+            ("SKU-A02", 7.99, None, 9.99, 10.99),
+        ])
+        self.assertEqual(batch_monitor.import_launch_price_file(path), stats)
+
+    def test_launch_price_import_rejects_duplicate_skus(self):
+        path = Path(self.temp.name) / "duplicate.xlsx"
+        path.write_bytes(
+            workbook_bytes(
+                [
+                    {"SKU": "SKU-A01", "DE开售价格": 5, "FR开售价格": 6, "ES开售价格": 7, "IT开售价格": 8},
+                    {"SKU": " sku-a01 ", "DE开售价格": 5, "FR开售价格": 6, "ES开售价格": 7, "IT开售价格": 8},
+                ]
+            )
+        )
+        with self.assertRaisesRegex(ValueError, "SKU 重复"):
+            batch_monitor.import_launch_price_file(path)
+
+    def test_launch_price_import_rejects_negative_prices(self):
+        path = Path(self.temp.name) / "invalid-price.xlsx"
+        path.write_bytes(
+            workbook_bytes(
+                [
+                    {"SKU": "SKU-A01", "DE开售价格": -1, "FR开售价格": 6, "ES开售价格": 7, "IT开售价格": 8},
+                ]
+            )
+        )
+        with self.assertRaisesRegex(ValueError, "价格不能为负数"):
+            batch_monitor.import_launch_price_file(path)
+
     def test_provided_files_match_migration_and_first_shipment_baselines(self):
         history_path = Path("C:/Users/Admin/Desktop/批次监控.xlsx")
         batch_path = Path("D:/20-FAK-CQT-2607-1-1785400037239.xlsx")

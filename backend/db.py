@@ -118,6 +118,17 @@ def initialize_database() -> None:
                 value TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS sku_launch_prices (
+                sku TEXT PRIMARY KEY,
+                de_price REAL CHECK (de_price IS NULL OR de_price > 0),
+                fr_price REAL CHECK (fr_price IS NULL OR fr_price > 0),
+                es_price REAL CHECK (es_price IS NULL OR es_price > 0),
+                it_price REAL CHECK (it_price IS NULL OR it_price > 0),
+                source_file_hash TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_sku_launch_prices_source
+                ON sku_launch_prices(source_file_hash);
             """
         )
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}

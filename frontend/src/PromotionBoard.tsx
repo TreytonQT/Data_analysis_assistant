@@ -203,7 +203,7 @@ function LiftSummaryChart({ rows, deletingName, onDelete }: { rows: PromotionAct
         <Typography.Text type="secondary">{formatNumber(row.sku_count, 0)} 个 SKU</Typography.Text>
         <Popconfirm
           title={`删除“${row.promotion_name}”促销活动？`}
-          description="会删除该活动下的全部 SKU 记录，删除后无法恢复。"
+          description="会删除该活动下的全部 SKU 活动记录，但会保留 SKU 最后一次促销记录。删除后的活动不能恢复。"
           onConfirm={() => onDelete(row)}
           okText="删除"
           cancelText="取消"
@@ -235,7 +235,7 @@ function PromotionOverviewPanel({ refreshToken, onRefresh }: { refreshToken: num
     setDeletingName(row.promotion_name);
     try {
       const result = await api.deletePromotionActivity(row.promotion_name);
-      message.success(`已删除“${row.promotion_name}”活动及 ${result.deleted} 条 SKU 记录`);
+      message.success(`已删除“${row.promotion_name}”活动及 ${result.deleted} 条活动记录，SKU 最后一次促销记录已保留`);
       onRefresh();
     } catch (reason) {
       message.error(reason instanceof Error ? reason.message : '删除促销活动失败');
@@ -270,6 +270,7 @@ function CandidateTable({ discount, refreshToken, onMark }: { discount: Promotio
   const [selected, setSelected] = useState<React.Key[]>([]);
   const [loading, setLoading] = useState(true);
   const [copyingAll, setCopyingAll] = useState(false);
+  const [creatingFiltered, setCreatingFiltered] = useState(false);
   const [error, setError] = useState('');
   const [retry, setRetry] = useState(0);
 
@@ -301,6 +302,33 @@ function CandidateTable({ discount, refreshToken, onMark }: { discount: Promotio
     finally { setCopyingAll(false); }
   };
 
+  const createFiltered = async () => {
+    if (creatingFiltered) return;
+    setCreatingFiltered(true);
+    try {
+      const text = await api.promotionCandidateSkus(discount, {
+        search: query.search || undefined,
+        developers: query.developers.length ? query.developers.join(',') : undefined,
+        sort_by: query.sortBy,
+        sort_order: query.sortOrder,
+      });
+      const skus = [...new Set(text.split(/\r?\n/).map(value => value.trim()).filter(Boolean))];
+      if (!skus.length) {
+        message.info('当前筛选没有可创建的 SKU');
+        return;
+      }
+      if (skus.length > 5000) {
+        message.error('筛选结果超过 5000 个 SKU，请缩小筛选范围');
+        return;
+      }
+      onMark(skus);
+    } catch (reason) {
+      message.error(reason instanceof Error ? reason.message : '筛选结果加载失败，请重试');
+    } finally {
+      setCreatingFiltered(false);
+    }
+  };
+
   const columns: NonNullable<TableProps<PromotionCandidate>['columns']> = [
     { ...sortableColumn<PromotionCandidate>('sku', 'SKU', query, 170), fixed: 'left', render: value => <Typography.Text copyable={{ text: String(value) }}>{String(value)}</Typography.Text> },
     { ...sortableColumn<PromotionCandidate>('asin', 'ASIN', query, 130), render: value => value || '-' },
@@ -330,6 +358,13 @@ function CandidateTable({ discount, refreshToken, onMark }: { discount: Promotio
         <Button icon={<CopyOutlined />} disabled={!selected.length} onClick={() => void copy(selected.map(String))}>复制所选（{selected.length}）</Button>
         <Button icon={<CopyOutlined />} loading={copyingAll} onClick={() => void copyAll()}>复制筛选下全部</Button>
         <Button icon={<DownloadOutlined />} onClick={() => download(exportUrl(`/api/promotions/candidates/${discount}/export.csv`, query))}>导出 CSV</Button>
+        <Button
+          type="primary"
+          icon={<TagsOutlined />}
+          loading={creatingFiltered}
+          disabled={!data || data.total === 0 || loading || copyingAll || creatingFiltered}
+          onClick={() => void createFiltered()}
+        >筛选结果创建促销（{data?.total || 0}）</Button>
         <Button type="primary" icon={<TagsOutlined />} disabled={!selected.length} onClick={() => onMark(selected.map(String))}>批量标记促销</Button>
       </Space>
     </div>
@@ -587,7 +622,7 @@ function RecordsTable({ refreshToken, onRefresh, onEdit, onManualAdd }: { refres
   };
   const remove = async (record: PromotionRecord) => {
     setActionId(record.id);
-    try { await api.deletePromotion(record.id); message.success('促销记录已删除'); onRefresh(); }
+    try { await api.deletePromotion(record.id); message.success('促销记录已删除，SKU 最后一次促销记录已保留'); onRefresh(); }
     catch (reason) { message.error(reason instanceof Error ? reason.message : '删除失败'); }
     finally { setActionId(null); }
   };
@@ -609,7 +644,7 @@ function RecordsTable({ refreshToken, onRefresh, onEdit, onManualAdd }: { refres
     { key: 'action', title: '操作', fixed: 'right', width: 230, render: (_, row) => <Space size={2}>
       <Button size="small" type="link" icon={<EditOutlined />} disabled={actionId !== null} onClick={() => onEdit(row)}>编辑</Button>
       {row.status === 'active' && <Popconfirm title="将结束日期设置为今天？" description="今天仍会计入正在促销，明天自动结束。" onConfirm={() => void endToday(row)} okText="确认" cancelText="取消"><Button size="small" type="link" icon={<StopOutlined />} loading={actionId === row.id}>今日结束</Button></Popconfirm>}
-      <Popconfirm title="删除这条促销记录？" description="仅用于删除误建记录，删除后无法恢复。" onConfirm={() => void remove(row)} okText="删除" cancelText="取消" okButtonProps={{ danger: true }}><Button size="small" type="link" danger disabled={actionId !== null}>删除</Button></Popconfirm>
+      <Popconfirm title="删除这条促销记录？" description="仅删除当前活动记录，SKU 最后一次促销记录仍会保留。删除后无法恢复。" onConfirm={() => void remove(row)} okText="删除" cancelText="取消" okButtonProps={{ danger: true }}><Button size="small" type="link" danger disabled={actionId !== null}>删除</Button></Popconfirm>
     </Space> },
   ];
 

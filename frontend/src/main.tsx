@@ -22,7 +22,7 @@ type RevisionDomain = keyof AppRevisions;
 
 const navKeys = new Set<string>(nav.map(item => item.key));
 const pageRevisionDomains: Record<PageKey, RevisionDomain[]> = {
-  overview: ['dashboard'], sales: ['dashboard'], products: ['dashboard'], department: ['dashboard'], replenishment: ['dashboard'],
+  overview: ['dashboard'], sales: ['dashboard'], products: ['dashboard', 'batch_monitor'], department: ['dashboard'], replenishment: ['dashboard'],
   'slow-moving': ['dashboard', 'promotions'], 'batch-monitor': ['batch_monitor'], uploads: ['reports'], config: ['configs'],
 };
 const routeChangeEvent = 'sales-dashboard-route-change';
@@ -138,12 +138,15 @@ function App() {
   const renderPage = (key: PageKey) => {
     const active = page === key;
     const dashboardRefreshVersion = domainRefreshVersions.dashboard;
+    const productRefreshVersion = dashboardRefreshVersion + domainRefreshVersions.batch_monitor;
     const content = key === 'uploads'
       ? <UploadCenter active={active} refreshVersion={domainRefreshVersions.reports} />
       : key === 'config'
         ? <ConfigCenter active={active} refreshVersion={domainRefreshVersions.configs} />
         : key === 'slow-moving'
           ? <SlowMovingPage active={active} routeVersion={pageRouteVersions[key]} dashboardRefreshVersion={dashboardRefreshVersion} promotionsRefreshVersion={domainRefreshVersions.promotions} />
+          : key === 'products'
+            ? <DashboardPage page={key} active={active} routeVersion={pageRouteVersions[key]} refreshVersion={productRefreshVersion} />
           : key === 'replenishment'
             ? <ReplenishmentPage active={active} routeVersion={pageRouteVersions[key]} refreshVersion={dashboardRefreshVersion} />
             : key === 'batch-monitor'

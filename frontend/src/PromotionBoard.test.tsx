@@ -96,6 +96,7 @@ describe('PromotionBoard component', () => {
       total: discount === 10 ? 1 : 0,
       developers: ['开发员甲'],
     }));
+    vi.spyOn(api, 'promotionCandidateSkus').mockResolvedValue('SKU-CANDIDATE\nSKU-CANDIDATE-2\n');
     vi.spyOn(api, 'promotionRecords').mockResolvedValue({
       columns: [], rows: [activeRecord], page: 1, page_size: 50, total: 1, developers: ['开发员乙'],
     });
@@ -125,6 +126,32 @@ describe('PromotionBoard component', () => {
     await user.click(markButton!);
     expect(await screen.findByRole('dialog', { name: '标记正在促销' })).toBeInTheDocument();
     expect(screen.getByPlaceholderText('例如：8月会员日促销')).toBeInTheDocument();
+  });
+
+  it('loads all currently filtered candidate SKUs before opening the bulk promotion dialog', async () => {
+    const user = userEvent.setup();
+    render(<PromotionBoard />);
+
+    await user.click(screen.getByRole('tab', { name: /促销候选 -10%/ }));
+    expect(await screen.findByText('SKU-CANDIDATE')).toBeInTheDocument();
+    const search = screen.getByPlaceholderText('搜索 SKU、ASIN、开发员');
+    await user.type(search, 'SKU');
+    await user.keyboard('{Enter}');
+    await user.click(screen.getByRole('button', { name: /筛选结果创建促销/ }));
+
+    expect(api.promotionCandidateSkus).toHaveBeenCalledWith(10, expect.objectContaining({ search: 'SKU' }));
+    expect(await screen.findByRole('dialog', { name: '标记正在促销' })).toBeInTheDocument();
+    expect(screen.getByText('将标记 2 个 SKU')).toBeInTheDocument();
+  });
+
+  it('disables filtered-result creation when the candidate result is empty', async () => {
+    const user = userEvent.setup();
+    vi.mocked(api.promotionCandidates).mockResolvedValue({ columns: [], rows: [], page: 1, page_size: 50, total: 0, developers: [] });
+    render(<PromotionBoard />);
+
+    await user.click(screen.getByRole('tab', { name: /促销候选 -10%/ }));
+    const button = await screen.findByRole('button', { name: /筛选结果创建促销/ });
+    expect(button).toBeDisabled();
   });
 
   it('opens the manual promotion form with all required inputs', async () => {

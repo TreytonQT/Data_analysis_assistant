@@ -44,6 +44,7 @@ def health():
 async def cache_headers(request: Request, call_next):
     upload_limits = {
         "/api/reports/performance": 105 * 1024 * 1024,
+        "/api/reports/sales-history": 105 * 1024 * 1024,
     }
     path = request.url.path
     if path.startswith("/api/reports/source/"):

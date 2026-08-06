@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+from datetime import date, datetime
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable, Iterator
@@ -11,9 +12,12 @@ import pandas as pd
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from backend.db import DB_PATH, connect
+from backend.batch_monitor import batch_monitor_revision
+from backend.db import DB_PATH, LOCAL_TIMEZONE, connect
 
 from dashboard.data_processing import (
+    SALES_HISTORY_GENERIC_COLUMNS,
+    SALES_HISTORY_GENERIC_MONTH_COLUMNS,
     SALES_HISTORY_2025_MONTH_COLUMNS,
     SALES_HISTORY_2025_SITE_COLUMNS,
     build_alerts,
@@ -22,7 +26,7 @@ from dashboard.data_processing import (
     build_person_commission_summary,
     build_product_management_table,
     build_replenishment_management_tables,
-    build_sales_history_2025_summary,
+    build_sales_history_monthly_summary,
     build_sales_dashboard_tables,
     build_slow_moving_inventory_table,
     compute_metric_table,
@@ -55,7 +59,15 @@ from dashboard.parquet_cache import (
     load_or_build_parquet,
     revision_digest,
 )
-from dashboard.report_store import DATA_DIR, get_latest_source_path, load_reports_from_records, load_upload_records
+from dashboard.report_store import (
+    DATA_DIR,
+    get_latest_source_path,
+    get_sales_history_paths,
+    load_reports_from_records,
+    load_sales_history_records,
+    load_upload_records,
+    sales_history_index_path,
+)
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -63,6 +75,17 @@ CONFIG_DIR = ROOT / "configs"
 SUMMARY_PAGE_SIZE = 50
 MAX_PAGE_SIZE = 200
 router = APIRouter(prefix="/api/dashboard", tags=["dashboard"])
+PRODUCT_LAUNCH_PRICE_COLUMNS = {
+    "de_price": "德国开售价格",
+    "fr_price": "法国开售价格",
+    "es_price": "西班牙开售价格",
+    "it_price": "意大利开售价格",
+}
+PRODUCT_LAUNCH_COLUMNS = [
+    "开售时间",
+    "开售天数",
+    *PRODUCT_LAUNCH_PRICE_COLUMNS.values(),
+]
 
 
 def records(frame: pd.DataFrame) -> list[dict[str, Any]]:
@@ -195,12 +218,24 @@ def source_path(key: str, title: str) -> Path:
 
 
 def load_source_frame(key: str, title: str) -> pd.DataFrame:
+    if key == "sales_history_rolling":
+        paths = get_sales_history_paths()
+        if not paths:
+            raise HTTPException(404, f"请先到上传中心上传{title}")
+        records_frame = load_sales_history_records()
+        month_by_path = {
+            str(row["保存文件名"]): str(row["月份"])
+            for _, row in records_frame.iterrows()
+        }
+        return load_or_build_parquet(
+            "source-sales_history_rolling-raw",
+            [sales_history_index_path(), *paths],
+            lambda: build_sales_history_monthly_summary(
+                [(month_by_path[path.name], path) for path in paths]
+            )[0],
+        )
     path = source_path(key, title)
-    loader = (
-        (lambda: build_sales_history_2025_summary(path)[0])
-        if key == "sales_history_2025"
-        else (lambda: read_local_table(path))
-    )
+    loader = lambda: read_local_table(path)
     return load_or_build_parquet(f"source-{key}-raw", [path], loader)
 
 
@@ -211,7 +246,7 @@ def warm_source_cache(source_key: str) -> None:
         "rating": "Rating",
         "sales_volume_detail": "销量明细",
         "sales_amount_detail": "销售额明细",
-        "sales_history_2025": "25年销量明细",
+        "sales_history_rolling": "往月销量原始表",
     }
     title = titles.get(source_key)
     if title:
@@ -441,6 +476,121 @@ def _build_slow_moving(developers: str | None, threshold: str) -> dict[str, Any]
     }
 
 
+def _product_launch_rows() -> pd.DataFrame:
+    """Read batch prices with historical price-only values as a fallback."""
+
+    columns = ["SKU", *PRODUCT_LAUNCH_PRICE_COLUMNS.values(), "开售时间"]
+    with connect() as conn:
+        rows = conn.execute(
+            """WITH product_skus AS (
+                SELECT sku FROM batch_monitor_skus
+                UNION
+                SELECT sku FROM sku_first_shipments
+                UNION
+                SELECT sku FROM sku_launch_prices
+            )
+            SELECT
+                keys.sku AS SKU,
+                COALESCE(prices.de_price, legacy.de_price) AS de_price,
+                COALESCE(prices.fr_price, legacy.fr_price) AS fr_price,
+                COALESCE(prices.es_price, legacy.es_price) AS es_price,
+                COALESCE(prices.it_price, legacy.it_price) AS it_price,
+                shipments.arrival_date AS 开售时间
+            FROM product_skus keys
+            LEFT JOIN batch_monitor_skus prices ON prices.sku = keys.sku
+            LEFT JOIN sku_launch_prices legacy ON legacy.sku = keys.sku
+            LEFT JOIN sku_first_shipments shipments ON shipments.sku = keys.sku
+            ORDER BY keys.sku"""
+        ).fetchall()
+    if not rows:
+        return pd.DataFrame(columns=columns)
+    frame = pd.DataFrame([dict(row) for row in rows])
+    return frame.rename(columns=PRODUCT_LAUNCH_PRICE_COLUMNS)[columns]
+
+
+def _normalized_sku_set(frame: pd.DataFrame, column: str) -> set[str]:
+    if column not in frame.columns:
+        return set()
+    return {
+        value
+        for value in frame[column].fillna("").astype(str).str.strip().str.upper()
+        if value
+    }
+
+
+def merge_product_launch_data(
+    detail: pd.DataFrame,
+    launch_rows: pd.DataFrame,
+    *,
+    today: date | datetime | pd.Timestamp | None = None,
+) -> pd.DataFrame:
+    """Attach batch-monitor launch data without changing product row cardinality."""
+
+    result = detail.copy()
+    result["_launch_row_order"] = range(len(result))
+    result["_launch_sku"] = (
+        result["SKU"].fillna("").astype(str).str.strip().str.upper()
+        if "SKU" in result.columns
+        else ""
+    )
+
+    launch = launch_rows.copy()
+    for column in ["SKU", *PRODUCT_LAUNCH_COLUMNS]:
+        if column not in launch.columns:
+            launch[column] = pd.NA
+    launch["_launch_sku"] = launch["SKU"].fillna("").astype(str).str.strip().str.upper()
+    launch = launch[launch["_launch_sku"].ne("")].drop_duplicates("_launch_sku", keep="first")
+
+    arrival = pd.to_datetime(launch["开售时间"], errors="coerce")
+    calculation_day = (
+        pd.Timestamp(today).normalize()
+        if today is not None
+        else pd.Timestamp(datetime.now(LOCAL_TIMEZONE).date())
+    )
+    launch["开售时间"] = arrival.dt.strftime("%Y-%m-%d").where(arrival.notna(), pd.NA)
+    launch["开售天数"] = (calculation_day - arrival.dt.normalize()).dt.days.astype("Int64")
+    for column in PRODUCT_LAUNCH_PRICE_COLUMNS.values():
+        launch[column] = pd.to_numeric(launch[column], errors="coerce")
+
+    result = result.merge(
+        launch[["_launch_sku", *PRODUCT_LAUNCH_COLUMNS]],
+        on="_launch_sku",
+        how="left",
+        sort=False,
+        validate="many_to_one",
+    )
+    result = result.sort_values("_launch_row_order", kind="stable")
+    result = result.drop(columns=["_launch_row_order", "_launch_sku"])
+
+    preferred = ["SKU", "ASIN", "Rating", "开售时间", "开售天数"]
+    ordered = [column for column in preferred if column in result.columns]
+    used = set(ordered)
+    price_by_sales = {
+        f"{country}销量": f"{country}开售价格"
+        for country in ("德国", "法国", "西班牙", "意大利")
+    }
+    for column in result.columns:
+        price_column = price_by_sales.get(str(column))
+        if price_column and price_column in result.columns and price_column not in used:
+            ordered.append(price_column)
+            used.add(price_column)
+        if column not in used:
+            ordered.append(column)
+            used.add(column)
+    return result[ordered].reset_index(drop=True)
+
+
+def _batch_monitor_updated_timestamp() -> float:
+    try:
+        with connect() as conn:
+            row = conn.execute(
+                "SELECT updated_at FROM batch_monitor_meta WHERE key = 'revision'"
+            ).fetchone()
+        return pd.Timestamp(row["updated_at"]).timestamp() if row else 0.0
+    except Exception:
+        return 0.0
+
+
 def _build_products(developers: str | None) -> dict[str, Any]:
     operational = load_source_frame("operational_sales", "运营原始表")
     gross = load_source_frame("gross_profit", "毛利原始表")
@@ -449,8 +599,16 @@ def _build_products(developers: str | None) -> dict[str, Any]:
     chosen = selected_values(developers, options)
     if options:
         operational = operational[operational["开发员"].fillna("").astype(str).str.strip().isin(chosen)].copy()
-    detail = product_management_display_table(build_product_management_table(operational, gross, rating))
-    low = build_low_margin_product_table(gross, developers=chosen or None)
+    operational_skus = _normalized_sku_set(operational, "MSKU")
+    detail = merge_product_launch_data(
+        product_management_display_table(build_product_management_table(operational, gross, rating)),
+        _product_launch_rows(),
+    )
+    low = build_low_margin_product_table(
+        gross,
+        developers=chosen or None,
+        allowed_skus=operational_skus,
+    )
     metrics = [] if detail.empty else [
         metric("ASIN数", detail["ASIN"].nunique(), "integer"),
         metric("SKU数", len(detail), "integer"),
@@ -462,7 +620,22 @@ def _build_products(developers: str | None) -> dict[str, Any]:
         **_base_payload("产品管理", {"developers": options}, {"developers": chosen}),
         "has_data": not detail.empty,
         "metrics": metrics,
-        "sections": [section("low-margin", "低毛利率 SKU", low), section("detail", "产品管理明细", detail)],
+        "sections": [
+            section("low-margin", "低毛利率 SKU", low),
+            section(
+                "detail",
+                "产品管理明细",
+                detail,
+                formats={
+                    "开售天数": "整数",
+                    **{
+                        column: "数值"
+                        for column in PRODUCT_LAUNCH_PRICE_COLUMNS.values()
+                    },
+                },
+            ),
+        ],
+        "_updated_at": _batch_monitor_updated_timestamp(),
     }
 
 
@@ -535,7 +708,7 @@ def _last_promotion_rows() -> pd.DataFrame:
 
 def _replenishment_base_paths() -> list[Path]:
     paths: list[Path] = []
-    for key in ("operational_sales", "gross_profit", "rating", "sales_history_2025"):
+    for key in ("operational_sales", "gross_profit", "rating"):
         path = get_latest_source_path(key)
         if path:
             paths.append(path)
@@ -543,6 +716,10 @@ def _replenishment_base_paths() -> list[Path]:
         path = CONFIG_DIR / f"{name}.csv"
         if path.exists():
             paths.append(path)
+    history_index = sales_history_index_path()
+    if history_index.exists():
+        paths.append(history_index)
+    paths.extend(get_sales_history_paths())
     if DB_PATH.exists():
         paths.append(DB_PATH)
     return sorted(set(paths), key=str)
@@ -554,18 +731,21 @@ def _cached_replenishment_base_tables(revision: str) -> dict[str, pd.DataFrame]:
     operational = load_source_frame("operational_sales", "运营原始表")
     gross = load_source_frame("gross_profit", "毛利原始表") if get_latest_source_path("gross_profit") else pd.DataFrame()
     rating = load_source_frame("rating", "Rating") if get_latest_source_path("rating") else pd.DataFrame()
-    history = load_source_frame("sales_history_2025", "25年销量明细") if get_latest_source_path("sales_history_2025") else pd.DataFrame()
-    return build_replenishment_management_tables(
+    history_paths = get_sales_history_paths()
+    history = load_source_frame("sales_history_rolling", "往月销量原始表") if history_paths else pd.DataFrame()
+    tables = build_replenishment_management_tables(
         operational,
         gross,
         rating,
         coverage_rules=_read_optional_replenishment_config("replenishment_coverage_rules", normalize_replenishment_coverage_rules),
         product_tags=_read_optional_replenishment_config("replenishment_product_tags", normalize_replenishment_product_tags),
         store_config=_read_optional_replenishment_config("store_config", normalize_store_config),
-        sales_history_2025=history,
+        sales_history_rolling=history if history_paths else None,
         promotions=_last_promotion_rows(),
         only_needed=False,
     )
+    tables["history_source"] = "rolling" if history_paths else None
+    return tables
 
 
 def _apply_replenishment_switches(
@@ -621,41 +801,72 @@ def _replenishment_number(value: Any) -> int | float | None:
     return int(number) if number.is_integer() else number
 
 
-def _replenishment_history(row: dict[str, Any], *, include_months: bool = False) -> dict[str, Any]:
-    raw_values = [row.get(column) for column in (*SALES_HISTORY_2025_SITE_COLUMNS, *SALES_HISTORY_2025_MONTH_COLUMNS)]
+def _history_metadata(source: str | None) -> dict[str, str | None]:
+    if source == "rolling":
+        return {"source": "rolling", "title": "近12个月销量画像"}
+    if source == "legacy_2025":
+        return {"source": "legacy_2025", "title": "25年销量画像"}
+    return {"source": None, "title": "销量画像"}
+
+
+def _replenishment_history(
+    row: dict[str, Any],
+    *,
+    include_months: bool = False,
+    source: str | None = None,
+) -> dict[str, Any]:
+    raw_values = [row.get(column) for column in SALES_HISTORY_GENERIC_MONTH_COLUMNS]
     available = any(value is not None and not pd.isna(value) for value in raw_values)
     site_sales = {
         code: (_replenishment_number(row.get(f"{code}总销量")) or 0)
         for code in ("DE", "FR", "ES", "IT")
     }
-    months = [
-        {
-            "month": month,
-            "total_sales": _replenishment_number(row.get(f"{month}月总销量")) or 0,
-            "active_days": int(_replenishment_number(row.get(f"{month}月出单天数")) or 0),
-            "nonzero_daily_average": _replenishment_number(row.get(f"{month}月除0日均")) or 0,
-        }
-        for month in range(1, 13)
-    ]
+    if available:
+        months = [
+            {
+                "month": str(row.get(f"历史月份{index}") or ""),
+                "total_sales": _replenishment_number(row.get(f"历史{index}月总销量")) or 0,
+                "included_days": int(_replenishment_number(row.get(f"历史{index}月计入天数")) or 0),
+                "adjusted_daily_average": _replenishment_number(row.get(f"历史{index}月日均销量")) or 0,
+            }
+            for index in range(1, 13)
+            if str(row.get(f"历史月份{index}") or "").strip()
+        ]
+    else:
+        legacy_values = [row.get(column) for column in (*SALES_HISTORY_2025_SITE_COLUMNS, *SALES_HISTORY_2025_MONTH_COLUMNS)]
+        available = any(value is not None and not pd.isna(value) for value in legacy_values)
+        months = [
+            {
+                "month": index,
+                "total_sales": _replenishment_number(row.get(f"{index}月总销量")) or 0,
+                "included_days": int(_replenishment_number(row.get(f"{index}月出单天数")) or 0),
+                "adjusted_daily_average": _replenishment_number(row.get(f"{index}月除0日均")) or 0,
+            }
+            for index in range(1, 13)
+        ]
     peak_months = sorted(
         (item for item in months if float(item["total_sales"]) > 0),
         key=lambda item: (
             -float(item["total_sales"]),
-            -float(item["nonzero_daily_average"]),
-            int(item["month"]),
+            -float(item["adjusted_daily_average"]),
+            str(item["month"]),
         ),
     )[:6]
+    metadata = _history_metadata(source)
     result: dict[str, Any] = {
         "available": available,
         "site_sales": site_sales,
         "peak_months": peak_months,
+        **metadata,
+        "period_start": months[0]["month"] if months else None,
+        "period_end": months[-1]["month"] if months else None,
     }
     if include_months:
         result["months"] = months
     return result
 
 
-def _replenishment_group_rows(frame: pd.DataFrame) -> list[dict[str, Any]]:
+def _replenishment_group_rows(frame: pd.DataFrame, history_source: str | None = None) -> list[dict[str, Any]]:
     country_columns = {
         "DE": "德国",
         "FR": "法国",
@@ -723,7 +934,7 @@ def _replenishment_group_rows(frame: pd.DataFrame) -> list[dict[str, Any]]:
                     "coverage_days": row.get("库存覆盖天数"),
                 },
                 "promotion": promotion,
-                "history": _replenishment_history(row),
+                "history": _replenishment_history(row, source=history_source),
                 "recommendation": {
                     "target_inventory": row.get("目标库存"),
                     "measured_quantity": row.get("测算建议补货数量"),
@@ -778,7 +989,14 @@ def _build_replenishment(developers: str | None, min_qty: int = 30) -> dict[str,
         "has_data": not detail.empty,
         "message": "当前筛选条件下没有补货组" if detail.empty else None,
         "metrics": metrics,
-        "sections": [section("detail", "ASIN补货汇总", detail, row_serializer=_replenishment_group_rows)],
+        "sections": [
+            section(
+                "detail",
+                "ASIN补货汇总",
+                detail,
+                row_serializer=lambda frame: _replenishment_group_rows(frame, tables.get("history_source")),
+            )
+        ],
     }
 
 
@@ -789,19 +1007,30 @@ def _revision_paths() -> list[Path]:
         paths.append(index_path)
     upload_records = load_upload_records()
     paths.extend(_report_paths(upload_records))
-    for key in ("operational_sales", "gross_profit", "rating", "sales_volume_detail", "sales_amount_detail", "sales_history_2025"):
+    for key in ("operational_sales", "gross_profit", "rating", "sales_volume_detail", "sales_amount_detail"):
         path = get_latest_source_path(key)
         if path:
             paths.append(path)
         source_index = DATA_DIR / "sources" / f"{key}_source.csv"
         if source_index.exists():
             paths.append(source_index)
+    history_index = sales_history_index_path()
+    if history_index.exists():
+        paths.append(history_index)
+    paths.extend(get_sales_history_paths())
     return sorted(set(paths), key=str)
 
 
 def dashboard_revision() -> str:
     paths = _revision_paths()
     return revision_digest("dashboard-derived", paths) if paths else "empty"
+
+
+def _page_revision(page_name: str) -> str:
+    base_revision = dashboard_revision()
+    if page_name == "products":
+        return f"{base_revision}:{batch_monitor_revision()}"
+    return base_revision
 
 
 @lru_cache(maxsize=48)
@@ -863,7 +1092,7 @@ def _bundle(
         threshold,
         month,
         min_qty,
-        dashboard_revision(),
+        _page_revision(page_name),
     )
 
 
@@ -928,7 +1157,8 @@ def _query_frame(
         needle = search.strip()
         mask = pd.Series(False, index=result.index)
         for column in result.columns:
-            mask |= result[column].fillna("").astype(str).str.contains(needle, case=False, regex=False)
+            searchable = result[column].astype("string").fillna("")
+            mask |= searchable.str.contains(needle, case=False, regex=False)
         result = result[mask]
     if sort_by:
         if sort_order not in {"asc", "desc"}:
@@ -1011,7 +1241,11 @@ def _serialized_section(
 
 
 def _serialize_bundle(bundle: dict[str, Any]) -> dict[str, Any]:
-    result = {key: value for key, value in bundle.items() if key != "sections"}
+    result = {
+        key: value
+        for key, value in bundle.items()
+        if key not in {"sections", "_updated_at"}
+    }
     result["sections"] = [_serialized_section(item) for item in bundle.get("sections", [])]
     replenishment_section = next(
         (item for item in result["sections"] if item.get("key") == "detail" and "group_rows" in item),
@@ -1019,7 +1253,10 @@ def _serialize_bundle(bundle: dict[str, Any]) -> dict[str, Any]:
     )
     if replenishment_section:
         result["group_rows"] = replenishment_section["group_rows"]
-    result["updated_at"] = max((path.stat().st_mtime for path in _revision_paths()), default=0)
+    result["updated_at"] = max(
+        max((path.stat().st_mtime for path in _revision_paths()), default=0),
+        float(bundle.get("_updated_at") or 0),
+    )
     return result
 
 
@@ -1117,10 +1354,14 @@ def replenishment_group_details(group_id: str):
             "group": records(match.head(1))[0],
             "sku_columns": column_definitions(sku_detail),
             "sku_rows": records(sku_detail),
-            "sales_history_2025": (
-                _replenishment_history(history_row[0], include_months=True)
+            "sales_history": (
+                _replenishment_history(
+                    history_row[0],
+                    include_months=True,
+                    source=tables.get("history_source"),
+                )
                 if history_row
-                else None
+                else {**_history_metadata(tables.get("history_source")), "available": False, "site_sales": {}, "peak_months": [], "months": [], "period_start": None, "period_end": None}
             ),
         }
     except HTTPException:
@@ -1141,15 +1382,16 @@ def export_replenishment(
         detail = _filter_replenishment_detail(tables["detail"], developers, min_qty, options)
         sku_detail = tables["sku_detail"].copy()
         sku_detail = sku_detail[sku_detail["补货组ID"].isin(set(detail["补货组ID"]))].copy()
-        export_detail = detail.drop(columns=SALES_HISTORY_2025_MONTH_COLUMNS, errors="ignore").copy()
-        peak_sets = [_replenishment_history(row)["peak_months"] for row in records(detail)]
+        export_detail = detail.drop(columns=SALES_HISTORY_GENERIC_MONTH_COLUMNS, errors="ignore").copy()
+        history_source = tables.get("history_source")
+        peak_sets = [_replenishment_history(row, source=history_source)["peak_months"] for row in records(detail)]
         for index in range(6):
             export_detail[f"峰值{index + 1}月份"] = [
-                f"{peaks[index]['month']}月" if index < len(peaks) else None
+                peaks[index]["month"] if index < len(peaks) else None
                 for peaks in peak_sets
             ]
-            export_detail[f"峰值{index + 1}除0日均"] = [
-                peaks[index]["nonzero_daily_average"] if index < len(peaks) else None
+            export_detail[f"峰值{index + 1}日均销量"] = [
+                peaks[index]["adjusted_daily_average"] if index < len(peaks) else None
                 for peaks in peak_sets
             ]
             export_detail[f"峰值{index + 1}月销量"] = [

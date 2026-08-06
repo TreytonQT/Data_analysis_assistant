@@ -19,6 +19,8 @@ DATA_DIR = ROOT / "data"
 REPORTS_DIR = DATA_DIR / "reports"
 SOURCES_DIR = DATA_DIR / "sources"
 INDEX_PATH = DATA_DIR / "upload_records.csv"
+SALES_HISTORY_DIR = DATA_DIR / "sales_history"
+SALES_HISTORY_INDEX_PATH = DATA_DIR / "sales_history_records.csv"
 INDEX_COLUMNS = ["月份", "原始文件名", "保存文件名", "上传时间", "文件大小"]
 OPERATIONAL_SALES_BASENAME = "operational_sales"
 OPERATIONAL_SALES_INDEX_PATH = SOURCES_DIR / "operational_sales_source.csv"
@@ -29,7 +31,7 @@ LATEST_SOURCE_DISPLAY_NAMES = {
     "rating": "Rating",
     "sales_volume_detail": "销量明细",
     "sales_amount_detail": "销售额明细",
-    "sales_history_2025": "25年销量明细",
+    "sales_history_rolling": "往月销量原始表",
 }
 ALLOWED_SOURCE_SUFFIXES = (".xlsx", ".xls", ".csv")
 STRICT_MONTH_PATTERN = re.compile(r"(?P<year>[1-9]\d{3})-(?P<month>0[1-9]|1[0-2])")
@@ -40,6 +42,14 @@ REPORT_MONTH_RANGE_PATTERN = re.compile(
 
 @dataclass(frozen=True)
 class PersistResult:
+    month: str
+    original_name: str
+    saved_name: str
+    replaced: bool
+
+
+@dataclass(frozen=True)
+class PersistSalesHistoryResult:
     month: str
     original_name: str
     saved_name: str
@@ -105,6 +115,16 @@ def _report_path(reports_dir: Path, month: str, saved_name: object | None = None
     return _contained_path(reports_dir, expected_name if saved_name is None else saved_name, {expected_name})
 
 
+def sales_history_index_path(data_dir: Path = DATA_DIR) -> Path:
+    return data_dir / "sales_history_records.csv"
+
+
+def _sales_history_path(history_dir: Path, month: str, saved_name: object | None = None) -> Path:
+    valid_month = validate_report_month(month)
+    expected_name = f"{valid_month}.csv"
+    return _contained_path(history_dir, expected_name if saved_name is None else saved_name, {expected_name})
+
+
 def _source_path(sources_dir: Path, source_key: str, saved_name: object) -> Path:
     key = validate_source_key(source_key)
     allowed_names = {f"{key}{suffix}" for suffix in ALLOWED_SOURCE_SUFFIXES}
@@ -154,6 +174,13 @@ def ensure_storage(data_dir: Path = DATA_DIR) -> tuple[Path, Path]:
     return reports_dir, index_path
 
 
+def ensure_sales_history_storage(data_dir: Path = DATA_DIR) -> tuple[Path, Path]:
+    history_dir = data_dir / "sales_history"
+    index_path = sales_history_index_path(data_dir)
+    history_dir.mkdir(parents=True, exist_ok=True)
+    return history_dir, index_path
+
+
 def ensure_sources_storage(data_dir: Path = DATA_DIR) -> tuple[Path, Path]:
     sources_dir = data_dir / "sources"
     index_path = sources_dir / "operational_sales_source.csv"
@@ -194,6 +221,191 @@ def save_upload_records(records: pd.DataFrame, data_dir: Path = DATA_DIR) -> Non
         month = validate_report_month(record["月份"])
         _report_path(data_dir / "reports", month, record["保存文件名"])
     _atomic_write_frame(index_path, clean)
+
+
+def load_sales_history_records(data_dir: Path = DATA_DIR) -> pd.DataFrame:
+    history_dir, index_path = ensure_sales_history_storage(data_dir)
+    if not index_path.exists():
+        return pd.DataFrame(columns=INDEX_COLUMNS)
+    records = pd.read_csv(index_path, encoding="utf-8-sig", dtype=str).fillna("")
+    for col in INDEX_COLUMNS:
+        if col not in records.columns:
+            records[col] = ""
+    records = records[INDEX_COLUMNS].copy()
+    for _, record in records.iterrows():
+        _sales_history_path(history_dir, record["月份"], record["保存文件名"])
+    if records["月份"].duplicated().any():
+        raise ValueError("往月销量原始表索引包含重复月份")
+    return records.sort_values("月份").reset_index(drop=True)
+
+
+def save_sales_history_records(records: pd.DataFrame, data_dir: Path = DATA_DIR) -> None:
+    history_dir, index_path = ensure_sales_history_storage(data_dir)
+    clean = records.copy()
+    for col in INDEX_COLUMNS:
+        if col not in clean.columns:
+            clean[col] = ""
+    clean = clean[INDEX_COLUMNS].copy()
+    if clean["月份"].duplicated().any():
+        raise ValueError("往月销量原始表索引包含重复月份")
+    clean = clean.sort_values("月份").reset_index(drop=True)
+    for _, record in clean.iterrows():
+        _sales_history_path(history_dir, record["月份"], record["保存文件名"])
+    _atomic_write_frame(index_path, clean)
+
+
+def get_sales_history_paths(data_dir: Path = DATA_DIR) -> list[Path]:
+    history_dir, _ = ensure_sales_history_storage(data_dir)
+    records = load_sales_history_records(data_dir)
+    paths: list[Path] = []
+    for _, record in records.iterrows():
+        path = _sales_history_path(history_dir, record["月份"], record["保存文件名"])
+        if path.exists():
+            paths.append(path)
+    return paths
+
+
+def _month_distance(start: str, end: str) -> int:
+    start_year, start_month = (int(part) for part in start.split("-"))
+    end_year, end_month = (int(part) for part in end.split("-"))
+    return (end_year - start_year) * 12 + end_month - start_month
+
+
+def _require_contiguous_months(months: Iterable[str], *, title: str = "往月销量原始表") -> list[str]:
+    ordered = sorted({validate_report_month(month) for month in months})
+    if not ordered:
+        return []
+    if any(_month_distance(previous, current) != 1 for previous, current in zip(ordered, ordered[1:])):
+        raise ValueError(f"{title}必须保留连续月份")
+    return ordered
+
+
+def _sales_history_month_from_filename(name: str, *, today: date | None = None) -> str:
+    match = REPORT_MONTH_RANGE_PATTERN.search(str(name))
+    if not match:
+        raise ValueError(f"往月销量原始表文件名必须包含完整日期范围：{name}")
+    try:
+        start = datetime.strptime(match.group("start"), "%Y-%m-%d").date()
+        end = datetime.strptime(match.group("end"), "%Y-%m-%d").date()
+    except ValueError as exc:
+        raise ValueError(f"往月销量原始表日期范围不合法：{name}") from exc
+    if (start.year, start.month) != (end.year, end.month) or start > end:
+        raise ValueError(f"往月销量原始表必须覆盖同一个完整自然月：{name}")
+    last_day = calendar.monthrange(start.year, start.month)[1]
+    if start.day != 1 or end.day != last_day:
+        raise ValueError(f"往月销量原始表必须覆盖完整自然月：{name}")
+    current = today or pd.Timestamp.now(tz="Asia/Shanghai").date()
+    if (start.year, start.month) >= (current.year, current.month):
+        raise ValueError(f"往月销量原始表不能上传当前月或未来月份：{start:%Y-%m}")
+    return f"{start.year:04d}-{start.month:02d}"
+
+
+def persist_uploaded_sales_history(
+    uploaded_files: Iterable,
+    data_dir: Path = DATA_DIR,
+    *,
+    today: date | None = None,
+) -> tuple[list[PersistSalesHistoryResult], list[str]]:
+    """Validate and atomically persist the rolling twelve-month CSV window."""
+
+    from dashboard.data_processing import normalize_sales_history_month_source, read_csv_bytes
+
+    history_dir, index_path = ensure_sales_history_storage(data_dir)
+    existing = load_sales_history_records(data_dir)
+    uploads = list(uploaded_files)
+    if not uploads:
+        raise ValueError("没有上传往月销量原始表")
+
+    prepared: list[tuple[object, bytes, str, str]] = []
+    batch_months: set[str] = set()
+    for uploaded_file in uploads:
+        suffix = Path(str(uploaded_file.name)).suffix.lower()
+        if suffix != ".csv":
+            raise ValueError(f"往月销量原始表只支持 CSV：{uploaded_file.name}")
+        data = uploaded_file.getvalue()
+        if not isinstance(data, bytes) or not data:
+            raise ValueError(f"往月销量原始表文件为空：{uploaded_file.name}")
+        month = _sales_history_month_from_filename(uploaded_file.name, today=today)
+        if month in batch_months:
+            raise ValueError(f"同一批次包含重复月份：{month}")
+        frame = read_csv_bytes(data)
+        normalize_sales_history_month_source(frame, month)
+        batch_months.add(month)
+        prepared.append((uploaded_file, data, month, f"{month}.csv"))
+
+    existing_months = set(existing["月份"].astype(str))
+    candidate_months = existing_months | batch_months
+    if not existing_months:
+        if len(batch_months) != 12:
+            raise ValueError("首次上传必须一次提供连续12个完整自然月")
+    else:
+        for month in batch_months:
+            if month not in existing_months and month < min(existing_months):
+                raise ValueError(f"月份 {month} 已超出当前滚动窗口")
+    ordered = _require_contiguous_months(candidate_months)
+    if len(ordered) < 12:
+        raise ValueError("往月销量原始表必须保留连续12个月")
+    retained = ordered[-12:]
+    _require_contiguous_months(retained)
+    retained_set = set(retained)
+    evicted = sorted(candidate_months - retained_set)
+
+    next_records = existing[~existing["月份"].isin(set(evicted) | batch_months)].copy()
+    rows = []
+    now_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    results: list[PersistSalesHistoryResult] = []
+    for uploaded_file, data, month, saved_name in prepared:
+        if month not in retained_set:
+            raise ValueError(f"月份 {month} 不在最新12个月窗口内")
+        replaced = month in existing_months
+        rows.append(
+            {
+                "月份": month,
+                "原始文件名": uploaded_file.name,
+                "保存文件名": saved_name,
+                "上传时间": now_text,
+                "文件大小": str(len(data)),
+            }
+        )
+        results.append(PersistSalesHistoryResult(month, uploaded_file.name, saved_name, replaced))
+    next_records = pd.concat([next_records, pd.DataFrame(rows, columns=INDEX_COLUMNS)], ignore_index=True)
+    next_records = next_records[next_records["月份"].isin(retained_set)].sort_values("月份").reset_index(drop=True)
+
+    upload_paths = [_sales_history_path(history_dir, month, saved_name) for _, _, month, saved_name in prepared]
+    evicted_paths = [
+        _sales_history_path(history_dir, month, str(existing.loc[existing["月份"].eq(month), "保存文件名"].iloc[0]))
+        for month in evicted
+        if not existing.loc[existing["月份"].eq(month)].empty
+    ]
+    snapshot = _snapshot([*upload_paths, *evicted_paths, index_path])
+    try:
+        for (_, data, _, _), path in zip(prepared, upload_paths):
+            _atomic_write_bytes(path, data)
+        for path in evicted_paths:
+            if path.exists():
+                path.unlink()
+        save_sales_history_records(next_records, data_dir)
+    except Exception:
+        _restore_snapshot(snapshot)
+        raise
+    return results, evicted
+
+
+def delete_sales_history(data_dir: Path = DATA_DIR) -> bool:
+    history_dir, index_path = ensure_sales_history_storage(data_dir)
+    records = load_sales_history_records(data_dir)
+    paths = [_sales_history_path(history_dir, row["月份"], row["保存文件名"]) for _, row in records.iterrows()]
+    snapshot = _snapshot([*paths, index_path])
+    try:
+        for path in paths:
+            if path.exists():
+                path.unlink()
+        if index_path.exists():
+            index_path.unlink()
+    except Exception:
+        _restore_snapshot(snapshot)
+        raise
+    return bool(paths)
 
 
 def load_operational_sales_source_record(data_dir: Path = DATA_DIR) -> pd.DataFrame:

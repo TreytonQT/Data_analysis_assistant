@@ -1,7 +1,7 @@
 import { cleanup, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import ReplenishmentPage, { ReplenishmentDecisionBoard } from './ReplenishmentPage';
+import ReplenishmentPage, { ReplenishmentDecisionBoard, maxWeightClass } from './ReplenishmentPage';
 import type { DashboardPayload, DashboardSection, ReplenishmentGroupRow } from './api';
 
 const apiMocks = vi.hoisted(() => ({
@@ -59,8 +59,8 @@ const row: ReplenishmentGroupRow = {
     available: true,
     site_sales: { DE: 120, FR: 80, ES: 60, IT: 40 },
     peak_months: [
-      { month: 7, total_sales: 90, active_days: 15, nonzero_daily_average: 6 },
-      { month: 8, total_sales: 68, active_days: 21, nonzero_daily_average: 3.24 },
+      { month: '2026-06', total_sales: 90, included_days: 15, adjusted_daily_average: 6 },
+      { month: '2026-07', total_sales: 68, included_days: 21, adjusted_daily_average: 3.24 },
     ],
   },
   recommendation: {
@@ -137,7 +137,15 @@ describe('ReplenishmentDecisionBoard', () => {
     expect(container.querySelector('.margin-warning')).toHaveTextContent('15.0%');
     expect(container.querySelector('.margin-negative')).toHaveTextContent('-10.0%');
     expect(container.querySelector('.rating-healthy')).toHaveTextContent('120（4.5）');
+    expect(container.querySelector('.weight-warning')).toHaveTextContent('120g');
     expect(screen.queryByRole('columnheader', { name: '促销与运营' })).not.toBeInTheDocument();
+  });
+
+  it('highlights maximum weight from 100g inclusively', () => {
+    expect(maxWeightClass(99.99)).toBe('');
+    expect(maxWeightClass(100)).toBe('weight-warning');
+    expect(maxWeightClass(100.01)).toBe('weight-warning');
+    expect(maxWeightClass(null)).toBe('');
   });
 
   it('supports expanding a group with a keyboard-accessible button', async () => {

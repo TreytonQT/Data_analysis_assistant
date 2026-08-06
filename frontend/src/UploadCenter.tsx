@@ -8,7 +8,6 @@ const sourceDefinitions = [
   { key: 'operational_sales', title: '运营原始表', accept: '.xls,.xlsx', description: '个人销量、库存、库龄、产品和补货分析的核心数据源' },
   { key: 'gross_profit', title: '毛利原始表', accept: '.csv,.xls,.xlsx', description: '产品毛利率、广告费和异常原因分析' },
   { key: 'rating', title: 'Rating', accept: '.xls,.xlsx', description: 'ASIN 各站点评分和评价数量' },
-  { key: 'sales_history_2025', title: '25年销量明细', accept: '.xlsx', description: '仅接收1月至12月十二-sheet原始表，按ASIN汇总四站销量、出单天数和除0日均，不参与建议补货计算' },
   { key: 'sales_volume_detail', title: '销量明细', accept: '.csv', description: '部门监控的销量明细数据' },
   { key: 'sales_amount_detail', title: '销售额明细', accept: '.csv', description: '部门监控的销售额明细数据' },
 ];
@@ -120,6 +119,13 @@ export default function UploadCenter({ active = true, refreshVersion = 0 }: { ac
     catch (deleteError) { setError(deleteError instanceof Error ? deleteError.message : '删除失败'); }
     finally { end(operationKey); }
   };
+  const deleteSalesHistory = async () => {
+    const operationKey = 'delete-sales-history';
+    begin(operationKey); setError('');
+    try { await api.deleteSalesHistory(); message.success('已清空往月销量原始表'); await refresh(false, false); }
+    catch (deleteError) { setError(deleteError instanceof Error ? deleteError.message : '删除失败'); }
+    finally { end(operationKey); }
+  };
 
   const reportColumns: TableProps<SourceRecord>['columns'] = [
     { title: '月份', dataIndex: '月份' }, { title: '原始文件名', dataIndex: '原始文件名', ellipsis: true },
@@ -128,6 +134,15 @@ export default function UploadCenter({ active = true, refreshVersion = 0 }: { ac
       const month = String(row['月份']); const deleting = isPending(`delete-report-${month}`);
       return <Space><Button disabled={deleting} size="small" icon={<DownloadOutlined />} href={`/api/reports/performance/${encodeURIComponent(month)}/download`}>下载</Button><Popconfirm title="确定删除该月份报表吗？" onConfirm={() => deleteReport(month)} okButtonProps={{ loading: deleting }}><Button loading={deleting} size="small" danger icon={<DeleteOutlined />}>删除</Button></Popconfirm></Space>;
     } },
+  ];
+
+  const historyRecords = [...(data.sources.sales_history_rolling?.records || [])].sort((left, right) => String(right['月份'] || '').localeCompare(String(left['月份'] || '')));
+  const historyColumns: TableProps<SourceRecord>['columns'] = [
+    { title: '月份', dataIndex: '月份' },
+    { title: '原始文件名', dataIndex: '原始文件名', ellipsis: true },
+    { title: '上传时间', dataIndex: '上传时间' },
+    { title: '大小', dataIndex: '文件大小', render: fileSize },
+    { title: '操作', render: (_, row) => { const month = String(row['月份']); return <Button size="small" icon={<DownloadOutlined />} href={`/api/reports/sales-history/${encodeURIComponent(month)}/download`}>下载</Button>; } },
   ];
 
   const sourceCard = (definition: typeof sourceDefinitions[number]) => {
@@ -151,12 +166,22 @@ export default function UploadCenter({ active = true, refreshVersion = 0 }: { ac
     <Spin spinning={initialLoading} tip="正在读取上传记录…"><div className="page-loading-min-height">
       <Typography.Title level={4}>个人监控数据源</Typography.Title>
       <div className="upload-grid">
-        {sourceDefinitions.slice(0, 4).map(sourceCard)}
+        {sourceDefinitions.slice(0, 3).map(sourceCard)}
         <Card title="业绩报表 CSV" data-testid="performance-reports"><Typography.Paragraph type="secondary">支持一次拖入或选择多个文件；相同月份会替换原记录。</Typography.Paragraph><Spin spinning={isPending('upload-performance')} tip="正在逐个校验并保存…"><Dragger {...uploader('performance', '/api/reports/performance', true, '.csv')} disabled={isPending('upload-performance')} className="source-dragger"><p className="ant-upload-drag-icon"><InboxOutlined /></p><p className="ant-upload-text">拖拽一个或多个 CSV 到这里，或点击选择</p><p className="ant-upload-hint">每个文件都会先校验，再保存为对应月份的业绩报表</p></Dragger></Spin></Card>
       </div>
       <Card title="已上传业绩报表" className="section-card"><Table rowKey={row => String(row['月份'])} columns={reportColumns} dataSource={data.reports} pagination={{ pageSize: 8 }} scroll={{ x: 760 }} locale={{ emptyText: '暂无业绩报表' }} /></Card>
+      <Card title="往月销量原始表" data-testid="sales-history-rolling" className="section-card">
+        <Typography.Paragraph type="secondary">支持一次上传多个完整自然月 CSV；首次需提供连续 12 个月，后续上传新月份会自动滚动替换最早月份，同月份重新上传会覆盖原记录。</Typography.Paragraph>
+        <Spin spinning={isPending('upload-sales-history')} tip="正在逐个校验并保存…">
+          <Dragger {...uploader('sales-history', '/api/reports/sales-history', true, '.csv')} disabled={isPending('upload-sales-history') || isPending('delete-sales-history')} className="source-dragger">
+            <p className="ant-upload-drag-icon"><InboxOutlined /></p><p className="ant-upload-text">拖拽一个或多个月度 CSV 到这里，或点击选择</p><p className="ant-upload-hint">仅接受已结束的完整自然月；系统始终保留连续 12 个月</p>
+          </Dragger>
+        </Spin>
+        <Space wrap className="source-actions"><Tag color={historyRecords.length === 12 ? 'success' : 'warning'}>{historyRecords.length}/12 个月</Tag><Popconfirm title="确定清空全部往月销量原始表吗？" description="清空后补货页将暂时没有销量画像。" onConfirm={() => void deleteSalesHistory()} okButtonProps={{ loading: isPending('delete-sales-history') }}><Button danger loading={isPending('delete-sales-history')} icon={<DeleteOutlined />}>清空全部</Button></Popconfirm></Space>
+        <Table rowKey={row => String(row['月份'])} columns={historyColumns} dataSource={historyRecords} pagination={{ pageSize: 12, hideOnSinglePage: true }} scroll={{ x: 760 }} locale={{ emptyText: '暂无往月销量原始表' }} />
+      </Card>
       <Typography.Title level={4}>部门监控数据源</Typography.Title>
-      <div className="upload-grid">{sourceDefinitions.slice(4).map(sourceCard)}</div>
+      <div className="upload-grid">{sourceDefinitions.slice(3).map(sourceCard)}</div>
     </div></Spin>
     <Modal width="90vw" title={preview ? `${preview.title}预览（共 ${preview.total} 行，显示前 ${preview.rows.length} 行）` : '数据预览'} open={!!preview} footer={null} onCancel={() => setPreview(undefined)} destroyOnHidden>{preview && <Table rowKey={(_, index) => String(index)} size="small" columns={preview.columns.map(column => ({ title: column, dataIndex: column, key: column, ellipsis: true }))} dataSource={preview.rows} scroll={{ x: 'max-content', y: 500 }} pagination={{ pageSize: 15 }} />}</Modal>
   </>;

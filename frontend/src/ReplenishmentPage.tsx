@@ -65,6 +65,12 @@ function trendClass(value: number | null) {
   return Number(value) > 0 ? 'trend-positive' : 'trend-negative';
 }
 
+export function maxWeightClass(value: number | null) {
+  return value !== null && value !== undefined && Number.isFinite(Number(value)) && Number(value) >= 100
+    ? 'weight-warning'
+    : '';
+}
+
 function ratingClass(score: number | null) {
   if (score === null || score === undefined || Number.isNaN(Number(score))) return 'rating-missing';
   if (Number(score) >= 4.3) return 'rating-healthy';
@@ -124,7 +130,7 @@ function CountryCell({ code, metric }: { code: string; metric: ReplenishmentCoun
 
 export function DecisionBoardHeader() {
   return <div className="replenishment-board-grid replenishment-board-header" role="row">
-    {['产品识别', 'DE', 'FR', 'ES', 'IT', '库存矩阵', '趋势测算', '25年画像', '补货决策'].map(label => (
+    {['产品识别', 'DE', 'FR', 'ES', 'IT', '库存矩阵', '趋势测算', '销量画像', '补货决策'].map(label => (
       <div key={label} role="columnheader">{label}</div>
     ))}
   </div>;
@@ -189,23 +195,23 @@ function SkuDetailPanel({
         </article>
       )) : <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无SKU明细" />}
     </div>
-    {details.sales_history_2025?.available
+    {details.sales_history?.available
       ? <section className="replenishment-history-detail">
-        <h4>25年销量完整画像</h4>
+        <h4>{details.sales_history.title || '销量画像'}</h4>
         <div className="replenishment-history-sites">
-          {COUNTRY_ORDER.map(code => <span key={code}><small>{code}</small><strong>{display(details.sales_history_2025!.site_sales[code])}</strong></span>)}
+          {COUNTRY_ORDER.map(code => <span key={code}><small>{code}</small><strong>{display(details.sales_history!.site_sales[code])}</strong></span>)}
         </div>
         <div className="replenishment-history-months">
-          {(details.sales_history_2025.months || []).map(item => (
+          {(details.sales_history.months || []).map(item => (
             <span key={item.month}>
-              <small>{item.month}月</small>
+              <small>{item.month}</small>
               <strong>{display(item.total_sales)}</strong>
-              <em>{item.active_days}天 · {Number(item.nonzero_daily_average).toFixed(2)}/日</em>
+              <em>计入{item.included_days}天 · {Number(item.adjusted_daily_average).toFixed(2)}/日</em>
             </span>
           ))}
         </div>
       </section>
-      : <div className="replenishment-history-empty">25年销量明细未上传或该ASIN暂无四站销量，不影响建议补货数量。</div>}
+      : <div className="replenishment-history-empty">往月销量原始表未上传或该ASIN暂无四站销量，不影响建议补货数量。</div>}
   </div>;
 }
 
@@ -316,10 +322,14 @@ export function DecisionBoardRow({
       <div className="replenishment-trend-cell" data-section="趋势测算" role="gridcell">
         <MetricLine label="T值" value={row.trend.t_value} className={trendClass(row.trend.t_value)} />
         <MetricLine label="校准日销" value={row.trend.calibrated_daily_sales} />
-        <MetricLine label="最大重量" value={row.trend.max_weight_g === null ? null : `${display(row.trend.max_weight_g)}g`} />
+        <MetricLine
+          label="最大重量"
+          value={row.trend.max_weight_g === null ? null : `${display(row.trend.max_weight_g)}g`}
+          className={maxWeightClass(row.trend.max_weight_g)}
+        />
         <MetricLine label="覆盖天数" value={row.trend.coverage_days === null ? null : `${display(row.trend.coverage_days)}天`} />
       </div>
-      <div className="replenishment-history-cell" data-section="25年画像" role="gridcell">
+      <div className="replenishment-history-cell" data-section="销量画像" role="gridcell">
         {row.history.available
           ? <>
             <div className="replenishment-history-site-line">
@@ -328,12 +338,12 @@ export function DecisionBoardRow({
             <div className="replenishment-history-peak-grid">
               {row.history.peak_months.map(item => (
                 <span key={item.month}>
-                  <b>{item.month}月：</b>{Number(item.nonzero_daily_average).toFixed(2)} <em>({display(item.total_sales)})</em>
+                  <b>{item.month}：</b>{Number(item.adjusted_daily_average).toFixed(2)} <em>({display(item.total_sales)})</em>
                 </span>
               ))}
             </div>
           </>
-          : <span className="replenishment-empty">暂无25年销量</span>}
+          : <span className="replenishment-empty">暂无往月销量</span>}
       </div>
       <div className={`replenishment-recommendation-cell ${suggestionClass}`} data-section="补货决策" role="gridcell">
         <MetricLine label="目标库存" value={recommendation.target_inventory} />

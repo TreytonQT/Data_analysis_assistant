@@ -352,12 +352,14 @@ class PromotionsApiTests(unittest.TestCase):
         edited = self.client.put(f"/api/promotions/{promotion_id}", json=self.dates(0, 2, "Edited campaign"))
         self.assertEqual(edited.status_code, 200)
         after_edit = self.client.get("/api/promotions/last-promotions", params={"search": "SKU-A"}).json()["rows"][0]
-        self.assertIn("Edited campaign -12%", after_edit["promotion_content"])
+        self.assertIn("Initial campaign -12%", after_edit["promotion_content"])
+        self.assertNotIn("Edited campaign", after_edit["promotion_content"])
 
         deleted = self.client.delete(f"/api/promotions/{promotion_id}")
         self.assertEqual(deleted.status_code, 204)
         after_delete = self.client.get("/api/promotions/last-promotions", params={"search": "SKU-A"}).json()["rows"][0]
-        self.assertIn("Edited campaign -12%", after_delete["promotion_content"])
+        self.assertIn("Initial campaign -12%", after_delete["promotion_content"])
+        self.assertNotIn("Edited campaign", after_delete["promotion_content"])
 
         replacement = self.create_manual(
             ["SKU-A"],
