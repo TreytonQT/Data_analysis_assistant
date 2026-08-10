@@ -12,6 +12,12 @@ import {
 } from './api';
 
 const COUNTRY_ORDER = ['DE', 'FR', 'ES', 'IT'] as const;
+const COUNTRY_NAMES: Record<typeof COUNTRY_ORDER[number], string> = {
+  DE: '德国',
+  FR: '法国',
+  ES: '西班牙',
+  IT: '意大利',
+};
 const SORT_OPTIONS = [
   { value: '建议补货数量:desc', label: '建议补货数量：高到低' },
   { value: 'ASIN总库存:desc', label: '总库存：高到低' },
@@ -71,7 +77,8 @@ export function maxWeightClass(value: number | null) {
     : '';
 }
 
-function ratingClass(score: number | null) {
+function ratingClass(score: number | null, reviewCount: number | null = null) {
+  if (reviewCount !== null && Number(reviewCount) === 0) return 'rating-missing';
   if (score === null || score === undefined || Number.isNaN(Number(score))) return 'rating-missing';
   if (Number(score) >= 4.3) return 'rating-healthy';
   if (Number(score) >= 3.5) return 'rating-warning';
@@ -136,7 +143,7 @@ export function DecisionBoardHeader() {
   </div>;
 }
 
-function SkuDetailPanel({
+export function SkuDetailPanel({
   details,
   loading,
   error,
@@ -190,6 +197,21 @@ function SkuDetailPanel({
               <MetricLine label="促销开始" value={row['最近促销开始日期']} />
               <MetricLine label="促销截止" value={row['最近促销截止日期']} />
               <MetricLine label="促销折扣" value={row['最近促销折扣'] === null || row['最近促销折扣'] === undefined ? null : `${display(row['最近促销折扣'])}%`} />
+            </section>
+            <section className="replenishment-sku-margin-section"><h4>分站点毛利率</h4>
+              <div className="replenishment-sku-margin-grid">
+                {COUNTRY_ORDER.map(code => {
+                  const rawMargin = row[`${COUNTRY_NAMES[code]}毛利率`];
+                  const margin = rawMargin === null || rawMargin === undefined || rawMargin === ''
+                    ? null
+                    : Number(rawMargin);
+                  const safeMargin = margin !== null && Number.isFinite(margin) ? margin : null;
+                  return <span className={`replenishment-sku-margin-cell ${marginClass(safeMargin)}`} key={code}>
+                    <small>{code}</small>
+                    <strong>{percent(safeMargin)}</strong>
+                  </span>;
+                })}
+              </div>
             </section>
           </div>
         </article>
@@ -300,7 +322,7 @@ export function DecisionBoardRow({
                 </>
                 : <span className="replenishment-empty">暂无促销</span>}
             </div>
-            <span className={`replenishment-rating-badge ${ratingClass(row.identity.rating?.score ?? null)}`}>
+            <span className={`replenishment-rating-badge ${ratingClass(row.identity.rating?.score ?? null, row.identity.rating?.review_count ?? null)}`}>
               {row.identity.rating
                 ? `${display(row.identity.rating.review_count)}（${display(row.identity.rating.score)}）`
                 : '暂无Rating'}

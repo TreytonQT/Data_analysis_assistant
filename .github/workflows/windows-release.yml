@@ -1,0 +1,148 @@
+name: Build Windows release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Release tag, for example v2.0.1
+        required: true
+        default: v2.0.1
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    env:
+      APP_NAME: DataAnalysisAssistant
+      DEFAULT_RELEASE_TAG: v2.0.1
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-build.txt
+
+      - name: Build frontend
+        shell: pwsh
+        run: |
+          Push-Location frontend
+          npm ci
+          npm run build
+          Pop-Location
+
+      - name: Install Python dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --disable-pip-version-check -r requirements.txt
+          python -m pip install --disable-pip-version-check -r requirements-build.txt
+
+      - name: Run regression tests
+        shell: pwsh
+        run: |
+          python -m unittest discover -s tests
+          Push-Location frontend
+          npm test -- --testTimeout=10000
+          Pop-Location
+
+      - name: Build portable application
+        shell: pwsh
+        run: |
+          python -m PyInstaller --noconfirm --clean packaging/DataAnalysisAssistant.spec
+          Copy-Item configs "dist/$env:APP_NAME/configs" -Recurse
+          Copy-Item "packaging/README-WINDOWS.txt" "dist/$env:APP_NAME/README-WINDOWS.txt"
+
+      - name: Package and verify archive
+        id: package
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REF -like "refs/tags/*") {
+            $tag = $env:GITHUB_REF_NAME
+          } elseif ("${{ github.event.inputs.release_tag }}") {
+            $tag = "${{ github.event.inputs.release_tag }}"
+          } else {
+            $tag = $env:DEFAULT_RELEASE_TAG
+          }
+          $archive = "$env:APP_NAME-windows-x64-$tag.zip"
+          Compress-Archive -Path "dist/$env:APP_NAME" -DestinationPath $archive -CompressionLevel Optimal
+
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zip = [System.IO.Compression.ZipFile]::OpenRead((Resolve-Path $archive))
+          try {
+            $forbidden = $zip.Entries | Where-Object {
+              $entryName = $_.FullName -replace '\\', '/'
+              $entryName -match '(^|/)data/' -or
+              $entryName -match 'app\.db$' -or
+              $entryName -match '(^|/)\.tmp/'
+            }
+            if ($forbidden) {
+              throw "Release archive contains runtime data: $($forbidden.FullName -join ', ')"
+            }
+            $entryNames = $zip.Entries.FullName | ForEach-Object { $_ -replace '\\', '/' }
+            if (-not ($entryNames -contains "$env:APP_NAME/DataAnalysisAssistant.exe")) {
+              throw "Release archive does not contain DataAnalysisAssistant.exe"
+            }
+          } finally {
+            $zip.Dispose()
+          }
+
+          $hash = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $archive" | Set-Content "$archive.sha256.txt" -Encoding ascii
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "archive=$archive" >> $env:GITHUB_OUTPUT
+
+      - name: Create or update GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.package.outputs.tag }}
+          RELEASE_ARCHIVE: ${{ steps.package.outputs.archive }}
+        run: |
+          $notes = @"
+          ## Windows 便携版
+
+          下载 **$env:RELEASE_ARCHIVE**，完整解压后双击 **DataAnalysisAssistant.exe**。
+
+          - 无需安装 Python、Node.js 或 Docker
+          - 不包含业务数据目录、SQLite 数据库、上传文件或缓存
+          - 首次运行会创建新的空数据目录
+          - configs 目录包含程序运行需要的默认配置
+          - 服务仅监听 127.0.0.1:8000
+
+          迁移已有数据时，请在程序关闭后手动复制旧电脑的 data 和 configs 目录。
+
+          ## 本版本主要更新
+
+          - React + FastAPI 桌面端重建，替代原 Streamlit 界面
+          - 新增批次监控、部门监控和数据源更新频率分组
+          - 重构 ASIN 补货决策矩阵，支持四站点毛利、滚动 12 个月销量画像、SKU 明细和补货开关
+          - 增强滞销促销、产品管理、上传校验、分页排序与导出
+
+          完整更新记录见仓库中的 CHANGELOG.md。
+          "@
+          $notes | Set-Content release-notes.md -Encoding utf8
+
+          if (gh release view $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY 2>$null) {
+            gh release upload $env:RELEASE_TAG $env:RELEASE_ARCHIVE "$env:RELEASE_ARCHIVE.sha256.txt" --clobber --repo $env:GITHUB_REPOSITORY
+          } else {
+            gh release create $env:RELEASE_TAG $env:RELEASE_ARCHIVE "$env:RELEASE_ARCHIVE.sha256.txt" --target $env:GITHUB_SHA --title "销售数据分析助手 $env:RELEASE_TAG" --notes-file release-notes.md --repo $env:GITHUB_REPOSITORY
+          }

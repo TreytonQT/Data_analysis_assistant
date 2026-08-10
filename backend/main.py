@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from pathlib import Path
-
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse, JSONResponse
@@ -15,10 +13,9 @@ from backend.batch_monitor import router as batch_monitor_router
 from backend.app_revisions import router as app_revisions_router
 from backend.reports_api import router as reports_router
 from backend.tasks import router as tasks_router
+from app_paths import FRONTEND_DIST
 
-ROOT = Path(__file__).resolve().parent.parent
-FRONTEND_DIST = ROOT / "frontend" / "dist"
-app = FastAPI(title="销售数据看板 API", version="2.0.0")
+app = FastAPI(title="销售数据看板 API", version="2.0.1")
 app.add_middleware(GZipMiddleware, minimum_size=500, compresslevel=6)
 app.include_router(tasks_router)
 app.include_router(reports_router)

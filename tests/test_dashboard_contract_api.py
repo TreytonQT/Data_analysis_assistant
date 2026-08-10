@@ -242,6 +242,26 @@ class DashboardContractApiTests(unittest.TestCase):
         self.assertNotIn("remarks", payload["group_rows"][0]["identity"])
         self.assertEqual(payload["group_rows"][0]["recommendation"]["official_quantity"], 310)
 
+    def test_replenishment_sku_detail_exposes_four_site_margins(self) -> None:
+        summary = pd.DataFrame([{"补货组ID": "B001", "ASIN": "B001"}])
+        sku_detail = pd.DataFrame([{
+            "补货组ID": "B001", "ASIN": "B001", "MSKU": "SKU1",
+            "德国毛利率": 0.25, "法国毛利率": 0.15, "西班牙毛利率": 0.05,
+            "意大利毛利率": -0.1,
+        }])
+        tables = {"detail": summary, "sku_detail": sku_detail, "history": pd.DataFrame()}
+        with patch("backend.dashboard_api._replenishment_tables", return_value=tables):
+            response = self.client.get("/api/dashboard/replenishment/groups/B001/details")
+
+        self.assertEqual(response.status_code, 200, response.text)
+        payload = response.json()
+        self.assertEqual(payload["sku_rows"][0]["德国毛利率"], 0.25)
+        self.assertEqual(payload["sku_rows"][0]["意大利毛利率"], -0.1)
+        self.assertEqual(
+            {column["key"] for column in payload["sku_columns"] if column["key"].endswith("毛利率")},
+            {"德国毛利率", "法国毛利率", "西班牙毛利率", "意大利毛利率"},
+        )
+
     def test_numeric_sort_is_stable_and_percent_values_use_numeric_order(self) -> None:
         amount_frame = pd.DataFrame(
             [

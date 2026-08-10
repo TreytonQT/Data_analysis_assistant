@@ -140,7 +140,7 @@ function App() {
     const dashboardRefreshVersion = domainRefreshVersions.dashboard;
     const productRefreshVersion = dashboardRefreshVersion + domainRefreshVersions.batch_monitor;
     const content = key === 'uploads'
-      ? <UploadCenter active={active} refreshVersion={domainRefreshVersions.reports} />
+      ? <UploadCenter active={active} routeVersion={pageRouteVersions[key]} refreshVersion={domainRefreshVersions.reports} />
       : key === 'config'
         ? <ConfigCenter active={active} refreshVersion={domainRefreshVersions.configs} />
         : key === 'slow-moving'

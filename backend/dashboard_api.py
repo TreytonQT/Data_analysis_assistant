@@ -68,10 +68,8 @@ from dashboard.report_store import (
     load_upload_records,
     sales_history_index_path,
 )
+from app_paths import CONFIG_DIR
 
-
-ROOT = Path(__file__).resolve().parent.parent
-CONFIG_DIR = ROOT / "configs"
 SUMMARY_PAGE_SIZE = 50
 MAX_PAGE_SIZE = 200
 router = APIRouter(prefix="/api/dashboard", tags=["dashboard"])
@@ -666,7 +664,12 @@ def _build_department(month: str | None) -> dict[str, Any]:
     performance = build_department_performance_tables(operational, volume, amount)
     sections = [section("commission", f"{chosen_month or ''} 人员提成汇总", commission)]
     sections.extend(
-        section(f"performance-{index}", title, performance_with_total(frame))
+        section(
+            f"performance-{index}",
+            title,
+            performance_with_total(frame),
+            formats={"库存总数": "整数", "占用资金": "金额"},
+        )
         for index, (title, frame) in enumerate(performance.items())
     )
     payload = {

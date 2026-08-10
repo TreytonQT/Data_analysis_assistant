@@ -5,8 +5,10 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
-DB_PATH = ROOT / "data" / "app.db"
+from app_paths import APP_ROOT, DATA_DIR
+
+ROOT = APP_ROOT
+DB_PATH = DATA_DIR / "app.db"
 PROMOTION_NAME_MIGRATION = "2026-07-promotion-name-active-reset"
 LAST_PROMOTION_SNAPSHOT_MIGRATION = "2026-07-last-promotion-snapshot-backfill"
 HISTORY_PROMOTION_NAME = "历史未命名促销"

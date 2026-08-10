@@ -10,9 +10,9 @@ from threading import RLock
 from typing import Callable, Iterable
 
 import pandas as pd
+from app_paths import APP_ROOT
 
-
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = APP_ROOT
 CACHE_DIR = ROOT / "data" / "cache"
 CACHE_SCHEMA_VERSION = "6"
 _CACHE_LOCK = RLock()

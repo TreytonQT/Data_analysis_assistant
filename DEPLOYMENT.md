@@ -1,8 +1,25 @@
 # React + FastAPI 本地运行与 Docker 说明
 
-本项目面向单人、本机桌面使用。正式入口是 `start_dashboard.bat`，Docker 只是可选方案。两种方式都应只从 `127.0.0.1` 访问，不提供登录或局域网公开服务。
+本项目面向单人、本机桌面使用。普通 Windows 用户推荐使用 GitHub Release 便携版；源码环境的正式入口是 `start_dashboard.bat`，Docker 只是可选方案。所有方式都应只从 `127.0.0.1` 访问，不提供登录或局域网公开服务。
 
-## 本机运行（推荐）
+## Windows 便携版（推荐）
+
+从 [GitHub Releases](https://github.com/TreytonQT/Data_analysis_assistant/releases/latest) 下载 `DataAnalysisAssistant-windows-x64-v2.0.1.zip` 和对应的 `.sha256.txt`：
+
+1. 可选：使用 `Get-FileHash` 核对压缩包 SHA-256。
+2. 将压缩包完整解压到固定目录，不要直接在压缩包中运行。
+3. 双击 `DataAnalysisAssistant.exe`；就绪后会自动打开 `http://127.0.0.1:8000`。
+4. 保留启动窗口；关闭窗口或按 `Ctrl+C` 即停止程序。
+
+```powershell
+Get-FileHash .\DataAnalysisAssistant-windows-x64-v2.0.1.zip -Algorithm SHA256
+```
+
+便携版内置前端和 Python 运行环境，不要求另行安装 Python、Node.js 或 Docker。首次运行会在程序目录旁创建 `data/` 和空数据库，默认配置位于 `configs/`。
+
+升级便携版时，先关闭旧程序并备份旧目录中的 `data/` 与 `configs/`，完整解压新版后再将备份复制到新版目录。不要直接用新版空目录覆盖唯一的数据副本。
+
+## 本机源码运行
 
 首次安装：
 

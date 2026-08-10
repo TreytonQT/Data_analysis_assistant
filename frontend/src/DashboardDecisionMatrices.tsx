@@ -111,12 +111,17 @@ export function adRatioTone(value: unknown) {
 function ratingParts(value: unknown) {
   const text = hasValue(value) ? String(value).trim() : '';
   const match = text.match(/^(\d+)(?:\(([-+]?\d+(?:\.\d+)?)\))?$/);
-  if (!match) return { text: text || '暂无Rating', score: null as number | null };
-  return { text, score: match[2] === undefined ? null : Number(match[2]) };
+  if (!match) return { text: text || '暂无Rating', count: null as number | null, score: null as number | null };
+  return {
+    text,
+    count: Number(match[1]),
+    score: match[2] === undefined ? null : Number(match[2]),
+  };
 }
 
 export function ratingTone(value: unknown) {
-  const score = ratingParts(value).score;
+  const { count, score } = ratingParts(value);
+  if (count === 0) return 'rating-missing';
   if (score === null || !Number.isFinite(score)) return 'rating-missing';
   if (score >= 4.3) return 'rating-good';
   if (score >= 3.5) return 'rating-warning';

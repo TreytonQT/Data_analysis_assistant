@@ -12,10 +12,9 @@ from typing import Iterable
 import pandas as pd
 
 from dashboard.formula_engine import FormulaContext, FormulaError, evaluate_formula, extract_fields, extract_range_sums
+from app_paths import APP_ROOT, CONFIG_DIR
 
-
-ROOT = Path(__file__).resolve().parent.parent
-CONFIG_DIR = ROOT / "configs"
+ROOT = APP_ROOT
 
 METRIC_COLUMNS = ["指标名称", "显示分组", "公式", "格式", "排序", "是否启用"]
 STORE_COLUMNS = ["店铺名", "店铺类型", "停提款时间", "店铺所属部门"]
@@ -132,6 +131,8 @@ SALES_VOLUME_DETAIL_REQUIRED_COLUMNS = ["msku", "店铺", "开发专员"]
 SALES_AMOUNT_DETAIL_REQUIRED_COLUMNS = ["msku", "店铺", "开发专员"]
 DEPARTMENT_PERFORMANCE_FIXED_COLUMNS = [
     "在售SKU数量",
+    "库存总数",
+    "占用资金",
     "销售额贡献占比",
     "近7天日均订单",
     "近7天日均销售额（元）",
@@ -1104,6 +1105,7 @@ def build_department_performance_tables(
     month_amount_cols = [col for col in department_metric_columns_for_dates(month_dates, "销售额") if col in amount.columns]
     remaining_days = calendar.monthrange(today_ts.year, today_ts.month)[1] - today_ts.day + 1
     onsale_counts = build_department_onsale_counts(operational_df)
+    inventory_metrics = build_department_inventory_metrics(operational_df)
     department_volume = volume[volume["店铺部门"].ne("")].copy()
     department_amount = amount[amount["店铺部门"].ne("")].copy()
     store_codes = build_department_store_codes(operational_df)
@@ -1122,6 +1124,7 @@ def build_department_performance_tables(
             month_amount_cols,
             remaining_days,
             onsale_counts,
+            inventory_metrics,
         ),
         "部门业绩": build_department_performance_table_for_group(
             "部门",
@@ -1135,6 +1138,7 @@ def build_department_performance_tables(
             month_amount_cols,
             remaining_days,
             onsale_counts,
+            inventory_metrics,
         ),
         "店铺业绩排行": build_department_performance_table_for_group(
             "店铺",
@@ -1148,6 +1152,7 @@ def build_department_performance_tables(
             month_amount_cols,
             remaining_days,
             onsale_counts,
+            inventory_metrics,
             labels=store_codes,
         ),
     }
@@ -1165,6 +1170,7 @@ def build_department_performance_table_for_group(
     month_amount_cols: list[str],
     remaining_days: int,
     onsale_counts: dict[tuple[str, str | None], int],
+    inventory_metrics: dict[tuple[str, str | None], dict[str, float]],
     labels: Iterable[str] | None = None,
 ) -> pd.DataFrame:
     if labels is None:
@@ -1187,6 +1193,7 @@ def build_department_performance_table_for_group(
                 month_amount_cols,
                 remaining_days,
                 onsale_counts,
+                inventory_metrics,
             )
         )
     if not rows:
@@ -1210,6 +1217,7 @@ def build_department_performance_row(
     month_amount_cols: list[str],
     remaining_days: int,
     onsale_counts: dict[tuple[str, str | None], int],
+    inventory_metrics: dict[tuple[str, str | None], dict[str, float]],
 ) -> dict:
     total_volume_7 = volume[volume_date_cols].sum().sum() if not volume.empty else 0
     total_amount_7 = amount[amount_date_cols].sum().sum() if not amount.empty else 0
@@ -1217,6 +1225,8 @@ def build_department_performance_row(
     row = {
         label_col: label,
         "在售SKU数量": onsale_counts.get((count_kind, label), 0),
+        "库存总数": inventory_metrics.get((count_kind, label), {}).get("库存总数", 0),
+        "占用资金": inventory_metrics.get((count_kind, label), {}).get("占用资金", 0),
         "销售额贡献占比": 0,
         "近7天日均订单": total_volume_7 / 7,
         "近7天日均销售额（元）": total_amount_7 / 7,
@@ -1227,6 +1237,45 @@ def build_department_performance_row(
         row[f"{label_prefix}销量"] = volume[volume_col].sum() if not volume.empty else 0
         row[f"{label_prefix}销售额（元）"] = amount[amount_col].sum() if not amount.empty else 0
     return row
+
+
+def build_department_inventory_metrics(
+    operational_df: pd.DataFrame,
+) -> dict[tuple[str, str | None], dict[str, float]]:
+    """Aggregate inventory and occupied capital for department monitoring groups."""
+    required = ["店铺名称", "开发员", *AVAILABLE_INVENTORY_STOCK_COLUMNS]
+    missing = [col for col in required if col not in operational_df.columns]
+    if missing:
+        raise ValueError(f"运营原始表缺少部门监控库存列：{', '.join(missing)}")
+
+    capital_columns = operational_sales_capital_columns(operational_df)
+    base = operational_df[required + capital_columns].copy()
+    numeric_columns = AVAILABLE_INVENTORY_STOCK_COLUMNS + capital_columns
+    for column in numeric_columns:
+        base[column] = normalize_config_number(base[column]).fillna(0)
+    base["开发员"] = base["开发员"].map(normalize_department_person_name)
+    base["店铺部门"] = base["店铺名称"].map(department_name_from_store)
+    base["库存总数"] = base[AVAILABLE_INVENTORY_STOCK_COLUMNS].sum(axis=1)
+    base["占用资金"] = base[capital_columns].sum(axis=1) if capital_columns else 0
+
+    metrics: dict[tuple[str, str | None], dict[str, float]] = {}
+
+    def add_metric(kind: str, label: str) -> None:
+        key = (kind, label)
+        bucket = metrics.setdefault(key, {"库存总数": 0, "占用资金": 0})
+        bucket["库存总数"] += float(row["库存总数"])
+        bucket["占用资金"] += float(row["占用资金"])
+
+    for _, row in base.iterrows():
+        if row["开发员"]:
+            add_metric("person", row["开发员"])
+        if row["店铺部门"]:
+            add_metric("department", row["店铺部门"])
+        for _, store_name in extract_operational_store_codes(row["店铺名称"]):
+            store_code = extract_department_store_code(store_name)
+            if store_code:
+                add_metric("store", store_code)
+    return metrics
 
 
 def build_department_onsale_counts(operational_df: pd.DataFrame) -> dict[tuple[str, str | None], int]:
@@ -2025,6 +2074,42 @@ def build_replenishment_gross_summary(df: pd.DataFrame) -> pd.DataFrame:
     return result[["ASIN"] + replenishment_gross_columns()]
 
 
+def build_replenishment_sku_gross_summary(df: pd.DataFrame) -> pd.DataFrame:
+    """Calculate station margins at ASIN/MSKU granularity for SKU details."""
+    columns = ["_ASIN关联键", "_MSKU关联键"] + [f"{country}毛利率" for country in PRODUCT_COUNTRIES]
+    gross_profit = normalize_replenishment_gross_profit_source(df)
+    if gross_profit.empty:
+        return pd.DataFrame(columns=columns)
+
+    country_data = gross_profit[gross_profit["国家"].isin(PRODUCT_COUNTRIES)].copy()
+    if country_data.empty:
+        return pd.DataFrame(columns=columns)
+    country_data["_ASIN关联键"] = country_data["ASIN"].fillna("").astype(str).str.strip().str.upper()
+    country_data["_MSKU关联键"] = country_data["MSKU"].fillna("").astype(str).str.strip().str.upper()
+    country_data = country_data[country_data["_ASIN关联键"].ne("") & country_data["_MSKU关联键"].ne("")]
+    if country_data.empty:
+        return pd.DataFrame(columns=columns)
+
+    grouped = (
+        country_data.groupby(["_ASIN关联键", "_MSKU关联键", "国家"], dropna=False, sort=False)
+        .agg(销售额=("销售额", "sum"), 毛利润=("毛利润", "sum"))
+        .reset_index()
+    )
+    grouped["毛利率"] = grouped.apply(
+        lambda row: safe_blank_ratio(row["毛利润"], row["销售额"]),
+        axis=1,
+    )
+    result = grouped[["_ASIN关联键", "_MSKU关联键"]].drop_duplicates().copy()
+    for country in PRODUCT_COUNTRIES:
+        subset = grouped[grouped["国家"].eq(country)][["_ASIN关联键", "_MSKU关联键", "毛利率"]]
+        subset = subset.rename(columns={"毛利率": f"{country}毛利率"})
+        result = result.merge(subset, on=["_ASIN关联键", "_MSKU关联键"], how="left")
+    for column in columns:
+        if column not in result.columns:
+            result[column] = pd.NA
+    return result[columns]
+
+
 def build_replenishment_reason_columns(gross_profit: pd.DataFrame) -> pd.DataFrame:
     if gross_profit.empty:
         return pd.DataFrame(columns=["ASIN"] + replenishment_reason_columns())
@@ -2394,6 +2479,17 @@ def build_replenishment_management_tables(
         detail = detail.merge(tag_summary, on="ASIN", how="left")
         sku_detail = sku_detail.merge(tag_summary, on="ASIN", how="left")
 
+    if gross_profit_df is not None and not gross_profit_df.empty and not sku_detail.empty:
+        sku_gross = build_replenishment_sku_gross_summary(gross_profit_df)
+        if not sku_gross.empty:
+            sku_detail["_ASIN关联键"] = sku_detail["ASIN"].fillna("").astype(str).str.strip().str.upper()
+            sku_detail["_MSKU关联键"] = sku_detail["MSKU"].fillna("").astype(str).str.strip().str.upper()
+            sku_detail = sku_detail.merge(
+                sku_gross,
+                on=["_ASIN关联键", "_MSKU关联键"],
+                how="left",
+            ).drop(columns=["_ASIN关联键", "_MSKU关联键"], errors="ignore")
+
     if not history.empty:
         detail = detail.merge(history[SALES_HISTORY_GENERIC_COLUMNS], on="ASIN", how="left")
     for column in replenishment_sku_detail_columns():
@@ -2439,6 +2535,7 @@ def replenishment_management_columns() -> list[str]:
 def replenishment_sku_detail_columns() -> list[str]:
     return [
         "补货组ID", "ASIN", "SKU角色", "MSKU", "店铺名称", "店铺状态", "开发员",
+        *[f"{country}毛利率" for country in PRODUCT_COUNTRIES],
         "上架时间", "上架天数", "单品重量(g)", "7天销量", "14天销量", "30天销量",
         "T值", "校准日销量", "SKU亚马逊可售", "SKU总库存", "库龄90天以上",
         "库龄180-365天", "库龄365天以上", *REPLENISHMENT_FORMULA_STOCK_COLUMNS,
