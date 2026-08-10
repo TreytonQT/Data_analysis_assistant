@@ -88,11 +88,12 @@ jobs:
           Add-Type -AssemblyName System.IO.Compression.FileSystem
           $zip = [System.IO.Compression.ZipFile]::OpenRead((Resolve-Path $archive))
           try {
+            $runtimePrefix = [regex]::Escape("$env:APP_NAME/")
             $forbidden = $zip.Entries | Where-Object {
               $entryName = $_.FullName -replace '\\', '/'
-              $entryName -match '(^|/)data/' -or
-              $entryName -match 'app\.db$' -or
-              $entryName -match '(^|/)\.tmp/'
+              $entryName -match "^${runtimePrefix}data/" -or
+              $entryName -match "^${runtimePrefix}app\.db$" -or
+              $entryName -match "^${runtimePrefix}\.tmp/"
             }
             if ($forbidden) {
               throw "Release archive contains runtime data: $($forbidden.FullName -join ', ')"
