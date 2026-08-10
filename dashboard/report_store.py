@@ -12,10 +12,9 @@ from typing import Iterable
 import pandas as pd
 
 from dashboard.data_processing import normalize_report, read_csv_bytes, read_local_table
+from app_paths import APP_ROOT, DATA_DIR
 
-
-ROOT = Path(__file__).resolve().parent.parent
-DATA_DIR = ROOT / "data"
+ROOT = APP_ROOT
 REPORTS_DIR = DATA_DIR / "reports"
 SOURCES_DIR = DATA_DIR / "sources"
 INDEX_PATH = DATA_DIR / "upload_records.csv"

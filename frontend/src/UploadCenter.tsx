@@ -1,16 +1,23 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Alert, Button, Card, Modal, Popconfirm, Space, Spin, Table, Tag, Typography, Upload, message } from 'antd';
+import { Alert, Button, Card, Modal, Popconfirm, Space, Spin, Table, Tabs, Tag, Typography, Upload, message } from 'antd';
 import { DeleteOutlined, DownloadOutlined, EyeOutlined, InboxOutlined, ReloadOutlined } from '@ant-design/icons';
 import type { TableProps, UploadProps } from 'antd';
 import { api, apiErrorMessage, type ReportsResponse, type SourceRecord } from './api';
 
+export type UploadFrequencyTab = 'daily' | 'weekly' | 'monthly';
+
+export function uploadFrequencyTabFromSearch(search: string): UploadFrequencyTab {
+  const tab = new URLSearchParams(search).get('tab');
+  return tab === 'weekly' || tab === 'monthly' ? tab : 'daily';
+}
+
 const sourceDefinitions = [
-  { key: 'operational_sales', title: '运营原始表', accept: '.xls,.xlsx', description: '个人销量、库存、库龄、产品和补货分析的核心数据源' },
-  { key: 'gross_profit', title: '毛利原始表', accept: '.csv,.xls,.xlsx', description: '产品毛利率、广告费和异常原因分析' },
-  { key: 'rating', title: 'Rating', accept: '.xls,.xlsx', description: 'ASIN 各站点评分和评价数量' },
-  { key: 'sales_volume_detail', title: '销量明细', accept: '.csv', description: '部门监控的销量明细数据' },
-  { key: 'sales_amount_detail', title: '销售额明细', accept: '.csv', description: '部门监控的销售额明细数据' },
-];
+  { key: 'operational_sales', frequency: 'daily', title: '运营原始表', accept: '.xls,.xlsx', description: '个人销量、库存、库龄、产品和补货分析的核心数据源' },
+  { key: 'gross_profit', frequency: 'daily', title: '毛利原始表', accept: '.csv,.xls,.xlsx', description: '产品毛利率、广告费和异常原因分析' },
+  { key: 'rating', frequency: 'weekly', title: 'Rating', accept: '.xls,.xlsx', description: 'ASIN 各站点评分和评价数量' },
+  { key: 'sales_volume_detail', frequency: 'daily', title: '销量明细', accept: '.csv', description: '部门监控的销量明细数据' },
+  { key: 'sales_amount_detail', frequency: 'daily', title: '销售额明细', accept: '.csv', description: '部门监控的销售额明细数据' },
+] as const;
 const { Dragger } = Upload;
 
 function fileSize(value: unknown) {
@@ -24,14 +31,16 @@ function latestUploadTime(data: ReportsResponse) {
   return timestamps.at(-1) || '';
 }
 
-export default function UploadCenter({ active = true, refreshVersion = 0 }: { active?: boolean; refreshVersion?: number }) {
+export default function UploadCenter({ active = true, routeVersion = 0, refreshVersion = 0 }: { active?: boolean; routeVersion?: number; refreshVersion?: number }) {
   const [data, setData] = useState<ReportsResponse>({ reports: [], sources: {} });
   const [initialLoading, setInitialLoading] = useState(true);
   const [pending, setPending] = useState<Record<string, number>>({});
   const [error, setError] = useState('');
   const [lastUpdated, setLastUpdated] = useState('');
   const [preview, setPreview] = useState<{ title: string; columns: string[]; rows: Record<string, unknown>[]; total: number }>();
+  const [tab, setTab] = useState<UploadFrequencyTab>(() => uploadFrequencyTabFromSearch(window.location.search));
   const seenRefreshVersion = useRef(refreshVersion);
+  const seenRouteVersion = useRef(routeVersion);
 
   const begin = (key: string) => setPending(current => ({ ...current, [key]: (current[key] || 0) + 1 }));
   const end = (key: string) => setPending(current => {
@@ -60,6 +69,19 @@ export default function UploadCenter({ active = true, refreshVersion = 0 }: { ac
     seenRefreshVersion.current = refreshVersion;
     void refresh(false);
   }, [active, refresh, refreshVersion]);
+  useEffect(() => {
+    if (!active || seenRouteVersion.current === routeVersion) return;
+    seenRouteVersion.current = routeVersion;
+    setTab(uploadFrequencyTabFromSearch(window.location.search));
+  }, [active, routeVersion]);
+  useEffect(() => {
+    const onPopState = () => {
+      const page = new URLSearchParams(window.location.search).get('page') || 'overview';
+      if (active && page === 'uploads') setTab(uploadFrequencyTabFromSearch(window.location.search));
+    };
+    window.addEventListener('popstate', onPopState);
+    return () => window.removeEventListener('popstate', onPopState);
+  }, [active]);
 
   const uploader = (key: string, url: string, multiple = false, accept?: string): UploadProps => ({
     accept, multiple, showUploadList: false,
@@ -127,6 +149,17 @@ export default function UploadCenter({ active = true, refreshVersion = 0 }: { ac
     finally { end(operationKey); }
   };
 
+  const changeTab = (value: string) => {
+    const next = value === 'weekly' || value === 'monthly' ? value : 'daily';
+    if (next === tab) return;
+    const url = new URL(window.location.href);
+    url.searchParams.set('page', 'uploads');
+    url.searchParams.set('tab', next);
+    window.history.pushState({}, '', url);
+    window.dispatchEvent(new Event('sales-dashboard-route-change'));
+    setTab(next);
+  };
+
   const reportColumns: TableProps<SourceRecord>['columns'] = [
     { title: '月份', dataIndex: '月份' }, { title: '原始文件名', dataIndex: '原始文件名', ellipsis: true },
     { title: '上传时间', dataIndex: '上传时间' }, { title: '大小', dataIndex: '文件大小', render: fileSize },
@@ -160,17 +193,26 @@ export default function UploadCenter({ active = true, refreshVersion = 0 }: { ac
     </Card>;
   };
 
-  return <>
+  const tabItems = [
+    { key: 'daily', label: '每日上传' },
+    { key: 'weekly', label: '每周上传' },
+    { key: 'monthly', label: '每月上传' },
+  ];
+
+  return <div className="upload-center-page">
+    <Tabs className="upload-center-tabs" activeKey={tab} onChange={changeTab} items={tabItems} />
     <div className="page-heading"><div><Typography.Title level={2}>上传中心</Typography.Title><Typography.Text type="secondary">所有文件会先执行字段与格式校验，通过后才会覆盖现有数据。{lastUpdated && ` · 数据更新时间 ${lastUpdated}`}</Typography.Text></div><Button loading={initialLoading} disabled={Object.keys(pending).length > 0} icon={<ReloadOutlined />} onClick={() => void refresh()}>刷新记录</Button></div>
     {error && <Alert className="persistent-page-error" type="error" showIcon message="上传中心操作失败" description={error} action={<Button size="small" onClick={() => void refresh()}>重新加载</Button>} />}
     <Spin spinning={initialLoading} tip="正在读取上传记录…"><div className="page-loading-min-height">
-      <Typography.Title level={4}>个人监控数据源</Typography.Title>
-      <div className="upload-grid">
-        {sourceDefinitions.slice(0, 3).map(sourceCard)}
-        <Card title="业绩报表 CSV" data-testid="performance-reports"><Typography.Paragraph type="secondary">支持一次拖入或选择多个文件；相同月份会替换原记录。</Typography.Paragraph><Spin spinning={isPending('upload-performance')} tip="正在逐个校验并保存…"><Dragger {...uploader('performance', '/api/reports/performance', true, '.csv')} disabled={isPending('upload-performance')} className="source-dragger"><p className="ant-upload-drag-icon"><InboxOutlined /></p><p className="ant-upload-text">拖拽一个或多个 CSV 到这里，或点击选择</p><p className="ant-upload-hint">每个文件都会先校验，再保存为对应月份的业绩报表</p></Dragger></Spin></Card>
-      </div>
-      <Card title="已上传业绩报表" className="section-card"><Table rowKey={row => String(row['月份'])} columns={reportColumns} dataSource={data.reports} pagination={{ pageSize: 8 }} scroll={{ x: 760 }} locale={{ emptyText: '暂无业绩报表' }} /></Card>
-      <Card title="往月销量原始表" data-testid="sales-history-rolling" className="section-card">
+      {tab === 'daily' && <div className="upload-grid">{sourceDefinitions.filter(definition => definition.frequency === 'daily').map(sourceCard)}</div>}
+      {tab === 'weekly' && <>
+        <div className="upload-grid">
+          <Card title="业绩报表 CSV" data-testid="performance-reports"><Typography.Paragraph type="secondary">支持一次拖入或选择多个文件；相同月份会替换原记录。</Typography.Paragraph><Spin spinning={isPending('upload-performance')} tip="正在逐个校验并保存…"><Dragger {...uploader('performance', '/api/reports/performance', true, '.csv')} disabled={isPending('upload-performance')} className="source-dragger"><p className="ant-upload-drag-icon"><InboxOutlined /></p><p className="ant-upload-text">拖拽一个或多个 CSV 到这里，或点击选择</p><p className="ant-upload-hint">每个文件都会先校验，再保存为对应月份的业绩报表</p></Dragger></Spin></Card>
+          {sourceDefinitions.filter(definition => definition.frequency === 'weekly').map(sourceCard)}
+        </div>
+        <Card title="已上传业绩报表" className="section-card"><Table rowKey={row => String(row['月份'])} columns={reportColumns} dataSource={data.reports} pagination={{ pageSize: 8 }} scroll={{ x: 760 }} locale={{ emptyText: '暂无业绩报表' }} /></Card>
+      </>}
+      {tab === 'monthly' && <Card title="往月销量原始表" data-testid="sales-history-rolling" className="section-card">
         <Typography.Paragraph type="secondary">支持一次上传多个完整自然月 CSV；首次需提供连续 12 个月，后续上传新月份会自动滚动替换最早月份，同月份重新上传会覆盖原记录。</Typography.Paragraph>
         <Spin spinning={isPending('upload-sales-history')} tip="正在逐个校验并保存…">
           <Dragger {...uploader('sales-history', '/api/reports/sales-history', true, '.csv')} disabled={isPending('upload-sales-history') || isPending('delete-sales-history')} className="source-dragger">
@@ -179,10 +221,8 @@ export default function UploadCenter({ active = true, refreshVersion = 0 }: { ac
         </Spin>
         <Space wrap className="source-actions"><Tag color={historyRecords.length === 12 ? 'success' : 'warning'}>{historyRecords.length}/12 个月</Tag><Popconfirm title="确定清空全部往月销量原始表吗？" description="清空后补货页将暂时没有销量画像。" onConfirm={() => void deleteSalesHistory()} okButtonProps={{ loading: isPending('delete-sales-history') }}><Button danger loading={isPending('delete-sales-history')} icon={<DeleteOutlined />}>清空全部</Button></Popconfirm></Space>
         <Table rowKey={row => String(row['月份'])} columns={historyColumns} dataSource={historyRecords} pagination={{ pageSize: 12, hideOnSinglePage: true }} scroll={{ x: 760 }} locale={{ emptyText: '暂无往月销量原始表' }} />
-      </Card>
-      <Typography.Title level={4}>部门监控数据源</Typography.Title>
-      <div className="upload-grid">{sourceDefinitions.slice(3).map(sourceCard)}</div>
+      </Card>}
     </div></Spin>
     <Modal width="90vw" title={preview ? `${preview.title}预览（共 ${preview.total} 行，显示前 ${preview.rows.length} 行）` : '数据预览'} open={!!preview} footer={null} onCancel={() => setPreview(undefined)} destroyOnHidden>{preview && <Table rowKey={(_, index) => String(index)} size="small" columns={preview.columns.map(column => ({ title: column, dataIndex: column, key: column, ellipsis: true }))} dataSource={preview.rows} scroll={{ x: 'max-content', y: 500 }} pagination={{ pageSize: 15 }} />}</Modal>
-  </>;
+  </div>;
 }

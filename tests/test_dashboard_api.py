@@ -214,12 +214,14 @@ class DashboardApiTests(unittest.TestCase):
 
     def test_performance_total_row_is_inserted_first(self):
         frame = pd.DataFrame([
-            {"开发员": "A", "在售SKU数量": 2, "销售额贡献占比": 0.6, "7月12日销量": 10},
-            {"开发员": "B", "在售SKU数量": 3, "销售额贡献占比": 0.4, "7月12日销量": 20},
+            {"开发员": "A", "在售SKU数量": 2, "库存总数": 20, "占用资金": 1000, "销售额贡献占比": 0.6, "7月12日销量": 10},
+            {"开发员": "B", "在售SKU数量": 3, "库存总数": 30, "占用资金": 2000, "销售额贡献占比": 0.4, "7月12日销量": 20},
         ])
         result = performance_with_total(frame)
         self.assertEqual(result.iloc[0]["开发员"], "合计")
         self.assertEqual(result.iloc[0]["在售SKU数量"], 5)
+        self.assertEqual(result.iloc[0]["库存总数"], 50)
+        self.assertEqual(result.iloc[0]["占用资金"], 3000)
         self.assertEqual(result.iloc[0]["销售额贡献占比"], 1)
         self.assertEqual(result.iloc[0]["7月12日销量"], 30)
 
@@ -256,10 +258,18 @@ class DashboardApiTests(unittest.TestCase):
                     for section in payload["sections"][1:]:
                         column_keys = [column["key"] for column in section["columns"]]
                         self.assertIn("在售SKU数量", column_keys)
+                        self.assertEqual(
+                            column_keys[1:5],
+                            ["在售SKU数量", "库存总数", "占用资金", "销售额贡献占比"],
+                        )
+                        metadata = {column["key"]: column for column in section["columns"]}
+                        self.assertEqual(metadata["库存总数"]["format"], "integer")
+                        self.assertEqual(metadata["占用资金"]["format"], "amount")
                         self.assertNotIn("在售产品数", column_keys)
                     exported = self.client.get("/api/dashboard/department/sections/performance-0/export.csv")
                     self.assertEqual(exported.status_code, 200, exported.text)
-                    self.assertIn("在售SKU数量", exported.content.decode("utf-8-sig").splitlines()[0])
+                    exported_header = exported.content.decode("utf-8-sig").splitlines()[0]
+                    self.assertIn("在售SKU数量,库存总数,占用资金,销售额贡献占比", exported_header)
 
     def test_replenishment_min_qty_filters_disabled_rows_before_metrics(self):
         detail = pd.DataFrame([

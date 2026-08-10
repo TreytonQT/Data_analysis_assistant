@@ -147,12 +147,12 @@
 .performance-image-header-text { fill: #101010; font-size: 13px; font-weight: 800; }
 .performance-summary-header-text { fill: #101010; font-size: 17px; font-weight: 800; }
 .performance-image-cell { fill: #101010; font-size: 16px; font-weight: 600; }
-.performance-image-total-cell { fill: #101010; font-size: 16px; font-weight: 800; }
-.performance-compact-header-text { fill: #101010; font-size: 14px; font-weight: 800; }
-.performance-date-header-text { fill: #101010; font-size: 15px; font-weight: 800; }
+.performance-image-total-cell { fill: #101010; font-size: 14px; font-weight: 800; }
+.performance-compact-header-text { fill: #101010; font-size: 13px; font-weight: 800; }
+.performance-date-header-text { fill: #101010; font-size: 14px; font-weight: 800; }
 .performance-sub-header-text { fill: #101010; font-size: 12px; font-weight: 800; }
 .performance-sub-header-unit { fill: #101010; font-size: 10px; font-weight: 700; }
-.performance-compact-cell { fill: #101010; font-size: 14px; font-weight: 600; }
+.performance-compact-cell { fill: #101010; font-size: 13px; font-weight: 600; }
 .performance-detail-title { fill: #b9e5e3; }
 .performance-detail-title-text { fill: #101010; font-size: 17px; font-weight: 800; }
 .performance-image-name-cell { fill: #fff1c9; }
@@ -209,9 +209,11 @@ html, body, #root { height: 100%; overflow: hidden; }
 }
 
 .slow-moving-tabs,
+.upload-center-tabs,
 .product-management-tabs,
 .department-monitoring-tabs { margin: -8px 0 18px; }
 .slow-moving-tabs > .ant-tabs-nav,
+.upload-center-tabs > .ant-tabs-nav,
 .product-management-tabs > .ant-tabs-nav,
 .department-monitoring-tabs > .ant-tabs-nav { margin-bottom: 0; }
 .promotion-page-heading { margin-bottom: 18px; }
@@ -916,7 +918,7 @@ html, body, #root { height: 100%; overflow: hidden; }
 .replenishment-sku-card header > div { display: flex; align-items: center; min-width: 0; gap: 5px; }
 .replenishment-sku-card header .ant-tag { margin: 0; }
 .replenishment-sku-card header > span { color: #536b84; font-size: 11px; }
-.replenishment-sku-sections { display: grid; grid-template-columns: .8fr 1.5fr 1fr; min-width: 0; }
+.replenishment-sku-sections { display: grid; grid-template-columns: .75fr 1.35fr 1fr .8fr; min-width: 0; }
 .replenishment-sku-sections > section { min-width: 0; padding: 8px 10px; border-right: 1px solid #e1e8f0; }
 .replenishment-sku-sections > section:last-child { border-right: 0; }
 .replenishment-sku-sections h4,
@@ -935,6 +937,23 @@ html, body, #root { height: 100%; overflow: hidden; }
 .replenishment-history-detail small { overflow: hidden; color: #63768b; font-size: 8px; text-overflow: ellipsis; white-space: nowrap; }
 .replenishment-stock-components strong,
 .replenishment-history-detail strong { color: #1d3f61; font-size: 10px; }
+.replenishment-sku-margin-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 5px;
+  margin-top: 5px;
+}
+.replenishment-sku-margin-cell {
+  display: grid;
+  min-width: 0;
+  justify-items: center;
+  gap: 2px;
+  padding: 5px 3px;
+  border-radius: 4px;
+  text-align: center;
+}
+.replenishment-sku-margin-cell small { font-size: 9px; font-weight: 700; }
+.replenishment-sku-margin-cell strong { font-size: 12px; line-height: 1.1; }
 .replenishment-history-detail { margin-top: 10px; padding: 9px; border: 1px solid #c5d5e6; border-radius: 7px; background: #fff; }
 .replenishment-history-detail > div { display: grid; gap: 4px; }
 .replenishment-history-detail .replenishment-history-sites { grid-template-columns: repeat(4, minmax(0, 1fr)); margin-bottom: 5px; }

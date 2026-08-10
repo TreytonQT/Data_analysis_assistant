@@ -8,6 +8,7 @@ from openpyxl import Workbook
 
 from dashboard.data_processing import (
     build_available_inventory_monitor_table,
+    build_department_inventory_metrics,
     build_department_performance_tables,
     build_department_onsale_counts,
     build_low_margin_product_table,
@@ -863,6 +864,20 @@ class DataProcessingTests(unittest.TestCase):
                 "店铺名称": ["20-A 德国", "20-B 法国", "6-C 德国,7-D 法国", "7-E 意大利", "20-C 德国", "20-fpi 英国, 6-Z 德国"],
                 "开发员": ["运营二十部-陈千潼-26", "运营二十部-付凯乐", "运营六部-陈千潼", "运营二十部-杨国梁-26", "运营二十部-付凯乐-26", "运营二十部-杨国梁-26"],
                 "可售": [10, 0, 5, 3, 8, 0],
+                "待调仓": [1, 2, 3, 4, 5, 6],
+                "调仓中": [0, 1, 0, 1, 0, 1],
+                "待入库": [0, 1, 2, 0, 1, 2],
+                "采购在途": [0, 2, 0, 3, 0, 4],
+                "本地库存": [0, 1, 1, 0, 1, 2],
+                "在途": [0, 0, 1, 1, 0, 1],
+                "计划入库": [0, 1, 0, 0, 1, 2],
+                "0-60天占用资金": [1, 2, 3, 4, 5, 6],
+                "61-90天占用资金": [10, 20, 30, 40, 50, 60],
+                "91-180天占用资金": [0, 0, 0, 0, 0, 0],
+                "181-330天占用资金": [0, 0, 0, 0, 0, 0],
+                "331-365天占用资金": [0, 0, 0, 0, 0, 0],
+                "366-455天占用资金": [0, 0, 0, 0, 0, 0],
+                "456天占用资金": [0, 0, 0, 0, 0, 0],
             }
         )
 
@@ -930,6 +945,41 @@ class DataProcessingTests(unittest.TestCase):
         self.assertEqual(counts[("store", "B")], 1)
         self.assertNotIn(("store", "C"), counts)
         self.assertNotIn(("store", "D"), counts)
+
+    def test_department_inventory_metrics_sum_all_stock_and_capital_fields(self):
+        source = pd.DataFrame(
+            {
+                "店铺名称": ["20-A 德国", "20-B 法国"],
+                "开发员": ["运营二十部-甲", "运营二十部-甲"],
+                "可售": ["0", "1"],
+                "待调仓": ["1,000", 1],
+                "调仓中": [None, 1],
+                "待入库": [2, 1],
+                "采购在途": [3, 1],
+                "本地库存": [4, 1],
+                "在途": [5, 1],
+                "计划入库": [6, 1],
+                "0-60天占用资金": ["1,000", 1],
+                "61-90天占用资金": [500, 1],
+                "91-180天占用资金": [None, 1],
+                "181-330天占用资金": [None, 1],
+                "331-365天占用资金": [None, 1],
+                "366-455天占用资金": [None, 1],
+                "456天占用资金": [None, 1],
+            }
+        )
+
+        metrics = build_department_inventory_metrics(source)
+
+        self.assertEqual(metrics[("person", "甲")], {"库存总数": 1028.0, "占用资金": 1507.0})
+        self.assertEqual(metrics[("department", "运营二十部")], {"库存总数": 1028.0, "占用资金": 1507.0})
+        self.assertEqual(metrics[("store", "A")], {"库存总数": 1020.0, "占用资金": 1500.0})
+        self.assertEqual(metrics[("store", "B")], {"库存总数": 8.0, "占用资金": 7.0})
+
+    def test_department_inventory_metrics_requires_all_stock_columns(self):
+        source = self.department_operational_source().drop(columns=["待调仓"])
+        with self.assertRaisesRegex(ValueError, "部门监控库存列.*待调仓"):
+            build_department_inventory_metrics(source)
 
     def test_department_performance_total_is_prepended_and_sums_all_rows(self):
         frame = pd.DataFrame(
@@ -1006,6 +1056,12 @@ class DataProcessingTests(unittest.TestCase):
         self.assertEqual(developer.loc["陈千潼", "在售SKU数量"], 2)
         self.assertEqual(developer.loc["付凯乐", "在售SKU数量"], 1)
         self.assertEqual(developer.loc["杨国梁", "在售SKU数量"], 1)
+        self.assertEqual(developer.loc["陈千潼", "库存总数"], 23)
+        self.assertEqual(developer.loc["陈千潼", "占用资金"], 44)
+        self.assertEqual(developer.loc["付凯乐", "库存总数"], 24)
+        self.assertEqual(developer.loc["付凯乐", "占用资金"], 77)
+        self.assertEqual(developer.loc["杨国梁", "库存总数"], 30)
+        self.assertEqual(developer.loc["杨国梁", "占用资金"], 110)
         self.assertEqual(developer.loc["陈千潼", "近7天日均订单"], 9)
         self.assertEqual(developer.loc["陈千潼", "近7天日均销售额（元）"], 77)
         self.assertEqual(developer.loc["付凯乐", "近7天日均订单"], 4)
@@ -1022,6 +1078,10 @@ class DataProcessingTests(unittest.TestCase):
         self.assertNotIn("付凯乐", department.index)
         self.assertEqual(department.loc["联合部门", "在售SKU数量"], 2)
         self.assertEqual(department.loc["运营二十部", "在售SKU数量"], 2)
+        self.assertEqual(department.loc["联合部门", "库存总数"], 24)
+        self.assertEqual(department.loc["联合部门", "占用资金"], 77)
+        self.assertEqual(department.loc["运营二十部", "库存总数"], 53)
+        self.assertEqual(department.loc["运营二十部", "占用资金"], 154)
         self.assertEqual(department.loc["联合部门", "近7天日均订单"], 6)
         self.assertEqual(department.loc["联合部门", "近7天日均销售额（元）"], 107)
         self.assertEqual(department.loc["运营二十部", "近7天日均订单"], 11)
@@ -1034,6 +1094,14 @@ class DataProcessingTests(unittest.TestCase):
         self.assertEqual(stores.loc["B", "在售SKU数量"], 0)
         self.assertEqual(stores.loc["C", "在售SKU数量"], 1)
         self.assertEqual(stores.loc["FPI", "在售SKU数量"], 0)
+        self.assertEqual(stores.loc["A", "库存总数"], 11)
+        self.assertEqual(stores.loc["B", "库存总数"], 8)
+        self.assertEqual(stores.loc["C", "库存总数"], 16)
+        self.assertEqual(stores.loc["FPI", "库存总数"], 18)
+        self.assertEqual(stores.loc["A", "占用资金"], 11)
+        self.assertEqual(stores.loc["B", "占用资金"], 22)
+        self.assertEqual(stores.loc["C", "占用资金"], 55)
+        self.assertEqual(stores.loc["FPI", "占用资金"], 66)
         self.assertEqual(stores.loc["A", "近7天日均订单"], 7)
         self.assertEqual(stores.loc["A", "近7天日均销售额（元）"], 70)
         self.assertEqual(stores.loc["FPI", "近7天日均订单"], 0)
@@ -1114,6 +1182,25 @@ class DataProcessingTests(unittest.TestCase):
         self.assertEqual(sku.loc["SKU1", "SKU总库存"], 28)
         self.assertEqual(sku.loc["SKU1", "SKU亚马逊可售"], 13)
         self.assertEqual(sku.loc["SKU1", "SKU角色"], "原SKU")
+
+    def test_replenishment_sku_site_margins_aggregate_before_ratio(self):
+        gross = self.replenishment_gross_source()
+        duplicate = gross[gross["MSKU"].eq("SKU2") & gross["国家"].eq("德国")].copy()
+        duplicate["销售额--FBA销售额"] = 50
+        duplicate["销售额--FBM销售额"] = 0
+        duplicate["毛利润"] = 0
+        gross = pd.concat([gross, duplicate], ignore_index=True)
+
+        tables = build_replenishment_management_tables(
+            self.replenishment_operational_source(), gross, today="2026-07-29", only_needed=False,
+        )
+        sku = tables["sku_detail"].set_index("MSKU")
+        self.assertAlmostEqual(sku.loc["SKU1", "德国毛利率"], 30 / 150)
+        self.assertAlmostEqual(sku.loc["SKU2", "德国毛利率"], 10 / 100)
+        self.assertAlmostEqual(sku.loc["SKU2", "法国毛利率"], 30 / 100)
+        self.assertTrue(pd.isna(sku.loc["SKU1", "法国毛利率"]))
+        self.assertIn("德国毛利率", tables["sku_detail"].columns)
+        self.assertIn("意大利毛利率", tables["sku_detail"].columns)
 
     def test_replenishment_uses_excel_rounding_weight_boundary_and_switch(self):
         source = pd.DataFrame({

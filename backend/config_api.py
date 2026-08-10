@@ -43,9 +43,8 @@ from dashboard.data_processing import (
 from dashboard.formula_engine import validate_formula
 from dashboard.report_store import load_upload_records
 from backend.upload_safety import read_upload_limited
+from app_paths import CONFIG_DIR
 
-ROOT = Path(__file__).resolve().parent.parent
-CONFIG_DIR = ROOT / "configs"
 router = APIRouter(prefix="/api", tags=["config"])
 CONFIG_MAX_ROWS = 20_000
 CONFIG_MAX_COLUMNS = 100

@@ -1,7 +1,7 @@
 import { cleanup, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import ReplenishmentPage, { ReplenishmentDecisionBoard, maxWeightClass } from './ReplenishmentPage';
+import ReplenishmentPage, { ReplenishmentDecisionBoard, SkuDetailPanel, maxWeightClass } from './ReplenishmentPage';
 import type { DashboardPayload, DashboardSection, ReplenishmentGroupRow } from './api';
 
 const apiMocks = vi.hoisted(() => ({
@@ -148,6 +148,33 @@ describe('ReplenishmentDecisionBoard', () => {
     expect(maxWeightClass(null)).toBe('');
   });
 
+  it('shows independent four-site margins for every expanded SKU', () => {
+    const { container } = render(
+      <SkuDetailPanel
+        loading={false}
+        onRetry={vi.fn()}
+        details={{
+          group: {},
+          sku_columns: [],
+          sales_history: null,
+          sku_rows: [
+            { MSKU: 'SKU1', ASIN: 'B001', SKU角色: '原SKU', 德国毛利率: 0.25, 法国毛利率: 0.15, 西班牙毛利率: 0.05, 意大利毛利率: -0.1 },
+            { MSKU: 'SKU2', ASIN: 'B001', SKU角色: '跟卖SKU', 德国毛利率: 0.2, 法国毛利率: null, 西班牙毛利率: 0, 意大利毛利率: 0.3 },
+          ],
+        }}
+      />,
+    );
+
+    expect(screen.getAllByText('分站点毛利率')).toHaveLength(2);
+    expect(container.querySelectorAll('.replenishment-sku-margin-cell.margin-healthy')).toHaveLength(3);
+    expect(container.querySelectorAll('.replenishment-sku-margin-cell.margin-warning')).toHaveLength(1);
+    expect(container.querySelectorAll('.replenishment-sku-margin-cell.margin-low')).toHaveLength(2);
+    expect(container.querySelectorAll('.replenishment-sku-margin-cell.margin-negative')).toHaveLength(1);
+    expect(container.querySelectorAll('.replenishment-sku-margin-cell.margin-missing')).toHaveLength(1);
+    expect(screen.getByText('25.0%')).toBeInTheDocument();
+    expect(container.querySelector('.replenishment-sku-margin-cell.margin-missing strong')).toHaveTextContent('—');
+  });
+
   it('supports expanding a group with a keyboard-accessible button', async () => {
     const user = userEvent.setup();
     const onToggle = vi.fn();
@@ -189,6 +216,25 @@ describe('ReplenishmentDecisionBoard', () => {
     await user.click(screen.getByRole('combobox', { name: 'B001补货开关' }));
     await user.click(await screen.findByText('不补货'));
     expect(onDisable).toHaveBeenCalledWith(missingRatingRow);
+  });
+
+  it('uses the gray rating state when the review count is zero', () => {
+    const zeroRatingRow = { ...row, identity: { ...row.identity, rating: { review_count: 0, score: 0 } } };
+    render(
+      <ReplenishmentDecisionBoard
+        rows={[zeroRatingRow]}
+        expanded={new Set()}
+        details={{}}
+        detailLoading={new Set()}
+        detailErrors={{}}
+        onToggle={vi.fn()}
+        onRetry={vi.fn()}
+        onDisable={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText('0（0）')).toHaveClass('rating-missing');
+    expect(screen.getByText('0（0）')).not.toHaveClass('rating-danger');
   });
 
   it('defaults to min quantity 30 and can select all matched developers', async () => {

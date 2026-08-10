@@ -32,7 +32,7 @@ vi.mock('./api', async () => {
 });
 
 const amountFields = new Set([
-  '销售额', '毛利润', '90天以上占用资金合计', '库存计提', '弃置费',
+  '销售额', '毛利润', '占用资金', '90天以上占用资金合计', '库存计提', '弃置费',
   '91-180天占用资金', '181-330天占用资金', '331-365天占用资金',
   '366-455天占用资金', '456天占用资金',
 ]);
@@ -124,7 +124,7 @@ const slowMovingRow = {
   '456天占用资金': 500,
 };
 
-const performanceFields = ['店铺', '在售SKU数量', '销售额贡献占比', '近7天日均订单', '近7天日均销售额（元）', '预估本月销售额（元）', '8月3日销量', '8月3日销售额（元）'];
+const performanceFields = ['店铺', '在售SKU数量', '库存总数', '占用资金', '销售额贡献占比', '近7天日均订单', '近7天日均销售额（元）', '预估本月销售额（元）', '8月3日销量', '8月3日销售额（元）'];
 
 describe('DashboardDecisionMatrix', () => {
   beforeEach(() => {
@@ -209,9 +209,9 @@ describe('DashboardDecisionMatrix', () => {
   it('switches department monitoring tabs, preserves month filter, and renders store performance', async () => {
     const user = userEvent.setup();
     const commission = section('commission', '2026-07 人员提成汇总', ['人员', '营业额'], [{ 人员: '陈千潼', 营业额: 100 }]);
-    const developer = section('performance-0', '开发员业绩排行', performanceFields.map(field => field === '店铺' ? '开发员' : field), [{ 开发员: '陈千潼', 在售SKU数量: 2, 销售额贡献占比: 1, 近7天日均订单: 3, '近7天日均销售额（元）': 100, '预估本月销售额（元）': 200, '8月3日销量': 3, '8月3日销售额（元）': 100 }]);
-    const department = section('performance-1', '部门业绩', performanceFields.map(field => field === '店铺' ? '部门' : field), [{ 部门: '运营二十部', 在售SKU数量: 2, 销售额贡献占比: 1, 近7天日均订单: 3, '近7天日均销售额（元）': 100, '预估本月销售额（元）': 200, '8月3日销量': 3, '8月3日销售额（元）': 100 }]);
-    const stores = section('performance-2', '店铺业绩排行', performanceFields, [{ 店铺: 'AEU', 在售SKU数量: 1, 销售额贡献占比: 1, 近7天日均订单: 3, '近7天日均销售额（元）': 100, '预估本月销售额（元）': 200, '8月3日销量': 3, '8月3日销售额（元）': 100 }]);
+    const developer = section('performance-0', '开发员业绩排行', performanceFields.map(field => field === '店铺' ? '开发员' : field), [{ 开发员: '陈千潼', 在售SKU数量: 2, 库存总数: 1234, 占用资金: 12345, 销售额贡献占比: 1, 近7天日均订单: 3, '近7天日均销售额（元）': 100, '预估本月销售额（元）': 200, '8月3日销量': 3, '8月3日销售额（元）': 100 }]);
+    const department = section('performance-1', '部门业绩', performanceFields.map(field => field === '店铺' ? '部门' : field), [{ 部门: '运营二十部', 在售SKU数量: 2, 库存总数: 1234, 占用资金: 12345, 销售额贡献占比: 1, 近7天日均订单: 3, '近7天日均销售额（元）': 100, '预估本月销售额（元）': 200, '8月3日销量': 3, '8月3日销售额（元）': 100 }]);
+    const stores = section('performance-2', '店铺业绩排行', performanceFields, [{ 店铺: 'AEU', 在售SKU数量: 1, 库存总数: 5678, 占用资金: 67890, 销售额贡献占比: 1, 近7天日均订单: 3, '近7天日均销售额（元）': 100, '预估本月销售额（元）': 200, '8月3日销量': 3, '8月3日销售额（元）': 100 }]);
     window.history.replaceState({}, '', '/?page=department&month=2026-07');
     apiMocks.dashboard.mockResolvedValue({
       title: '部门监控',
@@ -228,6 +228,15 @@ describe('DashboardDecisionMatrix', () => {
     expect(screen.getByText('店铺业绩排行榜')).toBeInTheDocument();
     expect(screen.getByText('AEU')).toBeInTheDocument();
     expect(screen.getAllByText('在售SKU数量')).toHaveLength(3);
+    expect(screen.getAllByText('库存总数')).toHaveLength(3);
+    expect(screen.getAllByText('占用资金')).toHaveLength(3);
+    expect(screen.getAllByText('1,234')).toHaveLength(2);
+    expect(screen.getAllByText('1.23 万')).toHaveLength(2);
+    expect(screen.getByRole('img', { name: '开发员业绩排行全量数据概览图' })).toHaveAttribute(
+      'viewBox',
+      expect.stringMatching(/^0 0 1700 /),
+    );
+    expect(screen.getByRole('img', { name: '开发员业绩排行全量数据概览图' })).not.toHaveAttribute('style');
     expect(screen.queryByPlaceholderText('选择月份')).not.toBeInTheDocument();
     expect(container.querySelector('.dashboard-section-commission')?.parentElement).toHaveAttribute('hidden');
 
@@ -270,6 +279,17 @@ describe('DashboardDecisionMatrix', () => {
     expect(ratingTone('10(4.3)')).toBe('rating-good');
     expect(ratingTone('10(3.5)')).toBe('rating-warning');
     expect(ratingTone('10(3.4)')).toBe('rating-danger');
+    expect(ratingTone('0(0.0)')).toBe('rating-missing');
+    expect(ratingTone('0')).toBe('rating-missing');
+  });
+
+  it('uses the gray rating state when the review count is zero', () => {
+    const zeroRatingRow = { ...productRow, Rating: '0(0.0)' };
+    const product = section('detail', '产品管理明细', PRODUCT_MATRIX_FIELDS, [zeroRatingRow]);
+    render(<DashboardDecisionMatrix kind="product-detail" section={product} />);
+
+    expect(screen.getByText('0(0.0)')).toHaveClass('rating-missing');
+    expect(screen.getByText('0(0.0)')).not.toHaveClass('rating-danger');
   });
 
   it('uses server-side sorting and keeps the same export query', async () => {
