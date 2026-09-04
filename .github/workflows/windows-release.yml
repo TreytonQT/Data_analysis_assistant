@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: Release tag, for example v2.0.1
+        description: Release tag, for example v2.1.0
         required: true
-        default: v2.0.1
+        default: v2.1.0
 
 permissions:
   contents: write
@@ -20,7 +20,7 @@ jobs:
     timeout-minutes: 20
     env:
       APP_NAME: DataAnalysisAssistant
-      DEFAULT_RELEASE_TAG: v2.0.1
+      DEFAULT_RELEASE_TAG: v2.1.0
 
     steps:
       - name: Check out source
@@ -133,10 +133,11 @@ jobs:
 
           ## 本版本主要更新
 
-          - React + FastAPI 桌面端重建，替代原 Streamlit 界面
-          - 新增批次监控、部门监控和数据源更新频率分组
-          - 重构 ASIN 补货决策矩阵，支持四站点毛利、滚动 12 个月销量画像、SKU 明细和补货开关
-          - 增强滞销促销、产品管理、上传校验、分页排序与导出
+          - 新增多级导航、最近访问标签页和浏览器历史恢复
+          - 新增页面内重启/退出、独立桌面启动器与源码桌面快捷方式
+          - 新增部门考核监控，以及产品、滞销、补货矩阵的 SKU 图片预览
+          - 产品和滞销矩阵关联当前/最近促销信息，补货筛选与关闭流程进一步完善
+          - 统一上传、配置、促销、待办、复制和下载操作反馈，并强化报表数据安全校验
 
           完整更新记录见仓库中的 CHANGELOG.md。
           "@

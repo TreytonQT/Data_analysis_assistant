@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import calendar
+import io
 import tempfile
 import unittest
 from datetime import date
@@ -38,6 +39,20 @@ def monthly_csv(month: str, values: list[int], asin: str = " B001 ") -> bytes:
     return pd.DataFrame([row]).to_csv(index=False).encode("utf-8-sig")
 
 
+def monthly_csv_with_zero_asin_row(month: str) -> bytes:
+    """Build an export that includes a zero-sales SKU row without an ASIN."""
+    year, month_number = (int(part) for part in month.split("-"))
+    days = calendar.monthrange(year, month_number)[1]
+    frame = pd.read_csv(io.BytesIO(monthly_csv(month, [1] * days)), dtype=object)
+    zero_row = frame.iloc[0].copy()
+    zero_row["asin"] = ""
+    zero_row["msku"] = "M-ZERO"
+    zero_row["小计"] = "0"
+    for day in range(1, days + 1):
+        zero_row[f"{month_number:02d}-{day:02d}销量"] = "0"
+    return pd.concat([frame, pd.DataFrame([zero_row])], ignore_index=True).to_csv(index=False).encode("utf-8-sig")
+
+
 def upload_for(month: str, values: list[int] | None = None) -> FakeUpload:
     year, month_number = (int(part) for part in month.split("-"))
     days = calendar.monthrange(year, month_number)[1]
@@ -67,6 +82,27 @@ class SalesHistoryRollingTests(unittest.TestCase):
             self.assertEqual(evicted, ["2025-08"])
             self.assertNotIn("2025-08", load_sales_history_records(data_dir)["月份"].tolist())
             self.assertIn("2026-08", load_sales_history_records(data_dir)["月份"].tolist())
+
+    def test_zero_sales_row_without_asin_does_not_block_month_replacement(self):
+        months = [(2025, month) for month in range(8, 13)] + [(2026, month) for month in range(1, 8)]
+        with tempfile.TemporaryDirectory() as temp:
+            data_dir = Path(temp)
+            persist_uploaded_sales_history(
+                [upload_for(f"{year:04d}-{month:02d}") for year, month in months],
+                data_dir,
+                today=date(2026, 8, 6),
+            )
+            upload = FakeUpload(
+                "销量统计_2026-08-01 ~ 2026-08-31.csv",
+                monthly_csv_with_zero_asin_row("2026-08"),
+            )
+            results, evicted = persist_uploaded_sales_history([upload], data_dir, today=date(2026, 9, 1))
+            self.assertEqual(results[0].month, "2026-08")
+            self.assertFalse(results[0].replaced)
+            self.assertEqual(evicted, ["2025-08"])
+            records = load_sales_history_records(data_dir)
+            self.assertNotIn("2025-08", records["月份"].tolist())
+            self.assertIn("2026-08", records["月份"].tolist())
 
     def test_cross_month_zero_run_excludes_both_month_edges(self):
         months = [(2025, month) for month in range(8, 13)] + [(2026, month) for month in range(1, 8)]

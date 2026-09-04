@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import io
 import calendar
+import ipaddress
 import math
 import re
 import unicodedata
 from datetime import date, datetime
 from pathlib import Path
 from typing import Iterable
+from urllib.parse import urlparse
 
 import pandas as pd
 
@@ -31,6 +33,7 @@ REPLENISHMENT_COVERAGE_RULE_COLUMNS = [
 ]
 REPLENISHMENT_SWITCH_COLUMNS = ["ASIN", "是否补货", "关闭原因"]
 REPLENISHMENT_PRODUCT_TAG_COLUMNS = ["ASIN", "产品标签", "标签颜色", "是否启用", "备注"]
+SKU_IMAGE_MAP_COLUMNS = ["库存SKU", "虚拟SKU", "库存图片链接"]
 SALES_HISTORY_2025_SHEETS = [f"{month}月" for month in range(1, 13)]
 SALES_HISTORY_2025_COUNTRIES = {
     "德国": "DE",
@@ -155,6 +158,7 @@ PRODUCT_COUNTRIES = ["德国", "法国", "西班牙", "意大利"]
 PRODUCT_OPERATIONAL_REQUIRED_COLUMNS = [
     "ASIN",
     "MSKU",
+    "开发员",
     "可售",
     "可售天数",
     "日均销量",
@@ -444,6 +448,70 @@ def normalize_report(df: pd.DataFrame, *, today: date | None = None) -> pd.DataF
     return result
 
 
+DEPARTMENT_ASSESSMENT_REQUIRED_COLUMNS = ["销售专员", "月份", "店铺", "销售额--FBA销售额", "COD"]
+
+
+def build_department_assessment_report(
+    reports_df: pd.DataFrame,
+    month: str | None = None,
+) -> dict[str, object]:
+    """Aggregate one performance report month for the developer assessment view."""
+    missing = [column for column in DEPARTMENT_ASSESSMENT_REQUIRED_COLUMNS if column not in reports_df.columns]
+    if missing:
+        raise ValueError(f"业绩报表缺少考核所需列：{', '.join(missing)}")
+    try:
+        sales_columns = columns_between(reports_df, "销售额--FBA销售额", "COD")
+    except ValueError as exc:
+        raise ValueError(str(exc).replace("毛利原始表", "业绩报表")) from exc
+
+    normalized = normalize_report(reports_df)
+    available_months = sorted(
+        normalized["月份"].dropna().astype(str).str.strip().loc[lambda values: values.ne("")].unique().tolist()
+    )
+    if not available_months:
+        raise ValueError("业绩报表没有可用月份")
+    if month is not None and month not in available_months:
+        raise ValueError(f"业绩报表没有月份 {month} 的数据")
+    selected_month = month or available_months[-1]
+    data = normalized[normalized["月份"].astype(str).eq(selected_month)].copy()
+    if data.empty:
+        raise ValueError(f"业绩报表没有月份 {selected_month} 的数据")
+
+    data["_考核销售额"] = data[sales_columns].apply(normalize_config_number).fillna(0).sum(axis=1)
+    data["_开发员"] = data["销售专员"].map(normalize_department_person_name)
+    raw_developers = data["销售专员"].fillna("").astype(str).str.strip()
+    data["_开发员"] = data["_开发员"].where(data["_开发员"].astype(str).str.strip().ne(""), raw_developers)
+    data["_开发员"] = data["_开发员"].where(data["_开发员"].astype(str).str.strip().ne(""), "未分配开发员")
+    data["_店铺"] = data["店铺"].fillna("").astype(str).map(extract_store_code)
+    data["_本土"] = data["店铺"].fillna("").astype(str).str.contains("本土", regex=False)
+
+    developers: dict[str, dict[str, object]] = {}
+    for _, row in data.iterrows():
+        developer = str(row["_开发员"])
+        store = str(row["_店铺"] or "未识别")
+        sales = float(row["_考核销售额"] or 0)
+        bucket = developers.setdefault(
+            developer,
+            {"开发员": developer, "销售额": 0.0, "中企销售额": 0.0, "本土销售额": 0.0, "店铺明细": {}},
+        )
+        local = bool(row["_本土"])
+        bucket["销售额"] = float(bucket["销售额"]) + sales
+        bucket["本土销售额" if local else "中企销售额"] = float(bucket["本土销售额" if local else "中企销售额"]) + sales
+        stores = bucket["店铺明细"]
+        store_bucket = stores.setdefault(store, {"店铺": store, "销售额": 0.0, "中企销售额": 0.0, "本土销售额": 0.0})
+        store_bucket["销售额"] = float(store_bucket["销售额"]) + sales
+        store_bucket["本土销售额" if local else "中企销售额"] = float(store_bucket["本土销售额" if local else "中企销售额"]) + sales
+
+    rows = []
+    for developer, bucket in developers.items():
+        stores = list(bucket.pop("店铺明细").values())
+        stores.sort(key=lambda item: (-float(item["销售额"]), str(item["店铺"])))
+        bucket["店铺明细"] = stores
+        rows.append(bucket)
+    rows.sort(key=lambda item: (-float(item["销售额"]), str(item["开发员"])))
+    return {"months": available_months, "selected_month": selected_month, "rows": rows}
+
+
 def normalize_month(value, *, today: date | None = None) -> str | None:
     if pd.isna(value):
         return None
@@ -570,13 +638,13 @@ def ensure_operational_sales_normalized(df: pd.DataFrame) -> pd.DataFrame:
     return normalize_operational_sales(df)
 
 
-def count_chen_26_onsale_skus(df: pd.DataFrame) -> int:
+def count_26_onsale_skus(df: pd.DataFrame) -> int:
     data = ensure_operational_sales_normalized(df)
     if data.empty:
         return 0
-    developer = data["开发员"].fillna("").astype(str).str.strip()
+    is_26 = data["是否-26"].fillna(False).astype(bool)
     onsale = normalize_config_number(data["可售"]).fillna(0).gt(0)
-    matched = data.loc[developer.str.endswith("陈千潼-26") & onsale, "MSKU"].fillna("").astype(str).str.strip()
+    matched = data.loc[is_26 & onsale, "MSKU"].fillna("").astype(str).str.strip()
     return int(matched[matched.ne("")].nunique())
 
 
@@ -758,6 +826,10 @@ def normalize_operational_aging(df: pd.DataFrame) -> pd.DataFrame:
         raise ValueError(f"运营原始表缺少库龄列：{', '.join(missing)}")
 
     result = df[OPERATIONAL_AGING_REQUIRED_COLUMNS].copy()
+    if "日均销量" in df.columns:
+        result["日均销量"] = normalize_config_number(df["日均销量"])
+    else:
+        result["日均销量"] = pd.Series(float("nan"), index=result.index, dtype="float64")
     for col in ["MSKU", "开发员", "ASIN"]:
         result[col] = result[col].fillna("").astype(str).str.strip()
     for col in AGING_STOCK_COLUMNS + AGING_CAPITAL_COLUMNS:
@@ -771,12 +843,13 @@ def build_slow_moving_inventory_table(df: pd.DataFrame, discard_threshold: str =
 
     data = normalize_operational_aging(df)
     if data.empty:
-        return pd.DataFrame()
+        return pd.DataFrame(columns=slow_moving_inventory_columns())
 
     agg = {col: (col, "sum") for col in AGING_STOCK_COLUMNS + AGING_CAPITAL_COLUMNS}
     base = data.groupby("MSKU", dropna=False, as_index=False).agg(
         开发员=("开发员", lambda values: "；".join(sorted({str(value) for value in values if str(value).strip()}))),
         ASIN=("ASIN", lambda values: "；".join(sorted({str(value) for value in values if str(value).strip()}))),
+        日均销量=("日均销量", lambda values: values.sum(min_count=1)),
         **agg,
     )
 
@@ -822,6 +895,7 @@ def slow_moving_inventory_columns() -> list[str]:
         "SKU",
         "开发员",
         "ASIN",
+        "日均销量",
         "90天以上库存数合计",
         "90天以上占用资金合计",
         "库存计提",
@@ -1344,7 +1418,7 @@ def normalize_replenishment_operational(df: pd.DataFrame) -> pd.DataFrame:
     if missing:
         raise ValueError(f"运营原始表缺少补货管理列：{', '.join(missing)}")
 
-    optional_columns = AGING_STOCK_COLUMNS + ["备注"]
+    optional_columns = AGING_STOCK_COLUMNS + ["备注", "本地SKU"]
     base = df[
         REPLENISHMENT_OPERATIONAL_REQUIRED_COLUMNS
         + [column for column in optional_columns if column in df.columns]
@@ -1352,7 +1426,7 @@ def normalize_replenishment_operational(df: pd.DataFrame) -> pd.DataFrame:
     for column in optional_columns:
         if column not in base.columns:
             base[column] = pd.NA
-    for col in ["ASIN", "MSKU", "店铺名称", "开发员"]:
+    for col in ["ASIN", "MSKU", "本地SKU", "店铺名称", "开发员"]:
         base[col] = base[col].fillna("").astype(str).str.strip()
     base["ASIN"] = base["ASIN"].str.upper()
     base["备注"] = base["备注"].fillna("").astype(str).str.strip()
@@ -1362,6 +1436,128 @@ def normalize_replenishment_operational(df: pd.DataFrame) -> pd.DataFrame:
         base[col] = normalize_config_number(base[col])
     base["上架时间"] = normalize_replenishment_listing_dates(base["上架时间"])
     return base
+
+
+def normalize_sku_image_map(df: pd.DataFrame) -> pd.DataFrame:
+    """Validate and normalize the latest SKU-to-image master table."""
+
+    # Excel exports occasionally vary only the ASCII ``SKU`` casing (for
+    # example ``虚拟sku``). Match headers case-insensitively while preserving
+    # the canonical names in the normalized result.
+    header_matches: dict[str, str] = {}
+    duplicate_headers: list[str] = []
+    for column in df.columns:
+        normalized_header = str(column).strip().lower()
+        if normalized_header in {item.lower() for item in SKU_IMAGE_MAP_COLUMNS}:
+            if normalized_header in header_matches:
+                duplicate_headers.append(str(column))
+            else:
+                header_matches[normalized_header] = column
+    if duplicate_headers:
+        raise ValueError(f"SKU图片映射表包含重复列：{', '.join(duplicate_headers)}")
+    missing = [
+        column
+        for column in SKU_IMAGE_MAP_COLUMNS
+        if column.lower() not in header_matches
+    ]
+    if missing:
+        raise ValueError(f"SKU图片映射表缺少列：{', '.join(missing)}")
+
+    data = df[
+        [header_matches[column.lower()] for column in SKU_IMAGE_MAP_COLUMNS]
+    ].copy()
+    data.columns = SKU_IMAGE_MAP_COLUMNS
+    for column in SKU_IMAGE_MAP_COLUMNS:
+        data[column] = data[column].fillna("").astype(str).str.strip()
+
+    empty_key_rows = data[["库存SKU", "虚拟SKU"]].eq("").any(axis=1)
+    if empty_key_rows.any():
+        empty_positions = [
+            position + 2
+            for position, is_empty in enumerate(empty_key_rows.tolist())
+            if is_empty
+        ][:5]
+        examples = ", ".join(str(position) for position in empty_positions)
+        raise ValueError(f"SKU图片映射表的库存SKU或虚拟SKU存在空值，问题行：{examples}")
+
+    empty_url_rows = data["库存图片链接"].eq("")
+    empty_url_count = int(empty_url_rows.sum())
+    if empty_url_count:
+        # A blank image URL means the SKU currently has no image. Keep the
+        # row out of the mapping relation so it renders as the normal no-image
+        # placeholder, while allowing other valid rows in the same upload.
+        data = data.loc[~empty_url_rows].copy()
+
+    invalid_urls: list[str] = []
+    for position, value in enumerate(data["库存图片链接"].tolist()):
+        try:
+            parsed = urlparse(value)
+        except ValueError:
+            invalid_urls.append(str(position + 2))
+            if len(invalid_urls) >= 5:
+                break
+            continue
+        try:
+            hostname = parsed.hostname or ""
+        except ValueError:
+            hostname = ""
+        is_public_host = hostname.lower() not in {"localhost"}
+        try:
+            is_public_host = is_public_host and ipaddress.ip_address(hostname).is_global
+        except ValueError:
+            # Domain names are not resolved by the backend; the browser will
+            # access the anonymous HTTPS URL directly.
+            pass
+        if (
+            parsed.scheme.lower() != "https"
+            or not parsed.netloc
+            or not is_public_host
+            or any(character.isspace() for character in value)
+        ):
+            invalid_urls.append(str(position + 2))
+            if len(invalid_urls) >= 5:
+                break
+    if invalid_urls:
+        raise ValueError(
+            "库存图片链接必须是有效的公网 HTTPS URL，问题行："
+            + ", ".join(invalid_urls)
+        )
+
+    data["_库存SKU关联键"] = data["库存SKU"].str.upper()
+    data["_虚拟SKU关联键"] = data["虚拟SKU"].str.upper()
+    # Treat whitespace/case variants as the same logical row while retaining
+    # the first original value for display/export.
+    exact_duplicates = data.duplicated(
+        subset=["_库存SKU关联键", "_虚拟SKU关联键", "库存图片链接"],
+        keep="first",
+    )
+    data = data.loc[~exact_duplicates].copy()
+
+    pair_link_conflicts = data.groupby(
+        ["_库存SKU关联键", "_虚拟SKU关联键"]
+    )["库存图片链接"].nunique()
+    conflicting_pairs = pair_link_conflicts[pair_link_conflicts.gt(1)].index.tolist()
+    if conflicting_pairs:
+        examples = "、".join(f"{inventory}/{virtual}" for inventory, virtual in conflicting_pairs[:3])
+        raise ValueError(
+            "SKU图片映射表存在同一库存SKU和虚拟SKU对应多个图片链接；"
+            f"示例：{examples}"
+        )
+
+    inventory_conflicts = data.groupby("_库存SKU关联键")["_虚拟SKU关联键"].nunique()
+    virtual_conflicts = data.groupby("_虚拟SKU关联键")["_库存SKU关联键"].nunique()
+    conflicting_inventory = inventory_conflicts[inventory_conflicts.gt(1)].index.tolist()
+    conflicting_virtual = virtual_conflicts[virtual_conflicts.gt(1)].index.tolist()
+    if conflicting_inventory or conflicting_virtual:
+        examples = [*conflicting_inventory[:3], *conflicting_virtual[:3]]
+        raise ValueError(
+            "SKU图片映射表存在一对多关系，库存SKU和虚拟SKU必须双向唯一；"
+            f"示例：{'、'.join(examples)}"
+        )
+
+    normalized = data[SKU_IMAGE_MAP_COLUMNS].reset_index(drop=True)
+    normalized.attrs["empty_url_rows"] = empty_url_count
+    return normalized
 
 
 def normalize_replenishment_listing_dates(values: pd.Series) -> pd.Series:
@@ -1643,9 +1839,6 @@ def normalize_sales_history_month_source(df: pd.DataFrame, month: str) -> pd.Dat
 
     result = data.copy()
     result["asin"] = result["asin"].fillna("").astype(str).str.strip().str.upper()
-    if result["asin"].eq("").any():
-        row_number = int(result.index[result["asin"].eq("")][0]) + 2
-        raise ValueError(f"{month}销量历史第{row_number}行ASIN为空")
     numeric_columns = ["小计", *day_columns]
     for column in numeric_columns:
         original = result[column]
@@ -1663,6 +1856,20 @@ def normalize_sales_history_month_source(df: pd.DataFrame, month: str) -> pd.Dat
     if mismatch.any():
         row_number = int(result.index[mismatch][0]) + 2
         raise ValueError(f"{month}销量历史第{row_number}行小计与每日销量合计不一致")
+
+    # Some exports contain SKU rows that have no ASIN yet and no sales for the
+    # month. They are not usable in the ASIN-keyed history, but should not
+    # block an otherwise valid monthly upload. Keep rejecting blank-ASIN rows
+    # when they carry any sales so malformed data cannot be silently dropped.
+    empty_asin = result["asin"].eq("")
+    zero_sales = result["小计"].eq(0) & daily_total.eq(0)
+    invalid_empty_asin = empty_asin & ~zero_sales
+    if invalid_empty_asin.any():
+        row_number = int(result.index[invalid_empty_asin][0]) + 2
+        raise ValueError(f"{month}销量历史第{row_number}行ASIN为空")
+    result = result.loc[~(empty_asin & zero_sales)].copy()
+    if result.empty:
+        raise ValueError(f"{month}销量历史没有有效ASIN数据")
     return result
 
 
@@ -2191,6 +2398,7 @@ def build_replenishment_management_tables(
     sales_history_2025: pd.DataFrame | None = None,
     sales_history_rolling: pd.DataFrame | None = None,
     promotions: pd.DataFrame | None = None,
+    sku_image_map: pd.DataFrame | None = None,
     only_needed: bool = True,
     today: date | datetime | pd.Timestamp | None = None,
 ) -> dict[str, pd.DataFrame]:
@@ -2202,6 +2410,7 @@ def build_replenishment_management_tables(
     """
     del target_config
     operational = normalize_replenishment_operational(operational_df)
+    image_map = normalize_sku_image_map(sku_image_map) if sku_image_map is not None else pd.DataFrame(columns=SKU_IMAGE_MAP_COLUMNS)
     rules = normalize_replenishment_coverage_rules(coverage_rules)
     if rules.empty:
         rules = default_replenishment_coverage_rules()
@@ -2223,6 +2432,26 @@ def build_replenishment_management_tables(
         }
 
     data = operational.copy()
+    data["库存SKU"] = pd.NA
+    data["虚拟SKU"] = pd.NA
+    data["库存图片链接"] = pd.NA
+    if not image_map.empty:
+        data["_库存SKU关联键"] = data["本地SKU"].fillna("").astype(str).str.strip().str.upper()
+        data["_虚拟SKU关联键"] = data["MSKU"].fillna("").astype(str).str.strip().str.upper()
+        mapping = image_map.copy()
+        mapping["_库存SKU关联键"] = mapping["库存SKU"].str.upper()
+        mapping["_虚拟SKU关联键"] = mapping["虚拟SKU"].str.upper()
+        data = data.merge(
+            mapping[["_库存SKU关联键", "_虚拟SKU关联键", *SKU_IMAGE_MAP_COLUMNS]],
+            on=["_库存SKU关联键", "_虚拟SKU关联键"],
+            how="left",
+            sort=False,
+            validate="many_to_one",
+            suffixes=("", "_映射"),
+        )
+        for column in SKU_IMAGE_MAP_COLUMNS:
+            data[column] = data.pop(f"{column}_映射")
+        data = data.drop(columns=["_库存SKU关联键", "_虚拟SKU关联键"])
     data["补货组ID"] = data.apply(
         lambda row: str(row["ASIN"])
         if str(row["ASIN"]).strip()
@@ -2315,6 +2544,17 @@ def build_replenishment_management_tables(
         group_issues = [item for item in group["数据异常"].tolist() if item]
         original_index = group.sort_values(["上架时间", "MSKU"], kind="stable", na_position="last").index[0]
         group.loc[original_index, "SKU角色"] = "原SKU"
+        image_candidates = group[
+            group["库存图片链接"].fillna("").astype(str).str.strip().ne("")
+        ]
+        if original_index in image_candidates.index:
+            representative_image = image_candidates.loc[original_index]
+        elif not image_candidates.empty:
+            representative_image = image_candidates.sort_values(
+                ["上架时间", "MSKU"], kind="stable", na_position="last"
+            ).iloc[0]
+        else:
+            representative_image = None
         max_weight = group["单品重量(g)"].max(skipna=True)
         rule = pd.DataFrame()
         if not group_issues and pd.notna(max_weight):
@@ -2349,6 +2589,9 @@ def build_replenishment_management_tables(
                 "补货组ID": str(group_id), "ASIN": asin_values, "原SKU": str(group.loc[original_index, "MSKU"]),
                 "跟卖SKU": follower_skus, "SKU数量": int(group["MSKU"].nunique()), "店铺编码": join_operational_store_codes(group["店铺名称"]),
                 "店铺状态": join_store_statuses(group["店铺状态"]),
+                "库存SKU": representative_image.get("库存SKU") if representative_image is not None else pd.NA,
+                "虚拟SKU": representative_image.get("虚拟SKU") if representative_image is not None else pd.NA,
+                "库存图片链接": representative_image.get("库存图片链接") if representative_image is not None else pd.NA,
                 "开发员": join_non_empty_values(group["开发员"]), "最大重量(g)": max_weight,
                 "库存覆盖天数": coverage_days, "T值": trend, "校准日销量": calibrated,
                 "亚马逊可售": amazon_available, "总可售": inventory, "跟卖总可售": asin_reference_inventory,
@@ -2366,6 +2609,7 @@ def build_replenishment_management_tables(
             sku_rows.append(
                 {
                     "补货组ID": str(group_id), "ASIN": row["ASIN"], "SKU角色": row["SKU角色"], "MSKU": row["MSKU"],
+                    "库存SKU": row["库存SKU"], "库存图片链接": row["库存图片链接"],
                     "店铺名称": row["店铺名称"], "店铺状态": row["店铺状态"], "开发员": row["开发员"],
                     "上架时间": row["上架时间"], "上架天数": row["上架天数"],
                     "单品重量(g)": row["单品重量(g)"], "7天销量": row["7天销量"], "14天销量": row["14天销量"],
@@ -2523,7 +2767,7 @@ def build_replenishment_store_distribution(detail: pd.DataFrame) -> pd.DataFrame
 
 def replenishment_management_columns() -> list[str]:
     return [
-        "补货组ID", "ASIN", "原SKU", "跟卖SKU", "SKU数量", "店铺编码", "店铺状态", "开发员",
+        "补货组ID", "ASIN", "原SKU", "跟卖SKU", "SKU数量", "店铺编码", "店铺状态", "库存SKU", "虚拟SKU", "库存图片链接", "开发员",
         "最大重量(g)", "库存覆盖天数", "T值", "校准日销量", "亚马逊可售", "总可售",
         "跟卖总可售", "ASIN总库存", "库龄90天以上", "库龄180-365天", "库龄365天以上",
         "目标库存", "测算建议补货数量", "建议补货数量", "是否补货", "关闭原因",
@@ -2534,7 +2778,7 @@ def replenishment_management_columns() -> list[str]:
 
 def replenishment_sku_detail_columns() -> list[str]:
     return [
-        "补货组ID", "ASIN", "SKU角色", "MSKU", "店铺名称", "店铺状态", "开发员",
+        "补货组ID", "ASIN", "SKU角色", "MSKU", "库存SKU", "库存图片链接", "店铺名称", "店铺状态", "开发员",
         *[f"{country}毛利率" for country in PRODUCT_COUNTRIES],
         "上架时间", "上架天数", "单品重量(g)", "7天销量", "14天销量", "30天销量",
         "T值", "校准日销量", "SKU亚马逊可售", "SKU总库存", "库龄90天以上",
@@ -2560,20 +2804,24 @@ def normalize_product_operational(df: pd.DataFrame) -> pd.DataFrame:
         raise ValueError(f"运营原始表缺少产品管理列：{', '.join(missing)}")
 
     base = df[PRODUCT_OPERATIONAL_REQUIRED_COLUMNS].copy()
-    for col in ["ASIN", "MSKU"]:
+    for col in ["ASIN", "MSKU", "开发员"]:
         base[col] = base[col].fillna("").astype(str).str.strip()
     base = base[base["MSKU"].ne("")].copy()
     for col in PRODUCT_OPERATIONAL_REQUIRED_COLUMNS:
-        if col in {"ASIN", "MSKU"}:
+        if col in {"ASIN", "MSKU", "开发员"}:
             continue
         base[col] = normalize_config_number(base[col]).fillna(0)
     base = base.rename(columns={"MSKU": "SKU", "可售": "可售数量"})
     if base.empty:
-        return pd.DataFrame(columns=["ASIN", "SKU", "可售天数"] + PRODUCT_OPERATIONAL_SUM_COLUMNS)
+        return pd.DataFrame(
+            columns=["ASIN", "SKU", "开发员", "可售数量", "可售天数"]
+            + [col for col in PRODUCT_OPERATIONAL_SUM_COLUMNS if col != "可售数量"]
+        )
 
     grouped = (
         base.groupby(["ASIN", "SKU"], dropna=False, sort=False)
         .agg(
+            开发员=("开发员", join_non_empty_values),
             可售数量=("可售数量", "sum"),
             可售天数=("可售天数", "first"),
             日均销量=("日均销量", "sum"),
@@ -2589,7 +2837,10 @@ def normalize_product_operational(df: pd.DataFrame) -> pd.DataFrame:
         )
         .reset_index()
     )
-    return grouped[["ASIN", "SKU", "可售数量", "可售天数"] + [col for col in PRODUCT_OPERATIONAL_SUM_COLUMNS if col != "可售数量"]]
+    return grouped[
+        ["ASIN", "SKU", "开发员", "可售数量", "可售天数"]
+        + [col for col in PRODUCT_OPERATIONAL_SUM_COLUMNS if col != "可售数量"]
+    ]
 
 
 def normalize_gross_profit_source(df: pd.DataFrame) -> pd.DataFrame:
@@ -2855,6 +3106,7 @@ def product_management_columns() -> list[str]:
     return [
         "SKU",
         "ASIN",
+        "开发员",
         "可售数量",
         "可售天数",
         "日均销量",
@@ -2961,7 +3213,11 @@ def normalize_config_number(series: pd.Series, percent_to_decimal: bool = False)
 
 
 def normalized_numeric_text(series: pd.Series) -> pd.Series:
-    return series.map(clean_numeric_text)
+    # ``Series.map`` can infer an integer/boolean dtype when all normalized
+    # values happen to be numbers (with missing values).  The callers below
+    # use pandas' string accessors, so keep the normalized representation on a
+    # StringDtype series regardless of the source column dtype.
+    return series.map(clean_numeric_text).astype("string")
 
 
 def clean_numeric_text(value) -> str | None:

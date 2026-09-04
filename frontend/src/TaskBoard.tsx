@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import dayjs, { Dayjs } from 'dayjs';
-import { Alert, Badge, Button, Card, DatePicker, Form, Input, Modal, Select, Space, Spin, Tag, Typography, Upload, message } from 'antd';
+import { Alert, Badge, Button, Card, DatePicker, Form, Input, Modal, Select, Space, Spin, Tag, Typography, Upload } from 'antd';
+import { feedbackMessage as message, downloadWithFeedback } from './feedback';
 import { HolderOutlined, PlusOutlined, ReloadOutlined } from '@ant-design/icons';
 import type { UploadProps } from 'antd';
 import { api, type Status, type Task, type TaskInput } from './api';
@@ -79,7 +80,7 @@ function TaskModal({ task, open, onClose, onSaved }: { task?: Task; open: boolea
       } else {
         await api.createTask(payload);
       }
-      message.success('任务已保存');
+      message.success(task ? `任务“${task.title}”已更新` : `任务“${values.title}”已创建`);
       onSaved();
       clearAndClose();
     } catch (error) {
@@ -99,9 +100,9 @@ export default function TaskBoard({ active, onTasksChanged }: { active: boolean;
   const [tasks, setTasks] = useState<Task[]>([]); const [search, setSearch] = useState(''); const [loading, setLoading] = useState(false); const [loadError, setLoadError] = useState(''); const [modal, setModal] = useState<{ open: boolean; task?: Task }>({ open: false }); const [deleteCandidate, setDeleteCandidate] = useState<Task>(); const [deleting, setDeleting] = useState(false); const [draggedTask, setDraggedTask] = useState<Task>(); const [dropTarget, setDropTarget] = useState<string>();
   const draggedTaskRef = useRef<Task | undefined>(undefined);
   const pointerDropRef = useRef<{ status: Status; beforeId: string | null } | undefined>(undefined);
-  const refresh = useCallback(async (showLoading = false) => { if (!active) return; if (showLoading) setLoading(true); try { const rows = await api.tasks(search); setTasks(rows); setLoadError(''); await onTasksChanged(); } catch (error) { const detail = error instanceof Error ? error.message : '加载任务失败'; setLoadError(detail); if (!showLoading) message.error(detail); } finally { if (showLoading) setLoading(false); } }, [active, onTasksChanged, search]);
+  const refresh = useCallback(async (showLoading = false) => { if (!active) return false; if (showLoading) setLoading(true); try { const rows = await api.tasks(search); setTasks(rows); setLoadError(''); await onTasksChanged(); return true; } catch (error) { const detail = error instanceof Error ? error.message : '加载任务失败'; setLoadError(detail); if (!showLoading) message.error(detail); return false; } finally { if (showLoading) setLoading(false); } }, [active, onTasksChanged, search]);
   useEffect(() => { if (!active) return undefined; void refresh(true); const timer = window.setInterval(() => { void refresh(); }, 60000); return () => clearInterval(timer); }, [active, refresh]);
-  const move = async (task: Task, status: Status) => { try { await api.transition(task.id, status); await refresh(); } catch { message.error('状态更新失败'); } };
+  const move = async (task: Task, status: Status) => { const operationKey = `task-status-${task.id}`; try { await api.transition(task.id, status); const refreshed = await refresh(); message.success({ key: operationKey, content: `任务“${task.title}”已${statusMeta[status].label}` }); if (refreshed === false) message.warning({ key: operationKey, content: `任务“${task.title}”已更新，但列表刷新失败`, duration: 6 }); } catch (error) { const detail = error instanceof Error ? error.message : '状态更新失败'; message.error({ key: operationKey, content: `任务“${task.title}”状态更新失败：${detail}`, duration: 6 }); } };
   const dropTask = async (status: Status, beforeId: string | null) => {
     const original = draggedTaskRef.current;
     if (!original || original.id === beforeId) return;
@@ -111,7 +112,7 @@ export default function TaskBoard({ active, onTasksChanged }: { active: boolean;
       if (original.status !== status) await api.transition(original.id, status);
       await api.moveTask(original.id, status, beforeId);
       await refresh();
-    } catch (error) { message.error(error instanceof Error ? error.message : '调整顺序失败'); await refresh(); }
+    } catch (error) { const detail = error instanceof Error ? error.message : '调整顺序失败'; message.error(`任务“${original.title}”调整顺序失败：${detail}`); await refresh(); }
   };
   const cardDropPosition = (status: Status, hoveredId: string, after: boolean) => {
     const original = draggedTaskRef.current;
@@ -156,11 +157,11 @@ export default function TaskBoard({ active, onTasksChanged }: { active: boolean;
     if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
     pointerDropRef.current = undefined; draggedTaskRef.current = undefined; setDraggedTask(undefined); setDropTarget(undefined);
   };
-  const confirmDelete = async () => { if (!deleteCandidate) return; setDeleting(true); try { await api.deleteTask(deleteCandidate.id); await refresh(); setDeleteCandidate(undefined); } catch (error) { message.error(error instanceof Error ? error.message : '删除失败'); } finally { setDeleting(false); } };
+  const confirmDelete = async () => { if (!deleteCandidate) return; const title = deleteCandidate.title; const operationKey = `task-delete-${deleteCandidate.id}`; setDeleting(true); try { await api.deleteTask(deleteCandidate.id); const refreshed = await refresh(); setDeleteCandidate(undefined); message.success({ key: operationKey, content: `任务“${title}”已删除` }); if (refreshed === false) message.warning({ key: operationKey, content: `任务“${title}”已删除，但列表刷新失败`, duration: 6 }); } catch (error) { message.error({ key: operationKey, content: error instanceof Error ? error.message : `任务“${title}”删除失败`, duration: 6 }); } finally { setDeleting(false); } };
   const actions = (task: Task) => <Space wrap size={4}><Button size="small" onClick={() => setModal({ open: true, task })}>编辑</Button>{task.status === 'current' && <Button size="small" onClick={() => move(task, 'in_progress')}>开始</Button>}{task.status === 'snoozed' && <Button size="small" onClick={() => move(task, 'current')}>恢复</Button>}{task.status !== 'completed' && <Button size="small" type="primary" onClick={() => move(task, 'completed')}>完成</Button>}{task.status !== 'snoozed' && task.status !== 'completed' && <Button size="small" onClick={() => move(task, 'snoozed')}>搁置</Button>}{task.status === 'completed' && <Button size="small" onClick={() => move(task, 'current')}>重开</Button>}<Button size="small" danger onClick={() => setDeleteCandidate(task)}>删除</Button></Space>;
-  const importer: UploadProps = { accept: '.json', showUploadList: false, beforeUpload: async file => { try { const text = await file.text(); const parsed = JSON.parse(text); const payload = Array.isArray(parsed) ? parsed : parsed.tasks; if (!Array.isArray(payload)) throw new Error('JSON 文件必须是任务数组'); await api.importTasks(payload.map(({ id, created_at, updated_at, is_overdue, ...task }) => task)); message.success(`已导入 ${payload.length} 项任务`); await refresh(); } catch (error) { message.error(error instanceof Error ? error.message : '导入失败'); } return false; } };
+  const importer: UploadProps = { accept: '.json', showUploadList: false, beforeUpload: async file => { try { const text = await file.text(); const parsed = JSON.parse(text); const payload = Array.isArray(parsed) ? parsed : parsed.tasks; if (!Array.isArray(payload)) throw new Error('JSON 文件必须是任务数组'); await api.importTasks(payload.map(({ id, created_at, updated_at, is_overdue, ...task }) => task)); message.success({ key: 'task-import', content: `已导入 ${payload.length} 项任务` }); const refreshed = await refresh(); if (refreshed === false) message.warning({ key: 'task-import', content: `已导入 ${payload.length} 项任务，但列表刷新失败`, duration: 6 }); } catch (error) { message.error(error instanceof Error ? error.message : '导入失败'); } return false; } };
   return <>
-    <div className="task-drawer-toolbar"><div><Typography.Text strong>全部待办</Typography.Text><Typography.Text type="secondary">集中管理工作任务、重复计划与提醒</Typography.Text></div><Space wrap className="task-drawer-actions"><Input.Search placeholder="搜索任务或备注" allowClear onSearch={setSearch} style={{ width: 280 }} /><Button icon={<ReloadOutlined />} onClick={() => void refresh(true)}>刷新</Button><Button href="/api/tasks/export.csv">导出 CSV</Button><Upload {...importer}><Button>导入 JSON</Button></Upload><Button type="primary" icon={<PlusOutlined />} onClick={() => setModal({ open: true })}>新增任务</Button></Space></div>
+    <div className="task-drawer-toolbar"><div><Typography.Text strong>全部待办</Typography.Text><Typography.Text type="secondary">集中管理工作任务、重复计划与提醒</Typography.Text></div><Space wrap className="task-drawer-actions"><Input.Search placeholder="搜索任务或备注" allowClear onSearch={setSearch} style={{ width: 280 }} /><Button icon={<ReloadOutlined />} onClick={() => void (async () => { const refreshed = await refresh(true); if (refreshed !== false) message.success('待办列表已刷新'); else message.error('待办列表刷新失败'); })()}>刷新</Button><Button href="/api/tasks/export.csv" onClick={event => { event.preventDefault(); void downloadWithFeedback('/api/tasks/export.csv', 'tasks.csv', '待办 CSV'); }}>导出 CSV</Button><Upload {...importer}><Button>导入 JSON</Button></Upload><Button type="primary" icon={<PlusOutlined />} onClick={() => setModal({ open: true })}>新增任务</Button></Space></div>
     {loadError && <Alert className="task-load-error" type="error" showIcon message="待办加载失败" description={loadError} action={<Button size="small" onClick={() => void refresh(true)}>重新加载</Button>} />}
     <Spin spinning={loading} wrapperClassName="task-board-spinner"><div className="task-board">{(Object.keys(statusMeta) as Status[]).map(status => {
       const rows = tasks.filter(task => task.status === status);

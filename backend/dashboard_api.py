@@ -22,6 +22,7 @@ from dashboard.data_processing import (
     SALES_HISTORY_2025_SITE_COLUMNS,
     build_alerts,
     build_department_performance_tables,
+    build_department_assessment_report,
     build_low_margin_product_table,
     build_person_commission_summary,
     build_product_management_table,
@@ -30,7 +31,7 @@ from dashboard.data_processing import (
     build_sales_dashboard_tables,
     build_slow_moving_inventory_table,
     compute_metric_table,
-    count_chen_26_onsale_skus,
+    count_26_onsale_skus,
     duplicate_row_issues,
     exclude_stopped_store_operational_rows,
     load_business_config,
@@ -46,6 +47,7 @@ from dashboard.data_processing import (
     normalize_replenishment_coverage_rules,
     normalize_replenishment_product_tags,
     normalize_replenishment_switches,
+    normalize_sku_image_map,
     normalize_store_config,
     normalize_sales_amount_detail,
     normalize_sales_volume_detail,
@@ -59,6 +61,7 @@ from dashboard.parquet_cache import (
     load_or_build_parquet,
     revision_digest,
 )
+from dashboard.promotions import normalize_promotion_sku
 from dashboard.report_store import (
     DATA_DIR,
     get_latest_source_path,
@@ -100,8 +103,9 @@ def _format_metadata(name: str, configured: str | None = None) -> dict[str, Any]
         token in name
         for token in ("销售额", "营业额", "毛利润", "广告费", "成本", "货值", "提成", "计提", "弃置费", "占用资金", "金额")
     )
-    integer = configured in {"整数", "integer"} or any(
-        token in name for token in ("数量", "库存数", "订单", "销量", "产品数", "SKU数", "ASIN数", "在售个数")
+    integer = configured in {"整数", "integer"} or (
+        configured not in {"数值", "number"}
+        and any(token in name for token in ("数量", "库存数", "订单", "销量", "产品数", "SKU数", "ASIN数", "在售个数", "折扣"))
     )
     if percent:
         return {"type": "percent", "format": "percent", "unit": "%", "precision": 2}
@@ -166,6 +170,8 @@ def section(
     formats: dict[str, str] | None = None,
     summary_mode: str | None = None,
     row_serializer: Callable[[pd.DataFrame], list[dict[str, Any]]] | None = None,
+    rows_serializer: Callable[[pd.DataFrame], list[dict[str, Any]]] | None = None,
+    export_frame_serializer: Callable[[pd.DataFrame], pd.DataFrame] | None = None,
 ) -> dict[str, Any]:
     frame = frame.reset_index(drop=True)
     columns = column_definitions(frame, formats)
@@ -174,6 +180,10 @@ def section(
         result["summary_mode"] = summary_mode
     if row_serializer:
         result["row_serializer"] = row_serializer
+    if rows_serializer:
+        result["rows_serializer"] = rows_serializer
+    if export_frame_serializer:
+        result["export_frame_serializer"] = export_frame_serializer
     return result
 
 
@@ -237,6 +247,127 @@ def load_source_frame(key: str, title: str) -> pd.DataFrame:
     return load_or_build_parquet(f"source-{key}-raw", [path], loader)
 
 
+def _optional_sku_image_map() -> pd.DataFrame:
+    """Load the optional SKU image map without making dashboard pages depend on it."""
+
+    path = get_latest_source_path("sku_image_map")
+    if not path:
+        return pd.DataFrame(columns=["库存SKU", "虚拟SKU", "库存图片链接"])
+    try:
+        return normalize_sku_image_map(load_source_frame("sku_image_map", "SKU图片映射表"))
+    except (OSError, TypeError, ValueError):
+        # The mapping is an optional presentation enhancement. A stale or
+        # malformed legacy file must not make the business matrices fail.
+        return pd.DataFrame(columns=["库存SKU", "虚拟SKU", "库存图片链接"])
+
+
+def _sku_image_lookup(operational: pd.DataFrame, image_map: pd.DataFrame) -> dict[str, dict[str, str]]:
+    """Build a virtual-SKU lookup only for exact operational SKU pairs."""
+
+    required = {"本地SKU", "MSKU"}
+    if image_map.empty or not required.issubset(operational.columns):
+        return {}
+
+    operational_keys = operational[["本地SKU", "MSKU"]].copy()
+    for column in operational_keys.columns:
+        operational_keys[column] = operational_keys[column].map(
+            lambda value: "" if value is None or pd.isna(value) else str(value).strip()
+        )
+    operational_keys["_库存SKU关联键"] = operational_keys["本地SKU"].str.upper()
+    operational_keys["_虚拟SKU关联键"] = operational_keys["MSKU"].str.upper()
+    operational_keys = operational_keys[
+        operational_keys["_库存SKU关联键"].ne("")
+        & operational_keys["_虚拟SKU关联键"].ne("")
+    ].drop_duplicates(["_库存SKU关联键", "_虚拟SKU关联键"])
+    if operational_keys.empty:
+        return {}
+
+    mapping = image_map.copy()
+    mapping["_库存SKU关联键"] = mapping["库存SKU"].str.strip().str.upper()
+    mapping["_虚拟SKU关联键"] = mapping["虚拟SKU"].str.strip().str.upper()
+    matched = mapping.merge(
+        operational_keys[["_库存SKU关联键", "_虚拟SKU关联键"]],
+        on=["_库存SKU关联键", "_虚拟SKU关联键"],
+        how="inner",
+        validate="one_to_one",
+    )
+    return {
+        str(row["_虚拟SKU关联键"]): {
+            "url": str(row["库存图片链接"]),
+            "inventory_sku": str(row["库存SKU"]),
+            "virtual_sku": str(row["虚拟SKU"]),
+        }
+        for _, row in matched.iterrows()
+    }
+
+
+def _rows_with_sku_images(
+    image_lookup: dict[str, dict[str, str]],
+    sku_column: str = "SKU",
+) -> Callable[[pd.DataFrame], list[dict[str, Any]]]:
+    """Create a section row serializer that adds a non-column image field."""
+
+    def serialize(frame: pd.DataFrame) -> list[dict[str, Any]]:
+        result = records(frame)
+        for row in result:
+            value = row.get(sku_column)
+            key = "" if value is None or pd.isna(value) else str(value).strip().upper()
+            image = image_lookup.get(key)
+            row["image"] = dict(image) if image else None
+        return result
+
+    return serialize
+
+
+def _slow_moving_csv_frame(
+    image_lookup: dict[str, dict[str, str]],
+) -> Callable[[pd.DataFrame], pd.DataFrame]:
+    """Flatten the slow-moving matrix identity and image fields for CSV export."""
+
+    identity = [
+        "SKU",
+        "ASIN",
+        "开发员",
+        "最近促销开始日期",
+        "最近促销截止日期",
+        "最近促销折扣",
+        "库存图片链接",
+        "库存SKU",
+        "虚拟SKU",
+    ]
+    overview = ["日均销量", "90天以上库存数合计", "90天以上占用资金合计", "库存计提", "弃置费"]
+    stock = ["91-180天库存数", "181-330天库存数", "331-365天库存数", "366-455天库存数", "456天以上库存数"]
+    capital = ["91-180天占用资金", "181-330天占用资金", "331-365天占用资金", "366-455天占用资金", "456天占用资金"]
+    ordered = identity + overview + stock + capital
+    amount_renames = {
+        "90天以上占用资金合计": "90天以上占用资金合计（元）",
+        "库存计提": "库存计提（元）",
+        "弃置费": "弃置费（元）",
+        **{column: f"{column}（元）" for column in capital},
+        "最近促销折扣": "最近促销折扣（%）",
+        "日均销量": "日均销量（件/天）",
+    }
+
+    def image_value(value: object, field: str) -> object:
+        if value is None or pd.isna(value):
+            return None
+        key = str(value).strip().upper()
+        return image_lookup.get(key, {}).get(field)
+
+    def serialize(frame: pd.DataFrame) -> pd.DataFrame:
+        result = frame.copy()
+        if "日均销量" not in result.columns:
+            result["日均销量"] = pd.NA
+        result["库存图片链接"] = result["SKU"].map(lambda value: image_value(value, "url"))
+        result["库存SKU"] = result["SKU"].map(lambda value: image_value(value, "inventory_sku"))
+        result["虚拟SKU"] = result["SKU"].map(lambda value: image_value(value, "virtual_sku"))
+        columns = [column for column in ordered if column in result.columns]
+        columns.extend(column for column in result.columns if column not in columns)
+        return result[columns].rename(columns=amount_renames)
+
+    return serialize
+
+
 def warm_source_cache(source_key: str) -> None:
     titles = {
         "operational_sales": "运营原始表",
@@ -245,6 +376,7 @@ def warm_source_cache(source_key: str) -> None:
         "sales_volume_detail": "销量明细",
         "sales_amount_detail": "销售额明细",
         "sales_history_rolling": "往月销量原始表",
+        "sku_image_map": "SKU图片映射表",
     }
     title = titles.get(source_key)
     if title:
@@ -413,7 +545,7 @@ def _build_sales(developers: str | None) -> dict[str, Any]:
     stores, source = tables["stores"], tables["source"]
     metrics = [] if stores.empty else [
         metric("在售个数", stores["在售个数"].sum(), "integer"),
-        metric("-26在售", count_chen_26_onsale_skus(source), "integer"),
+        metric("-26在售", count_26_onsale_skus(source), "integer"),
         metric("昨日订单", stores["昨日订单"].sum(), "integer"),
         metric("-26订单", stores["-26订单"].sum(), "integer"),
         metric("7天日均", stores["7天日均"].sum()),
@@ -453,7 +585,9 @@ def _build_slow_moving(developers: str | None, threshold: str) -> dict[str, Any]
     chosen = selected_values(developers, options)
     if options:
         operational = operational[operational["开发员"].astype(str).isin(chosen)].copy()
+    image_lookup = _sku_image_lookup(operational, _optional_sku_image_map())
     detail = build_slow_moving_inventory_table(operational, threshold)
+    detail = merge_slow_moving_promotion_data(detail, _last_promotion_rows())
     metrics = [] if detail.empty else [
         metric("滞销SKU数", len(detail), "integer"),
         metric("90天以上库存数", detail["90天以上库存数合计"].sum(), "integer"),
@@ -470,8 +604,74 @@ def _build_slow_moving(developers: str | None, threshold: str) -> dict[str, Any]
         "has_data": not detail.empty,
         "message": "当前筛选条件下没有对应库龄库存" if detail.empty else None,
         "metrics": metrics,
-        "sections": [section("detail", "滞销 SKU 明细", detail)],
+        "sections": [
+            section(
+                "detail",
+                "滞销 SKU 明细",
+                detail,
+                formats={"日均销量": "数值"},
+                rows_serializer=_rows_with_sku_images(image_lookup),
+                export_frame_serializer=_slow_moving_csv_frame(image_lookup),
+            )
+        ],
     }
+
+
+SLOW_MOVING_PROMOTION_COLUMNS = [
+    "最近促销开始日期",
+    "最近促销截止日期",
+    "最近促销折扣",
+]
+
+
+def merge_slow_moving_promotion_data(
+    detail: pd.DataFrame,
+    promotions: pd.DataFrame,
+) -> pd.DataFrame:
+    """Attach durable last-promotion snapshots without changing slow-SKU rows."""
+
+    result = detail.copy()
+    result["_slow_moving_row_order"] = range(len(result))
+    result["_promotion_sku"] = (
+        result["SKU"].map(normalize_promotion_sku)
+        if "SKU" in result.columns
+        else ""
+    )
+    result = result.drop(columns=SLOW_MOVING_PROMOTION_COLUMNS, errors="ignore")
+
+    source = promotions.copy()
+    source_columns = {
+        "最近促销开始日期": "start_date",
+        "最近促销截止日期": "end_date",
+        "最近促销折扣": "discount_percent",
+    }
+    if "sku" not in source.columns:
+        source["sku"] = pd.NA
+    for target, source_column in source_columns.items():
+        if source_column in source.columns:
+            source[target] = source[source_column]
+        elif target not in source.columns:
+            source[target] = pd.NA
+    source["_promotion_sku"] = source["sku"].map(normalize_promotion_sku)
+    source = source[source["_promotion_sku"].ne("")].drop_duplicates(
+        "_promotion_sku", keep="first"
+    )
+    for column in ["最近促销开始日期", "最近促销截止日期"]:
+        parsed = pd.to_datetime(source[column], errors="coerce")
+        source[column] = parsed.dt.strftime("%Y-%m-%d").where(parsed.notna(), pd.NA)
+    source["最近促销折扣"] = pd.to_numeric(
+        source["最近促销折扣"], errors="coerce"
+    ).astype("Int64")
+
+    result = result.merge(
+        source[["_promotion_sku", *SLOW_MOVING_PROMOTION_COLUMNS]],
+        on="_promotion_sku",
+        how="left",
+        sort=False,
+        validate="many_to_one",
+    )
+    result = result.sort_values("_slow_moving_row_order", kind="stable")
+    return result.drop(columns=["_slow_moving_row_order", "_promotion_sku"]).reset_index(drop=True)
 
 
 def _product_launch_rows() -> pd.DataFrame:
@@ -560,7 +760,7 @@ def merge_product_launch_data(
     result = result.sort_values("_launch_row_order", kind="stable")
     result = result.drop(columns=["_launch_row_order", "_launch_sku"])
 
-    preferred = ["SKU", "ASIN", "Rating", "开售时间", "开售天数"]
+    preferred = ["SKU", "ASIN", "Rating", "促销折扣", "开发员", "开售时间", "开售天数"]
     ordered = [column for column in preferred if column in result.columns]
     used = set(ordered)
     price_by_sales = {
@@ -576,6 +776,71 @@ def merge_product_launch_data(
             ordered.append(column)
             used.add(column)
     return result[ordered].reset_index(drop=True)
+
+
+def _active_product_promotion_rows(
+    reference_date: date | datetime | pd.Timestamp | None = None,
+) -> pd.DataFrame:
+    """Load current promotion discounts without allowing promotion data to break products."""
+
+    columns = ["SKU", "促销折扣"]
+    reference = (
+        pd.Timestamp(reference_date).date()
+        if reference_date is not None
+        else datetime.now(LOCAL_TIMEZONE).date()
+    ).isoformat()
+    try:
+        with connect() as conn:
+            rows = conn.execute(
+                """SELECT sku, discount_percent
+                FROM sku_promotions
+                WHERE start_date <= ? AND (end_date IS NULL OR end_date >= ?)
+                ORDER BY updated_at DESC, start_date DESC, id DESC""",
+                (reference, reference),
+            ).fetchall()
+    except Exception:
+        return pd.DataFrame(columns=columns)
+
+    if not rows:
+        return pd.DataFrame(columns=columns)
+    promotions = pd.DataFrame([dict(row) for row in rows]).rename(
+        columns={"sku": "SKU", "discount_percent": "促销折扣"}
+    )
+    promotions["SKU"] = promotions["SKU"].map(normalize_promotion_sku)
+    promotions = promotions[promotions["SKU"].ne("")].copy()
+    promotions["促销折扣"] = pd.to_numeric(promotions["促销折扣"], errors="coerce").astype("Int64")
+    return promotions.drop_duplicates("SKU", keep="first")[columns].reset_index(drop=True)
+
+
+def merge_product_promotion_data(detail: pd.DataFrame, promotions: pd.DataFrame) -> pd.DataFrame:
+    """Attach active promotion discounts without changing product row cardinality or order."""
+
+    result = detail.copy()
+    result["_product_row_order"] = range(len(result))
+    result["_promotion_sku"] = (
+        result["SKU"].map(normalize_promotion_sku)
+        if "SKU" in result.columns
+        else ""
+    )
+
+    source = promotions.copy()
+    for column in ["SKU", "促销折扣"]:
+        if column not in source.columns:
+            source[column] = pd.NA
+    source["SKU"] = source["SKU"].map(normalize_promotion_sku)
+    source = source[source["SKU"].ne("")].drop_duplicates("SKU", keep="first")
+    source["促销折扣"] = pd.to_numeric(source["促销折扣"], errors="coerce").astype("Int64")
+
+    result = result.merge(
+        source[["SKU", "促销折扣"]].rename(columns={"SKU": "_promotion_sku"}),
+        on="_promotion_sku",
+        how="left",
+        sort=False,
+        validate="many_to_one",
+    )
+    result = result.sort_values("_product_row_order", kind="stable")
+    result = result.drop(columns=["_product_row_order", "_promotion_sku"])
+    return result.reset_index(drop=True)
 
 
 def _batch_monitor_updated_timestamp() -> float:
@@ -597,9 +862,13 @@ def _build_products(developers: str | None) -> dict[str, Any]:
     chosen = selected_values(developers, options)
     if options:
         operational = operational[operational["开发员"].fillna("").astype(str).str.strip().isin(chosen)].copy()
+    image_lookup = _sku_image_lookup(operational, _optional_sku_image_map())
     operational_skus = _normalized_sku_set(operational, "MSKU")
     detail = merge_product_launch_data(
-        product_management_display_table(build_product_management_table(operational, gross, rating)),
+        merge_product_promotion_data(
+            product_management_display_table(build_product_management_table(operational, gross, rating)),
+            _active_product_promotion_rows(),
+        ),
         _product_launch_rows(),
     )
     low = build_low_margin_product_table(
@@ -619,7 +888,12 @@ def _build_products(developers: str | None) -> dict[str, Any]:
         "has_data": not detail.empty,
         "metrics": metrics,
         "sections": [
-            section("low-margin", "低毛利率 SKU", low),
+            section(
+                "low-margin",
+                "低毛利率 SKU",
+                low,
+                rows_serializer=_rows_with_sku_images(image_lookup),
+            ),
             section(
                 "detail",
                 "产品管理明细",
@@ -631,6 +905,7 @@ def _build_products(developers: str | None) -> dict[str, Any]:
                         for column in PRODUCT_LAUNCH_PRICE_COLUMNS.values()
                     },
                 },
+                rows_serializer=_rows_with_sku_images(image_lookup),
             ),
         ],
         "_updated_at": _batch_monitor_updated_timestamp(),
@@ -691,6 +966,20 @@ def _build_department(month: str | None) -> dict[str, Any]:
     return payload
 
 
+def _build_department_assessment(month: str | None) -> dict[str, Any]:
+    report_data = build_department_assessment_report(load_performance_reports(), month)
+    report_paths = _report_paths(load_upload_records())
+    updated_at = max((path.stat().st_mtime for path in report_paths), default=0)
+    return {
+        "title": "考核监控",
+        "months": report_data["months"],
+        "selected_month": report_data["selected_month"],
+        "rows": report_data["rows"],
+        "updated_at": updated_at,
+        "has_data": bool(report_data["rows"]),
+    }
+
+
 def _read_optional_replenishment_config(name: str, normalizer) -> pd.DataFrame:
     path = CONFIG_DIR / f"{name}.csv"
     return normalizer(read_local_table(path)) if path.exists() else normalizer(pd.DataFrame())
@@ -711,7 +1000,7 @@ def _last_promotion_rows() -> pd.DataFrame:
 
 def _replenishment_base_paths() -> list[Path]:
     paths: list[Path] = []
-    for key in ("operational_sales", "gross_profit", "rating"):
+    for key in ("operational_sales", "gross_profit", "rating", "sku_image_map"):
         path = get_latest_source_path(key)
         if path:
             paths.append(path)
@@ -734,6 +1023,7 @@ def _cached_replenishment_base_tables(revision: str) -> dict[str, pd.DataFrame]:
     operational = load_source_frame("operational_sales", "运营原始表")
     gross = load_source_frame("gross_profit", "毛利原始表") if get_latest_source_path("gross_profit") else pd.DataFrame()
     rating = load_source_frame("rating", "Rating") if get_latest_source_path("rating") else pd.DataFrame()
+    image_map = load_source_frame("sku_image_map", "SKU图片映射表") if get_latest_source_path("sku_image_map") else pd.DataFrame()
     history_paths = get_sales_history_paths()
     history = load_source_frame("sales_history_rolling", "往月销量原始表") if history_paths else pd.DataFrame()
     tables = build_replenishment_management_tables(
@@ -745,6 +1035,7 @@ def _cached_replenishment_base_tables(revision: str) -> dict[str, pd.DataFrame]:
         store_config=_read_optional_replenishment_config("store_config", normalize_store_config),
         sales_history_rolling=history if history_paths else None,
         promotions=_last_promotion_rows(),
+        sku_image_map=normalize_sku_image_map(image_map) if not image_map.empty else None,
         only_needed=False,
     )
     tables["history_source"] = "rolling" if history_paths else None
@@ -899,6 +1190,22 @@ def _replenishment_group_rows(frame: pd.DataFrame, history_source: str | None = 
             if review_count is not None or rating_score is not None
             else None
         )
+        def _text_value(value: object) -> str:
+            if value is None or pd.isna(value):
+                return ""
+            return str(value).strip()
+
+        image_url = _text_value(row.get("库存图片链接"))
+        image = None
+        if image_url:
+            virtual_sku = _text_value(row.get("虚拟SKU"))
+            original_sku = _text_value(row.get("原SKU"))
+            image = {
+                "url": image_url,
+                "inventory_sku": _text_value(row.get("库存SKU")),
+                "virtual_sku": virtual_sku,
+                "source_role": "original" if virtual_sku.upper() == original_sku.upper() else "follower",
+            }
         promotion = None
         if any(row.get(column) is not None for column in ("最近促销开始日期", "最近促销截止日期", "最近促销折扣")):
             promotion = {
@@ -911,6 +1218,7 @@ def _replenishment_group_rows(frame: pd.DataFrame, history_source: str | None = 
                 "group_id": str(row.get("补货组ID") or ""),
                 "identity": {
                     "asin": str(row.get("ASIN") or ""),
+                    "image": image,
                     "original_sku": str(row.get("原SKU") or ""),
                     "follower_skus": _split_compact(row.get("跟卖SKU")),
                     "sku_count": int(row.get("SKU数量") or 0),
@@ -1010,7 +1318,7 @@ def _revision_paths() -> list[Path]:
         paths.append(index_path)
     upload_records = load_upload_records()
     paths.extend(_report_paths(upload_records))
-    for key in ("operational_sales", "gross_profit", "rating", "sales_volume_detail", "sales_amount_detail"):
+    for key in ("operational_sales", "gross_profit", "rating", "sales_volume_detail", "sales_amount_detail", "sku_image_map"):
         path = get_latest_source_path(key)
         if path:
             paths.append(path)
@@ -1032,7 +1340,16 @@ def dashboard_revision() -> str:
 def _page_revision(page_name: str) -> str:
     base_revision = dashboard_revision()
     if page_name == "products":
-        return f"{base_revision}:{batch_monitor_revision()}"
+        # Import lazily because backend.promotions imports dashboard_api for source loading.
+        from backend.promotions import promotion_revision
+
+        return f"{base_revision}:{batch_monitor_revision()}:{promotion_revision()}"
+    if page_name == "slow-moving":
+        # Promotion snapshots are part of the slow-moving identity, but batch
+        # monitor changes do not affect this page.
+        from backend.promotions import promotion_revision
+
+        return f"{base_revision}:{promotion_revision()}"
     return base_revision
 
 
@@ -1225,11 +1542,12 @@ def _serialized_section(
     total = len(filtered)
     start = (page - 1) * page_size
     visible = filtered.iloc[start : start + page_size]
+    rows_serializer = model.get("rows_serializer")
     result = {
         "key": model["key"],
         "title": model["title"],
         "columns": model["columns"],
-        "rows": records(visible),
+        "rows": rows_serializer(visible) if rows_serializer else records(visible),
         "chart": model["chart"],
         "page": page,
         "page_size": page_size,
@@ -1306,6 +1624,16 @@ def products(developers: str | None = None):
 @router.get("/department")
 def department(month: str | None = None):
     return _dashboard_response("department", month=month)
+
+
+@router.get("/department/assessment")
+def department_assessment(month: str | None = None):
+    try:
+        return _build_department_assessment(month)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(422, f"考核监控计算失败：{exc}") from exc
 
 
 @router.get("/replenishment")
@@ -1497,6 +1825,9 @@ def export_dashboard_section(
         )
         model = _section_model(bundle, section_key)
         frame = _query_frame(model["frame"], search, sort_by, sort_order, model.get("columns"))
+        export_frame_serializer = model.get("export_frame_serializer")
+        if export_frame_serializer:
+            frame = export_frame_serializer(frame)
         filename = quote(f"{model['title']}.csv")
         return StreamingResponse(
             _csv_chunks(frame),

@@ -23,3 +23,4 @@ def _configured_path(variable: str, default: Path) -> Path:
 DATA_DIR = _configured_path("DATA_ANALYSIS_ASSISTANT_DATA_DIR", APP_ROOT / "data")
 CONFIG_DIR = _configured_path("DATA_ANALYSIS_ASSISTANT_CONFIG_DIR", APP_ROOT / "configs")
 FRONTEND_DIST = RESOURCE_ROOT / "frontend" / "dist"
+RUNTIME_DIR = APP_ROOT / ".tmp"

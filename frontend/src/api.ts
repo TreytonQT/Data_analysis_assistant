@@ -28,11 +28,26 @@ export interface DashboardChart {
   x: string;
   series: DashboardChartSeries[];
 }
+export interface DashboardImage {
+  url: string;
+  inventory_sku: string;
+  virtual_sku: string;
+}
+export interface SystemStatus {
+  control_available: boolean;
+  instance_id: string;
+  pending_action: 'restart' | 'shutdown' | null;
+}
+export interface SystemActionResult extends SystemStatus {
+  ok: boolean;
+  action: 'restart' | 'shutdown';
+}
+export type DashboardRow = Record<string, unknown> & { image?: DashboardImage | null };
 export interface DashboardSection {
   key: string;
   title: string;
   columns: DashboardColumn[];
-  rows: Record<string, unknown>[];
+  rows: DashboardRow[];
   chart?: DashboardChart | null;
   page?: number;
   page_size?: number;
@@ -41,6 +56,28 @@ export interface DashboardSection {
   server_managed?: boolean;
   summary?: Record<string, unknown> | null;
   group_rows?: ReplenishmentGroupRow[];
+}
+export interface DepartmentAssessmentStore {
+  店铺: string;
+  销售额: number;
+  中企销售额: number;
+  本土销售额: number;
+}
+export interface DepartmentAssessmentDeveloper {
+  开发员: string;
+  销售额: number;
+  中企销售额: number;
+  本土销售额: number;
+  店铺明细: DepartmentAssessmentStore[];
+}
+export interface DepartmentAssessmentPayload {
+  title: string;
+  months: string[];
+  selected_month: string;
+  rows: DepartmentAssessmentDeveloper[];
+  updated_at?: number | string | null;
+  has_data: boolean;
+  message?: string | null;
 }
 export interface ReplenishmentTag { label: string; color?: string }
 export interface ReplenishmentCountryMetric { units: number | null; margin: number | null; reasons: string[] }
@@ -66,6 +103,9 @@ export interface ReplenishmentGroupRow {
   group_id: string;
   identity: {
     asin: string;
+    image: (DashboardImage & {
+      source_role: 'original' | 'follower';
+    }) | null;
     original_sku: string;
     follower_skus: string[];
     sku_count: number;
@@ -337,6 +377,8 @@ async function requestForm<T>(url: string, body: FormData): Promise<T> {
   return response.json();
 }
 
+const systemControlHeaders = { 'X-Dashboard-Control': 'sales-dashboard' };
+
 function queryString(params?: Record<string, string | number | undefined>) {
   if (!params) return '';
   const query = new URLSearchParams();
@@ -410,6 +452,9 @@ function normalizeDashboardPayload(payload: DashboardPayload): DashboardPayload 
   };
 }
 export const api = {
+  systemStatus: () => request<SystemStatus>('/api/system/status', { headers: systemControlHeaders }),
+  restartSystem: () => request<SystemActionResult>('/api/system/restart', { method: 'POST', headers: systemControlHeaders }),
+  shutdownSystem: () => request<SystemActionResult>('/api/system/shutdown', { method: 'POST', headers: systemControlHeaders }),
   tasks: (search = '') => request<Task[]>(`/api/tasks${search ? `?search=${encodeURIComponent(search)}` : ''}`),
   createTask: (payload: TaskInput) => request<Task>('/api/tasks', { method: 'POST', body: JSON.stringify(payload) }),
   updateTask: (id: string, payload: TaskInput) => request<Task>(`/api/tasks/${id}`, { method: 'PUT', body: JSON.stringify(payload) }),
@@ -426,6 +471,10 @@ export const api = {
   dashboardSection: async (page: string, section: string, params?: Record<string, string>, signal?: AbortSignal) => {
     const query = params ? `?${new URLSearchParams(params).toString()}` : '';
     return normalizeDashboardSection(await request<DashboardSection>(`/api/dashboard/${encodeURIComponent(page)}/sections/${encodeURIComponent(section)}${query}`, { signal }));
+  },
+  departmentAssessment: async (month?: string, signal?: AbortSignal) => {
+    const query = month ? `?month=${encodeURIComponent(month)}` : '';
+    return request<DepartmentAssessmentPayload>(`/api/dashboard/department/assessment${query}`, { signal });
   },
   replenishmentGroupDetails: (groupId: string) => request<ReplenishmentGroupDetails>(`/api/dashboard/replenishment/groups/${encodeURIComponent(groupId)}/details`),
   updateReplenishmentSwitch: (asin: string, isReplenishment: boolean, closeReason: string) =>

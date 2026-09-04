@@ -28,6 +28,7 @@ from dashboard.data_processing import (
     normalize_product_operational,
     normalize_rating_source,
     normalize_replenishment_operational,
+    normalize_sku_image_map,
     normalize_sales_amount_detail,
     normalize_sales_volume_detail,
     read_csv_bytes,
@@ -83,12 +84,17 @@ def _validate_gross(frame: pd.DataFrame) -> pd.DataFrame:
     return normalized
 
 
+def _validate_sku_image_map(frame: pd.DataFrame) -> pd.DataFrame:
+    return normalize_sku_image_map(frame)
+
+
 SOURCE_DEFINITIONS: dict[str, tuple[str, Callable[[pd.DataFrame], pd.DataFrame]]] = {
     "operational_sales": ("运营原始表", _validate_operational),
     "gross_profit": ("毛利原始表", _validate_gross),
     "rating": ("Rating", normalize_rating_source),
     "sales_volume_detail": ("销量明细", normalize_sales_volume_detail),
     "sales_amount_detail": ("销售额明细", normalize_sales_amount_detail),
+    "sku_image_map": ("SKU图片映射表", _validate_sku_image_map),
 }
 
 
@@ -117,6 +123,8 @@ def _validate_table_limits(frame: pd.DataFrame, title: str) -> None:
 
 
 def _numeric_columns(source_key: str, frame: pd.DataFrame) -> list[str]:
+    if source_key == "sku_image_map":
+        return []
     if source_key == "operational_sales":
         candidates = set(
             OPERATIONAL_SALES_NUMERIC_COLUMNS
@@ -168,6 +176,37 @@ def _raise_bad_numbers(issues: list[dict]) -> None:
                 "examples": issues,
             },
         )
+
+
+def _sku_image_map_unmatched_warning(frame: pd.DataFrame) -> str | None:
+    """Report map rows absent from the current operational source without blocking upload."""
+
+    def warning(count: int, indices: list[int], reason: str = "") -> str:
+        examples = "、".join(str(row) for row in indices[:5])
+        return f"{reason}有 {count} 行图片映射未匹配当前运营原始表，示例行：{examples}；已保存但相关矩阵不会展示"
+
+    operational_path = get_latest_source_path("operational_sales")
+    if not operational_path:
+        return warning(len(frame), list(range(2, len(frame) + 2))) if not frame.empty else None
+    try:
+        operational = read_local_table(operational_path)
+    except (OSError, ValueError, TypeError):
+        return warning(len(frame), list(range(2, len(frame) + 2)), "当前运营原始表无法读取；") if not frame.empty else None
+    if not {"本地SKU", "MSKU"}.issubset(operational.columns):
+        return warning(len(frame), list(range(2, len(frame) + 2)), "当前运营原始表缺少本地SKU或MSKU；") if not frame.empty else None
+
+    current_keys = {
+        (str(row["本地SKU"]).strip().upper(), str(row["MSKU"]).strip().upper())
+        for _, row in operational[["本地SKU", "MSKU"]].fillna("").iterrows()
+    }
+    missing = [
+        position + 2
+        for position, (_, row) in enumerate(frame.iterrows())
+        if (row["库存SKU"].upper(), row["虚拟SKU"].upper()) not in current_keys
+    ]
+    if not missing:
+        return None
+    return warning(len(missing), missing) if missing else None
 
 
 def _duplicate_upload_warning(source_key: str, issues: list[dict]) -> tuple[int, str | None]:
@@ -316,21 +355,36 @@ async def upload_source(source_key: str, file: Annotated[UploadFile, File(...)])
         normalized = validator(raw)
         duplicate_count = 0
         duplicate_warning = None
+        source_warnings: list[str] = []
         if source_key in {"sales_volume_detail", "sales_amount_detail"}:
             duplicate_count, duplicate_warning = _duplicate_upload_warning(
                 source_key, duplicate_row_issues(normalized)
             )
+        elif source_key == "sku_image_map":
+            empty_url_count = int(normalized.attrs.get("empty_url_rows", 0))
+            duplicate_count = len(raw) - len(normalized) - empty_url_count
+            if duplicate_count:
+                duplicate_warning = f"检测到 {duplicate_count} 条完全重复图片映射，已合并为唯一映射"
+            if empty_url_count:
+                source_warnings.append(
+                    f"检测到 {empty_url_count} 行库存图片链接为空，已跳过；这些记录将在补货页显示无图片"
+                )
+            unmatched_warning = _sku_image_map_unmatched_warning(normalized)
+            if unmatched_warning:
+                source_warnings.append(unmatched_warning)
         path = persist_latest_source(upload, source_key, title)
         _invalidate_dashboard_cache()
         _warm_source_cache(source_key)
+        warnings = [warning for warning in [duplicate_warning, *source_warnings] if warning]
+        effective_rows = len(normalized) if source_key == "sku_image_map" else len(normalized) - duplicate_count
         return {
             "source": source_key,
             "file": path.name,
             "rows": len(raw),
-            "effective_rows": len(normalized) - duplicate_count,
+            "effective_rows": effective_rows,
             "duplicate_rows_ignored": duplicate_count,
             "columns": len(raw.columns),
-            "warnings": [duplicate_warning] if duplicate_warning else [],
+            "warnings": warnings,
         }
     except HTTPException:
         raise
@@ -348,6 +402,8 @@ def preview_source(source_key: str, limit: int = 50):
         from backend.dashboard_api import load_source_frame
 
         frame = load_source_frame(source_key, title)
+        if source_key == "sku_image_map":
+            frame = normalize_sku_image_map(frame)
         bounded_limit = min(max(limit, 1), 200)
         return {
             "title": title,
@@ -374,8 +430,19 @@ def delete_source(source_key: str):
     source_or_404(source_key)
     path = get_latest_source_path(source_key)
     index = latest_source_index_path(source_key)
-    if path and path.exists():
-        path.unlink()
+    # Remove every allowed variant so a stale file cannot be selected by the
+    # legacy fallback in get_latest_source_path after the index is deleted.
+    source_dir = DATA_DIR / "sources"
+    paths = {
+        candidate
+        for suffix in (".xlsx", ".xls", ".csv")
+        for candidate in [source_dir / f"{source_key}{suffix}"]
+    }
+    if path:
+        paths.add(path)
+    for candidate in paths:
+        if candidate.exists():
+            candidate.unlink()
     if index.exists():
         index.unlink()
     _invalidate_dashboard_cache()

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Alert, Button, Card, Input, Popconfirm, Select, Space, Spin, Table, Tabs, Tag, Typography, Upload, message } from 'antd';
+import { Alert, Button, Card, Input, Popconfirm, Select, Space, Spin, Table, Tag, Typography, Upload } from 'antd';
+import { feedbackMessage as message, downloadWithFeedback } from './feedback';
 import { DeleteOutlined, DownloadOutlined, PlusOutlined, ReloadOutlined, SaveOutlined, UploadOutlined } from '@ant-design/icons';
 import type { UploadProps } from 'antd';
 import { api, apiErrorMessage, type ConfigData } from './api';
@@ -49,15 +50,21 @@ function cellEditor(
   return <Input disabled={disabled} value={String(value ?? '')} onChange={event => update(rowId, column, event.target.value)} />;
 }
 
-export default function ConfigCenter({ active: pageActive = true, refreshVersion = 0 }: { active?: boolean; refreshVersion?: number }) {
+export function configTabFromSearch(search: string) {
+  const value = new URLSearchParams(search).get('config_tab');
+  return value || 'metrics_config';
+}
+
+export default function ConfigCenter({ active: pageActive = true, routeVersion = 0, refreshVersion = 0 }: { active?: boolean; routeVersion?: number; refreshVersion?: number }) {
   const [configs, setConfigs] = useState<EditableConfig[]>([]);
-  const [active, setActive] = useState('metrics_config');
+  const [active, setActive] = useState(() => configTabFromSearch(window.location.search));
   const [saving, setSaving] = useState('');
   const [dirty, setDirty] = useState<Set<string>>(new Set());
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [lastUpdated, setLastUpdated] = useState('');
   const seenRefreshVersion = useRef(refreshVersion);
+  const seenRouteVersion = useRef(routeVersion);
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -68,12 +75,19 @@ export default function ConfigCenter({ active: pageActive = true, refreshVersion
       setDirty(new Set());
       setActive(current => result.configs.some(item => item.name === current) ? current : result.configs[0]?.name || '');
       setLastUpdated(latestConfigTime(result.configs));
+      return true;
     } catch (loadError) {
       setError(loadError instanceof Error ? loadError.message : '读取配置失败');
+      return false;
     } finally {
       setLoading(false);
     }
   }, []);
+  const manualRefresh = async () => {
+    const refreshed = await refresh();
+    if (refreshed) message.success('配置数据已刷新');
+    else message.error('配置数据刷新失败');
+  };
 
   useEffect(() => { void refresh(); }, [refresh]);
   useEffect(() => {
@@ -81,6 +95,16 @@ export default function ConfigCenter({ active: pageActive = true, refreshVersion
     seenRefreshVersion.current = refreshVersion;
     void refresh();
   }, [pageActive, refresh, refreshVersion]);
+  useEffect(() => {
+    if (!pageActive || seenRouteVersion.current === routeVersion) return;
+    seenRouteVersion.current = routeVersion;
+    setActive(configTabFromSearch(window.location.search));
+  }, [pageActive, routeVersion]);
+  useEffect(() => {
+    const onPopState = () => { if (pageActive) setActive(configTabFromSearch(window.location.search)); };
+    window.addEventListener('popstate', onPopState);
+    return () => window.removeEventListener('popstate', onPopState);
+  }, [pageActive]);
 
   const markDirty = (name: string) => setDirty(current => {
     const next = new Set(current); next.add(name); return next;
@@ -103,16 +127,20 @@ export default function ConfigCenter({ active: pageActive = true, refreshVersion
   };
   const save = async (config: EditableConfig) => {
     if (saving) return;
+    const operationKey = `config-save-${config.name}`;
     setSaving(config.name);
     setError('');
+    message.loading({ key: operationKey, content: `正在校验并保存${config.title}…`, duration: 0 });
     try {
       const result = await api.saveConfig(config.name, serializableRows(config.rows));
       setConfigs(current => current.map(item => item.name === config.name ? { ...item, rows: attachRowIds(result.rows, config.rows) } : item));
       clearDirty(config.name);
       setLastUpdated(result.updated_at ? new Date(result.updated_at).toLocaleString('zh-CN', { hour12: false }) : new Date().toLocaleString('zh-CN', { hour12: false }));
-      message.success(`${config.title}已校验并保存`);
+      message.success({ key: operationKey, content: `${config.title}已校验并保存` });
     } catch (saveError) {
-      setError(saveError instanceof Error ? saveError.message : '保存失败');
+      const detail = saveError instanceof Error ? saveError.message : '保存失败';
+      setError(detail);
+      message.error({ key: operationKey, content: `${config.title}保存失败：${detail}`, duration: 6 });
     } finally {
       setSaving('');
     }
@@ -121,8 +149,10 @@ export default function ConfigCenter({ active: pageActive = true, refreshVersion
     accept: '.csv,.xlsx', showUploadList: false, disabled: Boolean(saving),
     beforeUpload: async file => {
       if (saving) return false;
+      const operationKey = `config-import-${config.name}`;
       setSaving(config.name);
       setError('');
+      message.loading({ key: operationKey, content: `正在导入并校验${config.title}…`, duration: 0 });
       try {
         const body = new FormData(); body.append('file', file);
         const response = await fetch(`/api/config/${config.name}/upload`, { method: 'POST', body });
@@ -131,9 +161,11 @@ export default function ConfigCenter({ active: pageActive = true, refreshVersion
         setConfigs(current => current.map(item => item.name === config.name ? { ...item, rows: attachRowIds(result.rows) } : item));
         clearDirty(config.name);
         setLastUpdated(result.updated_at ? new Date(result.updated_at).toLocaleString('zh-CN', { hour12: false }) : new Date().toLocaleString('zh-CN', { hour12: false }));
-        message.success(`${config.title}已导入并保存`);
+        message.success({ key: operationKey, content: `${config.title}已导入并保存` });
       } catch (importError) {
-        setError(importError instanceof Error ? importError.message : '导入失败');
+        const detail = importError instanceof Error ? importError.message : '导入失败';
+        setError(detail);
+        message.error({ key: operationKey, content: `${config.title}导入失败：${detail}`, duration: 6 });
       } finally {
         setSaving('');
       }
@@ -153,7 +185,7 @@ export default function ConfigCenter({ active: pageActive = true, refreshVersion
         <Space wrap className="config-actions">
           <Button disabled={locked || Boolean(saving)} icon={<PlusOutlined />} onClick={() => addRow(config)}>新增一行</Button>
           <Upload {...importer(config)}><Button disabled={locked || Boolean(saving)} loading={locked} icon={<UploadOutlined />}>导入 CSV/XLSX</Button></Upload>
-          <Button disabled={Boolean(saving)} icon={<DownloadOutlined />} href={`/api/config/${config.name}/download`}>下载当前 CSV</Button>
+          <Button disabled={Boolean(saving)} icon={<DownloadOutlined />} href={`/api/config/${config.name}/download`} onClick={event => { event.preventDefault(); void downloadWithFeedback(`/api/config/${config.name}/download`, `${config.name}.csv`, `${config.title}配置`); }}>下载当前 CSV</Button>
           <Button type="primary" disabled={!changed || Boolean(saving && !locked)} loading={locked} icon={<SaveOutlined />} onClick={() => void save(config)}>校验并保存</Button>
           {changed && <Typography.Text type="warning">当前修改仅保存在浏览器，校验通过后才会写入文件。</Typography.Text>}
         </Space>
@@ -176,13 +208,13 @@ export default function ConfigCenter({ active: pageActive = true, refreshVersion
     };
   }), [configs, dirty, saving]);
 
-  const reloadButton = <Button disabled={loading || Boolean(saving)} loading={loading} icon={<ReloadOutlined />} onClick={() => { if (!hasDirty) void refresh(); }}>重新载入</Button>;
+  const reloadButton = <Button disabled={loading || Boolean(saving)} loading={loading} icon={<ReloadOutlined />} onClick={() => { if (!hasDirty) void manualRefresh(); }}>重新载入</Button>;
   return <>
     <div className="page-heading">
       <div><Typography.Title level={2}>配置中心</Typography.Title><Typography.Text type="secondary">所有配置均在保存前校验字段、数值和业务规则；库存覆盖规则会校验重量区间完整且不重叠。{lastUpdated && ` · 数据更新时间 ${lastUpdated}`}</Typography.Text></div>
       {hasDirty ? <Popconfirm title="放弃全部未保存修改并重新载入吗？" onConfirm={() => void refresh()}>{reloadButton}</Popconfirm> : reloadButton}
     </div>
-    {error && <Alert className="persistent-page-error" type="error" showIcon message="配置操作失败" description={error} action={hasDirty ? <Button size="small" onClick={() => setError('')}>保留本地修改</Button> : <Button size="small" onClick={() => void refresh()}>重新加载</Button>} />}
-    <Spin spinning={loading} tip="正在读取配置…"><div className="page-loading-min-height"><Tabs activeKey={active} onChange={setActive} items={items} tabPosition="top" /></div></Spin>
+    {error && <Alert className="persistent-page-error" type="error" showIcon message="配置操作失败" description={error} action={hasDirty ? <Button size="small" onClick={() => setError('')}>保留本地修改</Button> : <Button size="small" onClick={() => void manualRefresh()}>重新加载</Button>} />}
+    <Spin spinning={loading} tip="正在读取配置…"><div className="page-loading-min-height">{items.find(item => item.key === active)?.children}</div></Spin>
   </>;
 }

@@ -12,10 +12,11 @@ from backend.promotions import router as promotions_router
 from backend.batch_monitor import router as batch_monitor_router
 from backend.app_revisions import router as app_revisions_router
 from backend.reports_api import router as reports_router
+from backend.system_api import router as system_router
 from backend.tasks import router as tasks_router
 from app_paths import FRONTEND_DIST
 
-app = FastAPI(title="销售数据看板 API", version="2.0.1")
+app = FastAPI(title="销售数据看板 API", version="2.1.0")
 app.add_middleware(GZipMiddleware, minimum_size=500, compresslevel=6)
 app.include_router(tasks_router)
 app.include_router(reports_router)
@@ -24,6 +25,7 @@ app.include_router(dashboard_router)
 app.include_router(promotions_router)
 app.include_router(batch_monitor_router)
 app.include_router(app_revisions_router)
+app.include_router(system_router)
 # Keep embedded runners and test clients usable even when they do not emit a lifespan event.
 initialize_database()
 

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Alert, Button, Card, Empty, Input, Modal, Pagination, Select, Space, Spin, Statistic, Tag, Tooltip, Typography, message } from 'antd';
+import { Alert, Button, Card, Empty, Input, Modal, Pagination, Select, Space, Spin, Statistic, Tag, Tooltip, Typography } from 'antd';
+import { feedbackMessage as message, downloadWithFeedback } from './feedback';
 import { DownOutlined, DownloadOutlined, ReloadOutlined, RightOutlined, SearchOutlined } from '@ant-design/icons';
 import {
   api,
@@ -10,6 +11,7 @@ import {
   type ReplenishmentGroupRow,
   type ReplenishmentTag,
 } from './api';
+import SkuImagePreview from './SkuImagePreview';
 
 const COUNTRY_ORDER = ['DE', 'FR', 'ES', 'IT'] as const;
 const COUNTRY_NAMES: Record<typeof COUNTRY_ORDER[number], string> = {
@@ -38,7 +40,6 @@ const MIN_QTY_OPTIONS = [
   { value: 100, label: '≥100' },
   { value: 200, label: '≥200' },
 ];
-
 type Row = Record<string, unknown>;
 
 function display(value: unknown, precision = 2) {
@@ -284,6 +285,13 @@ export function DecisionBoardRow({
         <button className="replenishment-expand-button" aria-label={`${expanded ? '收起' : '展开'}${row.identity.asin}明细`} onClick={onToggle}>
           {expanded ? <DownOutlined /> : <RightOutlined />}
         </button>
+        <SkuImagePreview
+          image={row.identity.image}
+          className="replenishment-asin-image"
+          placeholderClassName="replenishment-asin-image-placeholder"
+          alt={`${row.identity.asin}库存图片`}
+          placeholderLabel={`${row.identity.asin}暂无图片`}
+        />
         <div className="replenishment-identity-content">
           <div className="replenishment-asin-line">
             <strong>{row.identity.asin || 'ASIN缺失'}</strong>
@@ -463,8 +471,10 @@ export default function ReplenishmentPage({ active = true, routeVersion = 0, ref
       setSearch('');
       setAppliedSearch('');
       setSort('建议补货数量:desc');
+      return true;
     } catch (loadError) {
       if (current === requestId.current) setError(loadError instanceof Error ? loadError.message : '读取补货管理失败');
+      return false;
     } finally {
       if (current === requestId.current) setLoading(false);
     }
@@ -498,8 +508,10 @@ export default function ReplenishmentPage({ active = true, routeVersion = 0, ref
       setSection(next);
       setAppliedSearch(nextSearch.trim());
       setExpanded(new Set());
+      return true;
     } catch (pageError) {
       setError(pageError instanceof Error ? pageError.message : '读取补货分页失败');
+      return false;
     } finally {
       setQueryLoading(false);
     }
@@ -536,6 +548,7 @@ export default function ReplenishmentPage({ active = true, routeVersion = 0, ref
   const confirmDisable = async () => {
     if (!switchTarget || !switchReason.trim() || switchSavingAsin) return;
     const asin = switchTarget.identity.asin;
+    const operationKey = `disable-${asin}`;
     const groupId = switchTarget.group_id;
     const officialQuantity = Math.max(0, Number(switchTarget.recommendation.official_quantity) || 0);
     const removesPositive = officialQuantity > 0;
@@ -577,12 +590,15 @@ export default function ReplenishmentPage({ active = true, routeVersion = 0, ref
       });
       setSwitchTarget(undefined);
       setSwitchReason('');
-      message.success(`${asin}已设为不补货并移出矩阵`);
+      message.success({ key: operationKey, content: `${asin}已设为不补货并移出矩阵` });
       if (shouldLoadPreviousPage) {
-        await loadSection({ page: currentPage - 1, pageSize });
+        const refreshed = await loadSection({ page: currentPage - 1, pageSize });
+        if (refreshed === false) message.warning({ key: operationKey, content: `${asin}已设为不补货，但页面刷新失败`, duration: 6 });
       }
     } catch (switchError) {
-      setError(switchError instanceof Error ? switchError.message : '保存补货开关失败');
+      const detail = switchError instanceof Error ? switchError.message : '保存补货开关失败';
+      setError(detail);
+      message.error(`${asin}设为不补货失败：${detail}`);
     } finally {
       setSwitchSavingAsin('');
     }
@@ -596,7 +612,7 @@ export default function ReplenishmentPage({ active = true, routeVersion = 0, ref
   return <>
     <div className="page-heading replenishment-page-heading">
       <div><Typography.Title level={2}>补货管理</Typography.Title><Typography.Text type="secondary">ASIN主行汇总所有SKU销量与库存；建议补货数量无需横向滑动即可查看。</Typography.Text></div>
-      <Space><Button icon={<DownloadOutlined />} href={exportHref}>导出Excel</Button><Button icon={<ReloadOutlined />} loading={loading} onClick={() => void load()}>刷新</Button></Space>
+      <Space><Button icon={<DownloadOutlined />} href={exportHref} onClick={event => { event.preventDefault(); void downloadWithFeedback(exportHref, '补货建议.xlsx', '补货建议'); }}>导出Excel</Button><Button icon={<ReloadOutlined />} loading={loading} onClick={() => void (async () => { const refreshed = await load(); if (refreshed) message.success('补货数据已刷新'); else message.error('补货数据刷新失败'); })()}>刷新</Button></Space>
     </div>
     {error && <Alert className="persistent-page-error" type="error" showIcon message="补货管理读取失败" description={error} action={<Button size="small" onClick={() => void load()}>重试</Button>} />}
     <Card className="filter-card replenishment-filter-card">

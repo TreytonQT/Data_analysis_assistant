@@ -15,11 +15,11 @@ import {
   Space,
   Statistic,
   Table,
-  Tag,
   Tabs,
+  Tag,
   Typography,
-  message,
 } from 'antd';
+import { feedbackMessage as message, copyWithFeedback, downloadWithFeedback, writeClipboardText } from './feedback';
 import {
   CopyOutlined,
   DeleteOutlined,
@@ -100,17 +100,7 @@ export function skuCopyText(skus: string[]) {
 }
 
 export async function writeClipboard(text: string) {
-  if (!text) throw new Error('没有可复制的 SKU');
-  if (navigator.clipboard?.writeText) {
-    try { await navigator.clipboard.writeText(text); return; }
-    catch { /* 使用本地旧版浏览器的同步复制能力继续尝试。 */ }
-  }
-  const input = document.createElement('textarea');
-  input.value = text; input.readOnly = true; input.style.position = 'fixed'; input.style.opacity = '0';
-  document.body.appendChild(input); input.select();
-  const copied = document.execCommand('copy');
-  input.remove();
-  if (!copied) throw new Error('剪贴板写入失败，请检查浏览器权限后重试');
+  return writeClipboardText(text);
 }
 
 function formatNumber(value: unknown, maximumFractionDigits = 2) {
@@ -153,14 +143,7 @@ function exportUrl(path: string, query: ListQuery, extra?: Record<string, string
   return suffix ? `${path}?${suffix}` : path;
 }
 
-function download(url: string) {
-  const link = document.createElement('a');
-  link.href = url;
-  link.download = '';
-  document.body.appendChild(link);
-  link.click();
-  link.remove();
-}
+
 
 function sortableColumn<T>(key: keyof T & string, title: string, query: ListQuery, width?: number) {
   return {
@@ -232,13 +215,15 @@ function PromotionOverviewPanel({ refreshToken, onRefresh }: { refreshToken: num
   }, [refreshToken, retry]);
 
   const removeActivity = async (row: PromotionActivitySummary) => {
+    const operationKey = `promotion-activity-delete-${row.promotion_name}`;
     setDeletingName(row.promotion_name);
+    message.loading({ key: operationKey, content: `正在删除“${row.promotion_name}”活动…`, duration: 0 });
     try {
       const result = await api.deletePromotionActivity(row.promotion_name);
-      message.success(`已删除“${row.promotion_name}”活动及 ${result.deleted} 条活动记录，SKU 最后一次促销记录已保留`);
+      message.success({ key: operationKey, content: `已删除“${row.promotion_name}”活动及 ${result.deleted} 条活动记录，SKU 最后一次促销记录已保留` });
       onRefresh();
     } catch (reason) {
-      message.error(reason instanceof Error ? reason.message : '删除促销活动失败');
+      message.error({ key: operationKey, content: reason instanceof Error ? reason.message : '删除促销活动失败', duration: 6 });
     } finally {
       setDeletingName(null);
     }
@@ -288,16 +273,14 @@ function CandidateTable({ discount, refreshToken, onMark }: { discount: Promotio
   useEffect(() => setSelected([]), [refreshToken]);
 
   const copy = async (skus: string[]) => {
-    try { await writeClipboard(skuCopyText(skus)); message.success(`已复制 ${skus.length} 个 SKU`); }
-    catch (reason) { message.error(reason instanceof Error ? reason.message : '复制失败，请重试'); }
+    await copyWithFeedback(skuCopyText(skus), 'SKU', skus.length);
   };
   const copyAll = async () => {
     setCopyingAll(true);
     try {
       const text = await api.promotionCandidateSkus(discount, { search: query.search || undefined, developers: query.developers.length ? query.developers.join(',') : undefined, sort_by: query.sortBy, sort_order: query.sortOrder });
       const count = text.split(/\r?\n/).filter(Boolean).length;
-      await writeClipboard(text.trim());
-      message.success(`已复制当前筛选下全部 ${count} 个 SKU`);
+      await copyWithFeedback(text.trim(), 'SKU', count);
     } catch (reason) { message.error(reason instanceof Error ? reason.message : '复制失败，请重试'); }
     finally { setCopyingAll(false); }
   };
@@ -330,7 +313,7 @@ function CandidateTable({ discount, refreshToken, onMark }: { discount: Promotio
   };
 
   const columns: NonNullable<TableProps<PromotionCandidate>['columns']> = [
-    { ...sortableColumn<PromotionCandidate>('sku', 'SKU', query, 170), fixed: 'left', render: value => <Typography.Text copyable={{ text: String(value) }}>{String(value)}</Typography.Text> },
+    { ...sortableColumn<PromotionCandidate>('sku', 'SKU', query, 170), fixed: 'left', render: value => <Typography.Text copyable={{ text: String(value), onCopy: () => message.success({ key: `copy-sku-${String(value)}`, content: `SKU ${String(value)}已复制` }) }}>{String(value)}</Typography.Text> },
     { ...sortableColumn<PromotionCandidate>('asin', 'ASIN', query, 130), render: value => value || '-' },
     { ...sortableColumn<PromotionCandidate>('developer', '开发员', query, 110), render: value => value || '未配置' },
     { ...sortableColumn<PromotionCandidate>('available_inventory', '可售库存', query, 110), align: 'right', render: value => formatNumber(value, 0) },
@@ -357,7 +340,7 @@ function CandidateTable({ discount, refreshToken, onMark }: { discount: Promotio
       <Space wrap>
         <Button icon={<CopyOutlined />} disabled={!selected.length} onClick={() => void copy(selected.map(String))}>复制所选（{selected.length}）</Button>
         <Button icon={<CopyOutlined />} loading={copyingAll} onClick={() => void copyAll()}>复制筛选下全部</Button>
-        <Button icon={<DownloadOutlined />} onClick={() => download(exportUrl(`/api/promotions/candidates/${discount}/export.csv`, query))}>导出 CSV</Button>
+        <Button icon={<DownloadOutlined />} onClick={() => void downloadWithFeedback(exportUrl(`/api/promotions/candidates/${discount}/export.csv`, query), "促销候选.csv", `促销候选 -${discount}%`)}>导出 CSV</Button>
         <Button
           type="primary"
           icon={<TagsOutlined />}
@@ -406,7 +389,7 @@ function LastPromotionTable({ refreshToken }: { refreshToken: number }) {
   }, [query.page, query.pageSize, query.search, query.sortBy, query.sortOrder, refreshToken, retry]);
 
   const columns: NonNullable<TableProps<LastPromotionRecord>['columns']> = [
-    { ...sortableColumn<LastPromotionRecord>('sku', 'SKU', query, 220), fixed: 'left', render: value => <Typography.Text copyable={{ text: String(value) }}>{String(value)}</Typography.Text> },
+    { ...sortableColumn<LastPromotionRecord>('sku', 'SKU', query, 220), fixed: 'left', render: value => <Typography.Text copyable={{ text: String(value), onCopy: () => message.success({ key: `copy-sku-${String(value)}`, content: `SKU ${String(value)}已复制` }) }}>{String(value)}</Typography.Text> },
     { ...sortableColumn<LastPromotionRecord>('promotion_content', '促销内容', query, 460), render: value => String(value || '-') },
   ];
 
@@ -414,7 +397,7 @@ function LastPromotionTable({ refreshToken }: { refreshToken: number }) {
     <div className="promotion-table-toolbar">
       <Space wrap>
         <Input.Search value={searchDraft} onChange={event => setSearchDraft(event.target.value)} onSearch={value => setQuery(current => ({ ...current, page: 1, search: value.trim() }))} allowClear placeholder="搜索 SKU 或促销内容" style={{ width: 320 }} />
-        <Button icon={<DownloadOutlined />} onClick={() => download(exportUrl('/api/promotions/last-promotions/export.csv', query))}>导出 CSV</Button>
+        <Button icon={<DownloadOutlined />} onClick={() => void downloadWithFeedback(exportUrl('/api/promotions/last-promotions/export.csv', query), 'last-promotions.csv', 'SKU最后一次促销记录')}>导出 CSV</Button>
       </Space>
     </div>
     {error && <Alert className="section-load-error" type="error" showIcon message="最后一次促销记录加载失败" description={error} action={<Button size="small" onClick={() => setRetry(value => value + 1)}>重试</Button>} />}
@@ -461,12 +444,14 @@ function PromotionDateModal({ dialog, onClose, onSaved }: { dialog: PromotionDia
       start_date: values.start_date.format('YYYY-MM-DD'),
       end_date: values.end_date ? values.end_date.format('YYYY-MM-DD') : null,
     };
+    const operationKey = dialog.kind === 'edit' ? `promotion-edit-${dialog.record.id}` : 'promotion-create';
+    message.loading({ key: operationKey, content: dialog.kind === 'edit' ? `正在更新促销 ${dialog.record.sku}…` : `正在标记 ${dialog.skus.length} 个促销 SKU…`, duration: 0 });
     try {
       if (dialog.kind === 'edit') await api.updatePromotion(dialog.record.id, payload);
       else await api.createPromotions(dialog.skus, payload);
-      message.success(dialog.kind === 'edit' ? '促销日期已更新' : `已标记 ${dialog.skus.length} 个促销 SKU`);
+      message.success({ key: operationKey, content: dialog.kind === 'edit' ? '促销日期已更新' : `已标记 ${dialog.skus.length} 个促销 SKU` });
       form.resetFields(); onClose(); onSaved();
-    } catch (reason) { message.error(reason instanceof Error ? reason.message : '保存失败，请重试'); }
+    } catch (reason) { message.error({ key: operationKey, content: reason instanceof Error ? reason.message : '保存失败，请重试', duration: 6 }); }
     finally { savingRef.current = false; setSaving(false); }
   };
 
@@ -485,7 +470,7 @@ function PromotionDateModal({ dialog, onClose, onSaved }: { dialog: PromotionDia
     cancelButtonProps={{ disabled: saving }}
     destroyOnHidden
   >
-    {dialog?.kind === 'create' && <Alert className="promotion-dialog-summary" type="info" showIcon message={`将标记 ${skus.length} 个 SKU`} description={<Typography.Paragraph ellipsis={{ rows: 3, expandable: true, symbol: '展开' }} copyable={{ text: skuCopyText(skus) }}>{skus.join('、')}</Typography.Paragraph>} />}
+    {dialog?.kind === 'create' && <Alert className="promotion-dialog-summary" type="info" showIcon message={`将标记 ${skus.length} 个 SKU`} description={<Typography.Paragraph ellipsis={{ rows: 3, expandable: true, symbol: '展开' }} copyable={{ text: skuCopyText(skus), onCopy: () => message.success({ key: 'copy-promotion-skus', content: `已复制 ${skus.length} 个 SKU` }) }}>{skus.join('、')}</Typography.Paragraph>} />}
     <Form form={form} layout="vertical" preserve={false}>
       <Form.Item name="promotion_name" label="促销名称" rules={[
         { required: true, whitespace: true, message: '请输入促销名称' },
@@ -528,7 +513,9 @@ function ManualPromotionModal({ open, onClose, onSaved }: { open: boolean; onClo
     catch { savingRef.current = false; return; }
     const skus = parseManualSkus(values.skus_text);
     const [startDate, endDate] = values.promotion_dates;
+    const operationKey = 'promotion-manual-create';
     setSaving(true); setError('');
+    message.loading({ key: operationKey, content: `正在保存 ${skus.length} 个手动促销 SKU…`, duration: 0 });
     try {
       const response = await api.createManualPromotions(skus, {
         promotion_name: values.promotion_name,
@@ -542,10 +529,12 @@ function ManualPromotionModal({ open, onClose, onSaved }: { open: boolean; onClo
         replaced ? `覆盖 ${replaced} 个现有记录` : '',
         pending ? `${pending} 个待开始` : '',
       ].filter(Boolean).join('，');
-      message.success(`已保存 ${response.created.length} 个促销 SKU${details ? `，${details}` : ''}`);
+      message.success({ key: operationKey, content: `已保存 ${response.created.length} 个促销 SKU${details ? `，${details}` : ''}` });
       form.resetFields(); onClose(); onSaved();
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : '手动添加失败，请重试');
+      const detail = reason instanceof Error ? reason.message : '手动添加失败，请重试';
+      setError(detail);
+      message.error({ key: operationKey, content: `手动添加促销失败：${detail}`, duration: 6 });
     } finally {
       savingRef.current = false; setSaving(false);
     }
@@ -609,26 +598,30 @@ function RecordsTable({ refreshToken, onRefresh, onEdit, onManualAdd }: { refres
   }, [status, query.page, query.pageSize, query.search, query.sortBy, query.sortOrder, query.developers.join(','), refreshToken, retry]);
 
   const endToday = async (record: PromotionRecord) => {
+    const operationKey = `promotion-end-${record.id}`;
     setActionId(record.id);
+    message.loading({ key: operationKey, content: `正在结束 ${record.sku} 的促销…`, duration: 0 });
     try {
       await api.updatePromotion(record.id, {
         promotion_name: record.promotion_name,
         start_date: record.start_date,
         end_date: dayjs().format('YYYY-MM-DD'),
       });
-      message.success('已将结束日期设为今天'); onRefresh();
-    } catch (reason) { message.error(reason instanceof Error ? reason.message : '结束促销失败'); }
+      message.success({ key: operationKey, content: `${record.sku}结束日期已设为今天` }); onRefresh();
+    } catch (reason) { message.error({ key: operationKey, content: reason instanceof Error ? reason.message : `${record.sku}结束促销失败`, duration: 6 }); }
     finally { setActionId(null); }
   };
   const remove = async (record: PromotionRecord) => {
+    const operationKey = `promotion-delete-${record.id}`;
     setActionId(record.id);
-    try { await api.deletePromotion(record.id); message.success('促销记录已删除，SKU 最后一次促销记录已保留'); onRefresh(); }
-    catch (reason) { message.error(reason instanceof Error ? reason.message : '删除失败'); }
+    message.loading({ key: operationKey, content: `正在删除 ${record.sku} 的促销记录…`, duration: 0 });
+    try { await api.deletePromotion(record.id); message.success({ key: operationKey, content: `${record.sku}促销记录已删除，SKU 最后一次促销记录已保留` }); onRefresh(); }
+    catch (reason) { message.error({ key: operationKey, content: reason instanceof Error ? reason.message : `${record.sku}删除失败`, duration: 6 }); }
     finally { setActionId(null); }
   };
 
   const columns: NonNullable<TableProps<PromotionRecord>['columns']> = [
-    { ...sortableColumn<PromotionRecord>('sku', 'SKU', query, 170), fixed: 'left', render: value => <Typography.Text copyable={{ text: String(value) }}>{String(value)}</Typography.Text> },
+    { ...sortableColumn<PromotionRecord>('sku', 'SKU', query, 170), fixed: 'left', render: value => <Typography.Text copyable={{ text: String(value), onCopy: () => message.success({ key: `copy-sku-${String(value)}`, content: `SKU ${String(value)}已复制` }) }}>{String(value)}</Typography.Text> },
     { key: 'status', dataIndex: 'status', title: '状态', width: 105, render: (value: PromotionStatus) => <Tag color={statusColours[value]}>{promotionStatusLabel(value)}</Tag> },
     { ...sortableColumn<PromotionRecord>('promotion_name', '促销名称', query, 180), render: value => value || '历史未命名促销' },
     { ...sortableColumn<PromotionRecord>('discount_percent', '折扣', query, 80), render: value => <Tag color={discountTagColor(Number(value))}>-{value}%</Tag> },
@@ -657,7 +650,7 @@ function RecordsTable({ refreshToken, onRefresh, onEdit, onManualAdd }: { refres
       </Space>
       <Space>
         <Button type="primary" icon={<TagsOutlined />} onClick={onManualAdd}>手动添加促销 SKU</Button>
-        <Button icon={<DownloadOutlined />} onClick={() => download(exportUrl('/api/promotions/records/export.csv', query, { status }))}>导出 CSV</Button>
+        <Button icon={<DownloadOutlined />} onClick={() => void downloadWithFeedback(exportUrl('/api/promotions/records/export.csv', query, { status }), 'promotions.csv', '促销记录')}>导出 CSV</Button>
       </Space>
     </div>
     {error && <Alert className="section-load-error" type="error" showIcon message="促销记录加载失败" description={error} action={<Button size="small" onClick={() => setRetry(value => value + 1)}>重试</Button>} />}
@@ -704,7 +697,7 @@ export default function PromotionBoard({ active = true, routeVersion = 0, refres
 
   const changeDataTab = (value: string) => {
     const next = value as PromotionDataTab;
-    if (next === dataTab) return;
+    if (!promotionDataTabs.includes(next) || next === dataTab) return;
     const url = new URL(window.location.href);
     url.searchParams.set('promotion_view', next);
     window.history.pushState({}, '', url);
@@ -719,7 +712,6 @@ export default function PromotionBoard({ active = true, routeVersion = 0, refres
     { key: 'candidates-8', label: '促销候选 -8%' },
     { key: 'candidates-5', label: '促销候选 -5%' },
   ];
-
   return <div className="promotion-board">
     <div className="page-heading promotion-page-heading">
       <div><Typography.Title level={2}>促销提醒</Typography.Title><Typography.Text type="secondary">自动识别动销折扣候选，并跟踪正在促销 SKU 的日均销量变化</Typography.Text></div>

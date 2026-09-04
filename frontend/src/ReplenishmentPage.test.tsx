@@ -29,6 +29,7 @@ const row: ReplenishmentGroupRow = {
   group_id: 'B001',
   identity: {
     asin: 'B001',
+    image: null,
     original_sku: 'SKU-1',
     follower_skus: ['SKU-2', 'SKU-3', 'SKU-4'],
     sku_count: 4,
@@ -138,7 +139,39 @@ describe('ReplenishmentDecisionBoard', () => {
     expect(container.querySelector('.margin-negative')).toHaveTextContent('-10.0%');
     expect(container.querySelector('.rating-healthy')).toHaveTextContent('120（4.5）');
     expect(container.querySelector('.weight-warning')).toHaveTextContent('120g');
+    expect(screen.getByLabelText('B001暂无图片')).toBeInTheDocument();
     expect(screen.queryByRole('columnheader', { name: '促销与运营' })).not.toBeInTheDocument();
+  });
+
+  it('renders an ASIN image with a previewable source', () => {
+    const imageRow = {
+      ...row,
+      identity: {
+        ...row.identity,
+        image: {
+          url: 'https://cdn.example.com/SKU-1.jpg',
+          inventory_sku: 'MITSKU-1',
+          virtual_sku: 'SKU-1',
+          source_role: 'original' as const,
+        },
+      },
+    };
+    const { container } = render(
+      <ReplenishmentDecisionBoard
+        rows={[imageRow]}
+        expanded={new Set()}
+        details={{}}
+        detailLoading={new Set()}
+        detailErrors={{}}
+        onToggle={vi.fn()}
+        onRetry={vi.fn()}
+        onDisable={vi.fn()}
+      />,
+    );
+
+    const image = container.querySelector('.replenishment-asin-image');
+    expect(image).toHaveAttribute('src', 'https://cdn.example.com/SKU-1.jpg');
+    expect(image).toHaveAttribute('alt', 'B001库存图片');
   });
 
   it('highlights maximum weight from 100g inclusively', () => {

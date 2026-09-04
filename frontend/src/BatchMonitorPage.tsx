@@ -16,8 +16,8 @@ import {
   Spin,
   Tag,
   Typography,
-  message,
 } from 'antd';
+import { feedbackMessage as message, copyWithFeedback } from './feedback';
 import {
   CheckCircleOutlined,
   CloudUploadOutlined,
@@ -171,9 +171,11 @@ export default function BatchMonitorPage({
       setPayload(result);
       setPage(result.page);
       loaded.current = true;
+      return true;
     } catch (loadError) {
       if (currentRequest !== requestId.current) return;
       setError(loadError instanceof Error ? loadError.message : '批次监控读取失败');
+      return false;
     } finally {
       if (currentRequest === requestId.current) {
         setInitialLoading(false);
@@ -188,10 +190,12 @@ export default function BatchMonitorPage({
     try {
       const result = await api.batchCopyLists();
       if (currentRequest === copyListsRequestId.current) setCopyLists(result);
+      return true;
     } catch (loadError) {
       if (currentRequest === copyListsRequestId.current) {
         setError(loadError instanceof Error ? loadError.message : '可复制清单读取失败');
       }
+      return false;
     } finally {
       if (currentRequest === copyListsRequestId.current) setCopyListsLoading(false);
     }
@@ -279,6 +283,7 @@ export default function BatchMonitorPage({
     const key = `artwork-${row.batch_no}`;
     setActionKey(key);
     setError('');
+    message.loading({ key, content: `${completed ? '正在标记' : '正在撤销'}${row.batch_no}美工图…`, duration: 0 });
     try {
       const result = await api.updateBatchArtwork(row.batch_no, completed);
       patchBatch(
@@ -312,9 +317,11 @@ export default function BatchMonitorPage({
           },
         }
         : current);
-      message.success(completed ? `${row.batch_no}美工图已完成` : `${row.batch_no}已撤销美工图完成`);
+      message.success({ key, content: completed ? `${row.batch_no}美工图已完成` : `${row.batch_no}已撤销美工图完成` });
     } catch (artworkError) {
-      setError(artworkError instanceof Error ? artworkError.message : '美工图状态保存失败');
+      const detail = artworkError instanceof Error ? artworkError.message : '美工图状态保存失败';
+      setError(detail);
+      message.error({ key, content: `${row.batch_no}美工图状态保存失败：${detail}`, duration: 6 });
     } finally {
       setActionKey('');
     }
@@ -353,8 +360,10 @@ export default function BatchMonitorPage({
       message.warning('请填写货件单号和到货日期');
       return;
     }
+    const operationKey = 'shipment-arrival';
     setShipmentArrivalSaving(true);
     setError('');
+    message.loading({ key: operationKey, content: `正在登记${shipmentNo}货件到货…`, duration: 0 });
     try {
       const result = await api.updateShipmentArrival(
         shipmentNo,
@@ -416,11 +425,13 @@ export default function BatchMonitorPage({
       setShipmentArrivalOpen(false);
       setShipmentArrivalNo('');
       setShipmentArrivalDate(dayjs());
-      message.success(`${shipmentNo}新增${result.updated}个已到货SKU`);
-      void load(view, search, page);
-      void loadCopyLists();
+      message.success({ key: operationKey, content: `${shipmentNo}新增${result.updated}个已到货SKU` });
+      const refreshed = await Promise.all([load(view, search, page), loadCopyLists()]);
+      if (refreshed.some(value => value === false)) message.warning({ key: operationKey, content: `${shipmentNo}已登记到货，但页面刷新失败`, duration: 6 });
     } catch (arrivalError) {
-      setError(arrivalError instanceof Error ? arrivalError.message : '货件到货状态保存失败');
+      const detail = arrivalError instanceof Error ? arrivalError.message : '货件到货状态保存失败';
+      setError(detail);
+      message.error({ key: operationKey, content: `${shipmentNo}货件到货失败：${detail}`, duration: 6 });
     } finally {
       setShipmentArrivalSaving(false);
     }
@@ -433,8 +444,10 @@ export default function BatchMonitorPage({
 
   const saveSkuArrival = async () => {
     if (!arrivalTarget || !arrivalDate) return;
+    const operationKey = `sku-arrival-${arrivalTarget.sku.sku}`;
     setArrivalSaving(true);
     setError('');
+    message.loading({ key: operationKey, content: `正在保存${arrivalTarget.sku.sku}到货日期…`, duration: 0 });
     try {
       const result = await api.updateSkuArrival(
         arrivalTarget.sku.sku,
@@ -455,10 +468,13 @@ export default function BatchMonitorPage({
       }));
       if (wasPending) patchArrivalCount(arrivalTarget.batchNo, 1);
       setArrivalTarget(undefined);
-      message.success(`${arrivalTarget.sku.sku}到货日期已保存`);
-      void loadCopyLists();
+      const skuLabel = arrivalTarget.sku.sku;
+      message.success({ key: operationKey, content: `${skuLabel}到货日期已保存` });
+      if (await loadCopyLists() === false) message.warning({ key: operationKey, content: `${skuLabel}到货日期已保存，但复制清单刷新失败`, duration: 6 });
     } catch (arrivalError) {
-      setError(arrivalError instanceof Error ? arrivalError.message : 'SKU到货日期保存失败');
+      const detail = arrivalError instanceof Error ? arrivalError.message : 'SKU到货日期保存失败';
+      setError(detail);
+      message.error({ key: operationKey, content: `${arrivalTarget?.sku.sku || 'SKU'}到货日期保存失败：${detail}`, duration: 6 });
     } finally {
       setArrivalSaving(false);
     }
@@ -468,6 +484,7 @@ export default function BatchMonitorPage({
     const key = `sku-clear-${sku.sku}`;
     setActionKey(key);
     setError('');
+    message.loading({ key, content: `正在撤销${sku.sku}到货…`, duration: 0 });
     try {
       await api.updateSkuArrival(sku.sku, false);
       setDetails(current => ({
@@ -480,10 +497,12 @@ export default function BatchMonitorPage({
         },
       }));
       if (sku.arrival_date) patchArrivalCount(batch, -1);
-      message.success(`${sku.sku}已撤销到货`);
-      void loadCopyLists();
+      message.success({ key, content: `${sku.sku}已撤销到货` });
+      if (await loadCopyLists() === false) message.warning({ key, content: `${sku.sku}已撤销到货，但复制清单刷新失败`, duration: 6 });
     } catch (arrivalError) {
-      setError(arrivalError instanceof Error ? arrivalError.message : 'SKU到货状态撤销失败');
+      const detail = arrivalError instanceof Error ? arrivalError.message : 'SKU到货状态撤销失败';
+      setError(detail);
+      message.error({ key, content: `${sku.sku}撤销到货失败：${detail}`, duration: 6 });
     } finally {
       setActionKey('');
     }
@@ -494,22 +513,28 @@ export default function BatchMonitorPage({
       message.warning('请填写批次号并选择Excel文件');
       return;
     }
+    const operationKey = 'create-batch';
     setCreating(true);
     setError('');
+    message.loading({ key: operationKey, content: `正在创建批次${batchNo.trim()}…`, duration: 0 });
     try {
       const result = await api.createBatch(batchNo.trim(), batchFile);
-      message.success(
-        `${result.batch_no}已创建：源文件${result.source_sku_count}个SKU，`
-        + `导入${result.imported_sku_count}个，忽略${result.ignored_sku_count}个`,
-        7,
-      );
+      const hasWarnings = result.ignored_sku_count > 0;
+      const content = `${result.batch_no}已创建：源文件${result.source_sku_count}个SKU，导入${result.imported_sku_count}个，忽略${result.ignored_sku_count}个`;
+      (hasWarnings ? message.warning : message.success)({ key: operationKey, content, duration: 6 });
       setCreateOpen(false);
       setBatchNo('');
       setBatchFile(undefined);
       setPage(1);
-      await Promise.all([load(view, search, 1), loadCopyLists()]);
+      const refreshed = await Promise.all([load(view, search, 1), loadCopyLists()]);
+      if (refreshed.some(result => result === false)) {
+        setError('批次已创建，但页面刷新失败');
+        message.warning({ key: operationKey, content: '批次已创建，但页面刷新失败', duration: 6 });
+      }
     } catch (createError) {
-      setError(createError instanceof Error ? createError.message : '新建批次失败');
+      const detail = createError instanceof Error ? createError.message : '新建批次失败';
+      setError(detail);
+      message.error({ key: operationKey, content: `新建批次失败：${detail}`, duration: 6 });
     } finally {
       setCreating(false);
     }
@@ -519,17 +544,23 @@ export default function BatchMonitorPage({
     if (!file) return;
     setActionKey('upload-shipments');
     setError('');
+    message.loading({ key: 'upload-shipments', content: `正在上传货件列表${file.name}…`, duration: 0 });
     try {
       const result = await api.uploadBatchShipments(file);
       const preserved = result.conflicts ? `，${result.conflicts}个SKU保留了历史首次货件` : '';
-      message.success(
-        `货件上传完成：新增${result.inserted}，忽略${result.ignored}，未归属${result.unassigned}${preserved}`,
-        6,
-      );
+      const hasWarnings = result.ignored > 0 || result.unassigned > 0 || Boolean(result.conflicts);
+      const content = `货件上传${hasWarnings ? '完成但有部分结果需要注意' : '完成'}：新增${result.inserted}，忽略${result.ignored}，未归属${result.unassigned}${preserved}`;
+      (hasWarnings ? message.warning : message.success)({ key: 'upload-shipments', content, duration: 6 });
       setDetails({});
-      await Promise.all([load(view, search, page), loadCopyLists()]);
+      const refreshed = await Promise.all([load(view, search, page), loadCopyLists()]);
+      if (refreshed.some(result => result === false)) {
+        setError('货件上传已成功，但页面刷新失败');
+        message.warning({ key: 'upload-shipments', content: '货件上传已成功，但页面刷新失败', duration: 6 });
+      }
     } catch (uploadError) {
-      setError(uploadError instanceof Error ? uploadError.message : '货件列表上传失败');
+      const detail = uploadError instanceof Error ? uploadError.message : '货件列表上传失败';
+      setError(detail);
+      message.error({ key: 'upload-shipments', content: `货件列表上传失败：${detail}`, duration: 6 });
     } finally {
       setActionKey('');
       if (shipmentInput.current) shipmentInput.current.value = '';
@@ -558,30 +589,7 @@ export default function BatchMonitorPage({
   };
 
   const copyLines = async (items: string[], label: string) => {
-    if (!items.length) {
-      message.info(`暂无${label}可复制`);
-      return;
-    }
-    const text = items.join('\n');
-    try {
-      if (navigator.clipboard?.writeText) {
-        await navigator.clipboard.writeText(text);
-      } else {
-        const textarea = document.createElement('textarea');
-        textarea.value = text;
-        textarea.setAttribute('readonly', '');
-        textarea.style.position = 'fixed';
-        textarea.style.opacity = '0';
-        document.body.appendChild(textarea);
-        textarea.select();
-        const copied = document.execCommand('copy');
-        document.body.removeChild(textarea);
-        if (!copied) throw new Error('copy failed');
-      }
-      message.success(`已复制${items.length}个${label}`);
-    } catch {
-      message.error('复制失败，请在清单中全选后复制');
-    }
+    await copyWithFeedback(items.join('\n'), label, items.length);
   };
 
   const renderDetails = (row: BatchMonitorRow) => {
@@ -682,10 +690,11 @@ export default function BatchMonitorPage({
         <Button
           icon={<ReloadOutlined />}
           loading={softLoading || copyListsLoading}
-          onClick={() => void Promise.all([
-            load(view, search, page),
-            loadCopyLists(),
-          ])}
+          onClick={() => void (async () => {
+            const refreshed = await Promise.all([load(view, search, page), loadCopyLists()]);
+            if (refreshed.every(result => result !== false)) message.success('批次监控数据已刷新');
+            else message.error('批次监控刷新失败');
+          })()}
         >
           刷新
         </Button>

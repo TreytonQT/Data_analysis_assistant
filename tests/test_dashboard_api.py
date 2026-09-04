@@ -41,6 +41,27 @@ class DashboardApiTests(unittest.TestCase):
         self.assertEqual(result["ASIN"].tolist(), ["B0D9L92YXY"])
         self.assertTrue(pd.isna(result.loc[0, "开售天数"]))
 
+    def test_numeric_sort_handles_integer_columns(self):
+        frame = pd.DataFrame(
+            {
+                "ASIN": ["B000000000", "YAP241001CQT012"],
+                "建议补货数量": pd.Series([0, 310], dtype="Int64"),
+            }
+        )
+        columns = [
+            {"key": "ASIN", "label": "ASIN", "format": "text", "sortable": True},
+            {"key": "建议补货数量", "label": "建议补货数量", "type": "number", "format": "integer", "sortable": True},
+        ]
+
+        result = dashboard_api._query_frame(
+            frame,
+            search="YAP241001CQT012",
+            sort_by="建议补货数量",
+            sort_order="desc",
+            columns=columns,
+        )
+        self.assertEqual(result["ASIN"].tolist(), ["YAP241001CQT012"])
+
     def test_overview_defaults_to_all_data_with_empty_visible_filters(self):
         home = pd.DataFrame(
             {
@@ -94,12 +115,15 @@ class DashboardApiTests(unittest.TestCase):
             patch("backend.dashboard_api.normalize_operational_sales", return_value=operational),
             patch("backend.dashboard_api.load_business_config", return_value=(pd.DataFrame(), pd.DataFrame())),
             patch("backend.dashboard_api.build_sales_dashboard_tables", return_value=tables),
-            patch("backend.dashboard_api.count_chen_26_onsale_skus", return_value=0),
+            patch("backend.dashboard_api.count_26_onsale_skus", return_value=42) as count_26,
         ):
             payload = dashboard_api._build_sales(None)
 
         self.assertEqual(payload["selected"], {"developers": []})
         self.assertEqual(payload["metrics"][0]["value"], 2)
+        self.assertEqual(payload["metrics"][1]["name"], "-26在售")
+        self.assertEqual(payload["metrics"][1]["value"], 42)
+        count_26.assert_called_once_with(operational)
 
     def test_slow_moving_filters_stores_configured_as_stopped_before_building_table(self):
         raw = pd.DataFrame({"开发员": ["保留", "已停款"]})
@@ -192,19 +216,198 @@ class DashboardApiTests(unittest.TestCase):
         self.assertTrue(pd.isna(result.loc[3, "开售时间"]))
         self.assertTrue(pd.isna(result.loc[3, "开售天数"]))
 
-    def test_product_page_revision_includes_batch_monitor_only_for_products(self):
+    def test_page_revision_includes_promotions_for_products_and_slow_moving(self):
         with (
             patch("backend.dashboard_api.dashboard_revision", return_value="dashboard-v1"),
             patch("backend.dashboard_api.batch_monitor_revision", return_value="batch-v2"),
+            patch("backend.promotions.promotion_revision", return_value="promotions-v1"),
         ):
             self.assertEqual(
                 dashboard_api._page_revision("products"),
-                "dashboard-v1:batch-v2",
+                "dashboard-v1:batch-v2:promotions-v1",
+            )
+            self.assertEqual(
+                dashboard_api._page_revision("slow-moving"),
+                "dashboard-v1:promotions-v1",
             )
             self.assertEqual(
                 dashboard_api._page_revision("sales"),
                 "dashboard-v1",
             )
+
+    def test_product_promotion_merge_preserves_rows_and_uses_normalized_sku(self):
+        detail = pd.DataFrame({"SKU": ["SKU-A", "SKU-B", "SKU-C"], "ASIN": ["A", "B", "C"]})
+        promotions = pd.DataFrame(
+            [
+                {"SKU": " SKU-A ", "促销折扣": 10},
+                {"SKU": "SKU-A", "促销折扣": 8},
+            ]
+        )
+
+        result = dashboard_api.merge_product_promotion_data(detail, promotions)
+
+        self.assertEqual(len(result), len(detail))
+        self.assertEqual(result["SKU"].tolist(), ["SKU-A", "SKU-B", "SKU-C"])
+        self.assertEqual(result.loc[0, "促销折扣"], 10)
+        self.assertTrue(pd.isna(result.loc[1, "促销折扣"]))
+        self.assertTrue(pd.isna(result.loc[2, "促销折扣"]))
+
+    def test_slow_moving_promotion_merge_preserves_rows_and_formats_snapshot(self):
+        detail = pd.DataFrame(
+            {
+                "SKU": ["SKU-A", "SKU-B", "SKU-C"],
+                "ASIN": ["A", "B", "C"],
+                "90天以上库存数合计": [10, 20, 30],
+            }
+        )
+        promotions = pd.DataFrame(
+            [
+                {
+                    "sku": "SKU-A",
+                    "start_date": "2026-08-01",
+                    "end_date": "2026-08-15",
+                    "discount_percent": 20,
+                },
+                {
+                    "sku": " SKU-A ",
+                    "start_date": "2026-07-01",
+                    "end_date": "2026-07-05",
+                    "discount_percent": 10,
+                },
+            ]
+        )
+
+        result = dashboard_api.merge_slow_moving_promotion_data(detail, promotions)
+
+        self.assertEqual(len(result), len(detail))
+        self.assertEqual(result["SKU"].tolist(), ["SKU-A", "SKU-B", "SKU-C"])
+        self.assertEqual(result.loc[0, "最近促销开始日期"], "2026-08-01")
+        self.assertEqual(result.loc[0, "最近促销截止日期"], "2026-08-15")
+        self.assertEqual(result.loc[0, "最近促销折扣"], 20)
+        for column in dashboard_api.SLOW_MOVING_PROMOTION_COLUMNS:
+            self.assertTrue(pd.isna(result.loc[1, column]))
+            self.assertTrue(pd.isna(result.loc[2, column]))
+
+    def test_slow_moving_csv_frame_contains_matrix_fields_and_image_columns(self):
+        frame = pd.DataFrame([{
+            "SKU": "SKU-A",
+            "ASIN": "ASIN-A",
+            "开发员": "甲",
+            "最近促销开始日期": "2026-08-04",
+            "最近促销截止日期": "2026-08-10",
+            "最近促销折扣": 10,
+            "日均销量": 5.678,
+            "90天以上库存数合计": 153,
+            "90天以上占用资金合计": 1116.9,
+            "库存计提": 134.028,
+            "弃置费": 2593.35,
+            **{f"{age}天库存数": 1 for age in ["91-180", "181-330", "331-365", "366-455"]},
+            "456天以上库存数": 153,
+            **{f"{age}天占用资金": 10 for age in ["91-180", "181-330", "331-365", "366-455"]},
+            "456天占用资金": 1116.9,
+        }])
+
+        exported = dashboard_api._slow_moving_csv_frame({
+            "SKU-A": {
+                "url": "https://cdn.example.com/sku-a.jpg",
+                "inventory_sku": "LOCAL-A",
+                "virtual_sku": "SKU-A",
+            }
+        })(frame)
+
+        self.assertEqual(exported.loc[0, "最近促销折扣（%）"], 10)
+        self.assertEqual(exported.loc[0, "日均销量（件/天）"], 5.678)
+        self.assertEqual(exported.loc[0, "90天以上占用资金合计（元）"], 1116.9)
+        self.assertEqual(exported.loc[0, "库存图片链接"], "https://cdn.example.com/sku-a.jpg")
+        self.assertEqual(exported.loc[0, "库存SKU"], "LOCAL-A")
+        self.assertEqual(exported.loc[0, "虚拟SKU"], "SKU-A")
+        self.assertEqual(exported.columns[:9].tolist(), [
+            "SKU", "ASIN", "开发员", "最近促销开始日期", "最近促销截止日期",
+            "最近促销折扣（%）", "库存图片链接", "库存SKU", "虚拟SKU",
+        ])
+        self.assertEqual(exported.columns[9], "日均销量（件/天）")
+
+    def test_sku_image_lookup_matches_exact_operational_pair_and_serializes_missing_images(self):
+        operational = pd.DataFrame(
+            [
+                {"本地SKU": " local-1 ", "MSKU": " sku-1 "},
+                {"本地SKU": "LOCAL-2", "MSKU": "SKU-2"},
+            ]
+        )
+        image_map = pd.DataFrame(
+            [
+                {
+                    "库存SKU": "LOCAL-1",
+                    "虚拟SKU": "SKU-1",
+                    "库存图片链接": "https://cdn.example.com/1.jpg",
+                },
+                {
+                    "库存SKU": "WRONG-LOCAL",
+                    "虚拟SKU": "SKU-2",
+                    "库存图片链接": "https://cdn.example.com/2.jpg",
+                },
+            ]
+        )
+
+        lookup = dashboard_api._sku_image_lookup(operational, image_map)
+        rows = dashboard_api._rows_with_sku_images(lookup)(
+            pd.DataFrame({"SKU": [" SKU-1 ", "SKU-2", "SKU-3"]})
+        )
+
+        self.assertEqual(
+            rows[0]["image"],
+            {
+                "url": "https://cdn.example.com/1.jpg",
+                "inventory_sku": "LOCAL-1",
+                "virtual_sku": "SKU-1",
+            },
+        )
+        self.assertIsNone(rows[1]["image"])
+        self.assertIsNone(rows[2]["image"])
+
+    def test_representative_asin_uses_the_same_image_mapping_as_replenishment(self):
+        operational = pd.DataFrame(
+            [{"本地SKU": "MDERAM240701CQT027", "MSKU": "RAM240701CQT027", "ASIN": "B0D9L92YXY"}]
+        )
+        image_map = pd.DataFrame(
+            [{
+                "库存SKU": "MDERAM240701CQT027",
+                "虚拟SKU": "RAM240701CQT027",
+                "库存图片链接": "https://m.media-amazon.com/images/I/615E3D3kewL.jpg",
+            }]
+        )
+
+        lookup = dashboard_api._sku_image_lookup(operational, image_map)
+        row = dashboard_api._rows_with_sku_images(lookup)(
+            pd.DataFrame([{"SKU": "RAM240701CQT027", "ASIN": "B0D9L92YXY"}])
+        )[0]
+
+        self.assertEqual(row["image"]["url"], "https://m.media-amazon.com/images/I/615E3D3kewL.jpg")
+        self.assertEqual(row["image"]["inventory_sku"], "MDERAM240701CQT027")
+
+    def test_section_row_image_serializer_keeps_image_out_of_columns_and_paging(self):
+        frame = pd.DataFrame({"SKU": ["SKU-1", "SKU-2"], "销售额": [100, 200]})
+        model = dashboard_api.section(
+            "detail",
+            "图片明细",
+            frame,
+            rows_serializer=dashboard_api._rows_with_sku_images(
+                {
+                    "SKU-1": {
+                        "url": "https://cdn.example.com/1.jpg",
+                        "inventory_sku": "LOCAL-1",
+                        "virtual_sku": "SKU-1",
+                    }
+                }
+            ),
+        )
+
+        payload = dashboard_api._serialized_section(model, page=2, page_size=1)
+
+        self.assertEqual(payload["total"], 2)
+        self.assertEqual(payload["rows"][0]["SKU"], "SKU-2")
+        self.assertIsNone(payload["rows"][0]["image"])
+        self.assertNotIn("image", {column["key"] for column in payload["columns"]})
 
     def test_latest_detail_date_uses_latest_common_metric_day(self):
         volume = pd.DataFrame(columns=["07-06销量", "07-05销量"])
@@ -230,6 +433,21 @@ class DashboardApiTests(unittest.TestCase):
         )
         self.assertEqual(store_result.iloc[0]["店铺"], "合计")
         self.assertEqual(store_result.iloc[0]["在售SKU数量"], 1)
+
+    def test_department_assessment_endpoint_returns_developer_and_store_rollups(self):
+        report = pd.DataFrame([
+            {"销售专员": "运营二十部-甲", "月份": "2026-08", "店铺": "7-YIP 本土法国", "销售额--FBA销售额": 100, "费用": 20, "COD": 30},
+            {"销售专员": "运营二十部-甲", "月份": "2026-08", "店铺": "20-TIS 德国", "销售额--FBA销售额": 10, "费用": 0, "COD": 0},
+        ])
+        with patch("backend.dashboard_api.load_performance_reports", return_value=report):
+            response = self.client.get("/api/dashboard/department/assessment", params={"month": "2026-08"})
+        self.assertEqual(response.status_code, 200, response.text)
+        payload = response.json()
+        self.assertEqual(payload["selected_month"], "2026-08")
+        self.assertEqual(payload["rows"][0]["开发员"], "甲")
+        self.assertEqual(payload["rows"][0]["销售额"], 160)
+        self.assertEqual(payload["rows"][0]["本土销售额"], 150)
+        self.assertEqual([store["店铺"] for store in payload["rows"][0]["店铺明细"]], ["YIP", "TIS"])
 
     def test_current_workspace_dashboard_pages_return_business_sections(self):
         required_sources = ["operational_sales", "gross_profit", "rating", "sales_volume_detail", "sales_amount_detail"]

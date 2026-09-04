@@ -245,7 +245,9 @@ def promotion_revision() -> str:
     if operational:
         paths.append(operational)
     existing = [path for path in paths if path.is_file()]
-    return revision_digest("app-promotions", existing) if existing else "empty"
+    revision = revision_digest("app-promotions", existing) if existing else "empty"
+    # Promotion status changes at the local-day boundary even when SQLite is unchanged.
+    return f"{revision}:{today().isoformat()}"
 
 
 def _promotion_frames() -> tuple[pd.DataFrame, pd.DataFrame]:

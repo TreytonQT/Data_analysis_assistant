@@ -17,6 +17,7 @@ import type { DashboardColumn, DashboardSection } from './api';
 const apiMocks = vi.hoisted(() => ({
   dashboard: vi.fn(),
   dashboardSection: vi.fn(),
+  departmentAssessment: vi.fn(),
 }));
 
 vi.mock('./api', async () => {
@@ -27,6 +28,7 @@ vi.mock('./api', async () => {
       ...actual.api,
       dashboard: apiMocks.dashboard,
       dashboardSection: apiMocks.dashboardSection,
+      departmentAssessment: apiMocks.departmentAssessment,
     },
   };
 });
@@ -39,14 +41,15 @@ const amountFields = new Set([
 
 function column(key: string): DashboardColumn {
   const percent = key.includes('毛利率') || key.includes('广告费占比');
+  const dailySales = key === '日均销量';
   const text = ['SKU', 'ASIN', 'Rating', '开发员', '国家', '开售时间'].includes(key);
   const launchPrice = key.endsWith('开售价格');
   return {
     key,
     label: key,
     type: text ? 'string' : percent ? 'percent' : 'number',
-    format: text ? 'text' : percent ? 'percent' : amountFields.has(key) ? 'amount' : launchPrice ? 'number' : 'integer',
-    precision: percent || amountFields.has(key) || launchPrice ? 2 : 0,
+    format: text ? 'text' : percent ? 'percent' : amountFields.has(key) ? 'amount' : dailySales || launchPrice ? 'number' : 'integer',
+    precision: percent || amountFields.has(key) || dailySales || launchPrice ? 2 : 0,
     sortable: true,
   };
 }
@@ -75,6 +78,8 @@ Object.assign(productRow, {
   SKU: 'SKU-PRODUCT-001',
   ASIN: 'B0PRODUCT01',
   Rating: '120(4.5)',
+  促销折扣: 10,
+  开发员: '运营二十部-陈千潼',
   开售时间: '2026-08-03',
   开售天数: 0,
   德国开售价格: 5.9,
@@ -108,6 +113,10 @@ const slowMovingRow = {
   SKU: 'SKU-SLOW-001',
   ASIN: 'B0SLOW0001',
   开发员: '运营六部-陈千潼',
+  最近促销开始日期: '2026-08-01',
+  最近促销截止日期: '2026-08-15',
+  最近促销折扣: 20,
+  日均销量: 5.678,
   '90天以上库存数合计': 150,
   '90天以上占用资金合计': 12000,
   库存计提: 800,
@@ -130,32 +139,36 @@ describe('DashboardDecisionMatrix', () => {
   beforeEach(() => {
     apiMocks.dashboard.mockReset();
     apiMocks.dashboardSection.mockReset();
+    apiMocks.departmentAssessment.mockReset();
   });
   afterEach(() => {
     cleanup();
+    window.localStorage.removeItem('department-assessment-local-ratio');
     window.history.replaceState({}, '', '/');
   });
 
   it('defines every source field exactly once and routes only the three requested sections', () => {
-    expect(PRODUCT_MATRIX_FIELDS).toHaveLength(34);
-    expect(new Set(PRODUCT_MATRIX_FIELDS).size).toBe(34);
+    expect(PRODUCT_MATRIX_FIELDS).toHaveLength(36);
+    expect(new Set(PRODUCT_MATRIX_FIELDS).size).toBe(36);
     expect(LOW_MARGIN_MATRIX_FIELDS).toHaveLength(8);
     expect(new Set(LOW_MARGIN_MATRIX_FIELDS).size).toBe(8);
-    expect(SLOW_MOVING_MATRIX_FIELDS).toHaveLength(17);
-    expect(new Set(SLOW_MOVING_MATRIX_FIELDS).size).toBe(17);
+    expect(SLOW_MOVING_MATRIX_FIELDS).toHaveLength(21);
+    expect(new Set(SLOW_MOVING_MATRIX_FIELDS).size).toBe(21);
     expect(dashboardMatrixKind('products', 'detail')).toBe('product-detail');
     expect(dashboardMatrixKind('products', 'low-margin')).toBe('low-margin');
     expect(dashboardMatrixKind('slow-moving', 'detail')).toBe('slow-moving');
     expect(dashboardMatrixKind('sales', 'stores')).toBeNull();
   });
 
-  it('renders the 34-field product matrix with launch, margin, ad-ratio and rating states', () => {
+  it('renders the 36-field product matrix with launch, promotion, developer, margin, ad-ratio and rating states', () => {
     const product = section('detail', '产品管理明细', PRODUCT_MATRIX_FIELDS, [productRow]);
     const { container } = render(<DashboardDecisionMatrix kind="product-detail" section={product} />);
 
     expect(container.querySelector('table')).not.toBeInTheDocument();
     expect(screen.getByRole('grid', { name: '产品管理明细决策矩阵' })).toHaveAttribute('aria-colcount', '9');
     expect(screen.getByText('SKU-PRODUCT-001')).toBeInTheDocument();
+    expect(screen.getByText('促销 -10%')).toHaveClass('dashboard-matrix-promotion');
+    expect(screen.getByText('运营二十部-陈千潼')).toHaveClass('dashboard-matrix-developer');
     expect(screen.getByText('120(4.5)')).toHaveClass('rating-good');
     expect(screen.getByText('2026-08-03')).toBeInTheDocument();
     expect(screen.getByText('5.90')).toBeInTheDocument();
@@ -164,6 +177,67 @@ describe('DashboardDecisionMatrix', () => {
     expect(container.querySelector('.dashboard-country-matrix .tone-low')).toBeInTheDocument();
     expect(container.querySelector('.dashboard-country-matrix .tone-negative')).toBeInTheDocument();
     expect(screen.getByText('1.23 万')).toBeInTheDocument();
+  });
+
+  it('renders the shared SKU image preview and no-image placeholder in all three matrices', () => {
+    const image = {
+      url: 'https://cdn.example.com/SKU-1.jpg',
+      inventory_sku: 'LOCAL-1',
+      virtual_sku: 'SKU-PRODUCT-001',
+    };
+    const product = section('detail', '产品管理明细', PRODUCT_MATRIX_FIELDS, [{ ...productRow, image }]);
+    const low = section('low-margin', '低毛利率 SKU', LOW_MARGIN_MATRIX_FIELDS, [{ ...lowMarginRow, image }]);
+    const slow = section('detail', '滞销 SKU 明细', SLOW_MOVING_MATRIX_FIELDS, [slowMovingRow]);
+    const { container, rerender } = render(<DashboardDecisionMatrix kind="product-detail" section={product} />);
+
+    expect(container.querySelector('.dashboard-matrix-image')).toHaveAttribute('src', image.url);
+    expect(screen.getByAltText('SKU-PRODUCT-001库存图片')).toBeInTheDocument();
+
+    rerender(<DashboardDecisionMatrix kind="low-margin" section={low} />);
+    expect(container.querySelector('.dashboard-matrix-image')).toHaveAttribute('src', image.url);
+    expect(screen.getByAltText('SKU-LOW-001库存图片')).toBeInTheDocument();
+
+    rerender(<DashboardDecisionMatrix kind="slow-moving" section={slow} />);
+    expect(screen.getByLabelText('SKU-SLOW-001暂无图片')).toBeInTheDocument();
+    expect(container.querySelector('.dashboard-matrix-image')).not.toBeInTheDocument();
+    expect(screen.getByText('最近促销：2026-08-01 至 2026-08-15 · -20%')).toBeInTheDocument();
+    expect(container.querySelector('.slow-overview-daily strong')).toHaveTextContent('5.68');
+  });
+
+  it('renders open-ended and missing last-promotion states', () => {
+    const openEnded = { ...slowMovingRow, 最近促销截止日期: null };
+    const missing = { ...slowMovingRow, 最近促销开始日期: null, 最近促销截止日期: null, 最近促销折扣: null };
+    const slow = section('detail', '滞销 SKU 明细', SLOW_MOVING_MATRIX_FIELDS, [openEnded, missing]);
+    render(<DashboardDecisionMatrix kind="slow-moving" section={slow} />);
+
+    expect(screen.getByText('最近促销：2026-08-01 起 · -20%')).toBeInTheDocument();
+    expect(screen.getByText('最近促销：暂无记录')).toBeInTheDocument();
+  });
+
+  it('renders missing daily sales as a dash without changing the risk metrics', () => {
+    const slow = section('detail', '滞销 SKU 明细', SLOW_MOVING_MATRIX_FIELDS, [{ ...slowMovingRow, 日均销量: null }]);
+    const { container } = render(<DashboardDecisionMatrix kind="slow-moving" section={slow} />);
+
+    expect(container.querySelector('.slow-overview-daily strong')).toHaveTextContent('-');
+    expect(screen.getByText('90+库存')).toBeInTheDocument();
+    expect(screen.getByText('150')).toBeInTheDocument();
+  });
+
+  it('distinguishes an unavailable promotion payload from an empty promotion record', () => {
+    const legacyRow = Object.fromEntries(
+      Object.entries(slowMovingRow).filter(([key]) => !key.startsWith('最近促销')),
+    );
+    const slow = section('detail', '滞销 SKU 明细', SLOW_MOVING_MATRIX_FIELDS, [legacyRow]);
+    render(<DashboardDecisionMatrix kind="slow-moving" section={slow} />);
+
+    expect(screen.getByText('最近促销：信息未加载')).toBeInTheDocument();
+  });
+
+  it('hides the promotion badge when a SKU is not currently promoted', () => {
+    const product = section('detail', '产品管理明细', PRODUCT_MATRIX_FIELDS, [{ ...productRow, 促销折扣: null }]);
+    render(<DashboardDecisionMatrix kind="product-detail" section={product} />);
+
+    expect(screen.queryByText(/促销 -/)).not.toBeInTheDocument();
   });
 
   it('defaults product tabs to detail and keeps filters while switching and restoring history', async () => {
@@ -191,15 +265,18 @@ describe('DashboardDecisionMatrix', () => {
     expect(lowPane).toHaveAttribute('hidden');
     expect(productManagementTabFromSearch('?tab=unknown')).toBe('detail');
 
-    await user.click(screen.getByRole('tab', { name: '低毛利率 SKU' }));
+    window.history.pushState({}, '', '/?page=products&developers=陈千潼&tab=low-margin');
+    window.dispatchEvent(new PopStateEvent('popstate'));
+    await waitFor(() => expect(container.querySelector('.dashboard-section-low-margin')?.parentElement).not.toHaveAttribute('hidden'));
     expect(new URLSearchParams(window.location.search).get('tab')).toBe('low-margin');
     expect(new URLSearchParams(window.location.search).get('developers')).toBe('陈千潼');
-    expect(detailPane).toHaveAttribute('hidden');
-    expect(lowPane).not.toHaveAttribute('hidden');
+    await waitFor(() => {
+      expect(container.querySelector('.dashboard-section-detail')?.parentElement).toHaveAttribute('hidden');
+      expect(container.querySelector('.dashboard-section-low-margin')?.parentElement).not.toHaveAttribute('hidden');
+    });
 
     window.history.replaceState({}, '', '/?page=products&developers=陈千潼&tab=detail');
     window.dispatchEvent(new PopStateEvent('popstate'));
-    await waitFor(() => expect(screen.getByRole('tab', { name: '产品管理明细' })).toHaveAttribute('aria-selected', 'true'));
     await waitFor(() => {
       expect(container.querySelector('.dashboard-section-detail')?.parentElement).not.toHaveAttribute('hidden');
       expect(container.querySelector('.dashboard-section-low-margin')?.parentElement).toHaveAttribute('hidden');
@@ -223,7 +300,7 @@ describe('DashboardDecisionMatrix', () => {
     });
 
     const { container } = render(<DashboardPage page="department" />);
-    await waitFor(() => expect(screen.getByRole('tab', { name: '业绩监控' })).toHaveAttribute('aria-selected', 'true'));
+    await waitFor(() => expect(screen.getByText('店铺业绩排行榜')).toBeInTheDocument());
     expect(departmentMonitoringTabFromSearch('?tab=unknown')).toBe('performance');
     expect(screen.getByText('店铺业绩排行榜')).toBeInTheDocument();
     expect(screen.getByText('AEU')).toBeInTheDocument();
@@ -240,7 +317,9 @@ describe('DashboardDecisionMatrix', () => {
     expect(screen.queryByPlaceholderText('选择月份')).not.toBeInTheDocument();
     expect(container.querySelector('.dashboard-section-commission')?.parentElement).toHaveAttribute('hidden');
 
-    await user.click(screen.getByRole('tab', { name: '提成监控' }));
+    window.history.pushState({}, '', '/?page=department&month=2026-07&tab=commission');
+    window.dispatchEvent(new PopStateEvent('popstate'));
+    await waitFor(() => expect(container.querySelector('.filter-card')).toBeInTheDocument());
     expect(new URLSearchParams(window.location.search).get('tab')).toBe('commission');
     expect(new URLSearchParams(window.location.search).get('month')).toBe('2026-07');
     await waitFor(() => expect(container.querySelector('.filter-card')).toBeInTheDocument());
@@ -249,7 +328,73 @@ describe('DashboardDecisionMatrix', () => {
 
     window.history.replaceState({}, '', '/?page=department&month=2026-07&tab=performance');
     window.dispatchEvent(new PopStateEvent('popstate'));
-    await waitFor(() => expect(screen.getByRole('tab', { name: '业绩监控' })).toHaveAttribute('aria-selected', 'true'));
+    await waitFor(() => expect(screen.getByText('店铺业绩排行榜')).toBeInTheDocument());
+  });
+
+  it('renders assessment monitoring with expandable stores and recalculates the local discount', async () => {
+    const user = userEvent.setup();
+    window.history.replaceState({}, '', '/?page=department&tab=assessment&month=2026-08');
+    apiMocks.departmentAssessment.mockResolvedValue({
+      title: '考核监控',
+      months: ['2026-07', '2026-08'],
+      selected_month: '2026-08',
+      has_data: true,
+      rows: [{
+        开发员: '甲', 销售额: 30000, 中企销售额: 10000, 本土销售额: 20000,
+        店铺明细: [
+          { 店铺: 'YIP', 销售额: 20000, 中企销售额: 0, 本土销售额: 20000 },
+          { 店铺: 'TIS', 销售额: 10000, 中企销售额: 10000, 本土销售额: 0 },
+          { 店铺: 'ZXU', 销售额: 15000, 中企销售额: 15000, 本土销售额: 0 },
+        ],
+      }],
+      updated_at: '2026-08-31T10:00:00+08:00',
+    });
+    const { container } = render(<DashboardPage page="department" />);
+    await waitFor(() => expect(screen.getByText('考核销售额 = 中企销售额 + x × 本土销售额')).toBeInTheDocument());
+    expect(await screen.findByText('甲')).toBeInTheDocument();
+    expect(screen.getAllByText('3.00 万')).not.toHaveLength(0);
+    expect(screen.getByText('考核销售额 = 中企销售额 + x × 本土销售额')).toBeInTheDocument();
+    await user.click(screen.getAllByRole('button').find(button => button.className.includes('ant-table-row-expand-icon'))!);
+    expect(screen.getByText('YIP')).toBeInTheDocument();
+    const storeRows = Array.from(container.querySelectorAll('tr.department-assessment-store-row'));
+    expect(storeRows[0]).toHaveTextContent('YIP');
+    expect(storeRows[0]).toHaveClass('department-assessment-store-row');
+    const ratioInput = screen.getByRole('spinbutton', { name: '本土业绩折扣比例' });
+    await user.clear(ratioInput);
+    await user.type(ratioInput, '0.5');
+    await ratioInput.blur();
+    await waitFor(() => expect(screen.getAllByText('2.00 万')).not.toHaveLength(0));
+    expect(Array.from(container.querySelectorAll('tr.department-assessment-store-row'))[0]).toHaveTextContent('ZXU');
+    expect(localStorage.getItem('department-assessment-local-ratio')).toBe('0.5');
+  });
+
+  it('filters assessment monitoring by developer without requesting another report', async () => {
+    const user = userEvent.setup();
+    window.history.replaceState({}, '', '/?page=department&tab=assessment&month=2026-08');
+    apiMocks.departmentAssessment.mockResolvedValue({
+      title: '考核监控',
+      months: ['2026-08'],
+      selected_month: '2026-08',
+      has_data: true,
+      rows: [
+        { 开发员: '付凯乐', 销售额: 10000, 中企销售额: 10000, 本土销售额: 0, 店铺明细: [] },
+        { 开发员: '陈千潼', 销售额: 90000, 中企销售额: 90000, 本土销售额: 0, 店铺明细: [] },
+      ],
+      updated_at: '2026-08-31T10:00:00+08:00',
+    });
+    const { container } = render(<DashboardPage page="department" />);
+    await waitFor(() => expect(screen.getByText('考核监控')).toBeInTheDocument());
+    expect(await screen.findByText('付凯乐')).toBeInTheDocument();
+    expect(screen.getByText('陈千潼')).toBeInTheDocument();
+    const developerSelect = screen.getByRole('combobox', { name: '考核监控开发员筛选' });
+    await user.click(developerSelect);
+    await user.click(screen.getByText('付凯乐', { selector: '.ant-select-item-option-content' }));
+    await waitFor(() => {
+      const developerCells = Array.from(container.querySelectorAll('.department-assessment-table tbody tr td:first-child')).map(cell => cell.textContent?.trim());
+      expect(developerCells).toEqual(['付凯乐']);
+    });
+    expect(new URLSearchParams(window.location.search).get('developer')).toBe('付凯乐');
+    expect(apiMocks.departmentAssessment).toHaveBeenCalledTimes(1);
   });
 
   it('renders low-margin and slow-moving rows without native tables', () => {

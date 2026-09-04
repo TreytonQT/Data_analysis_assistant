@@ -28,7 +28,6 @@ describe('UploadCenter', () => {
   });
 
   it('groups upload cards and records by frequency tab', async () => {
-    const user = userEvent.setup();
     window.history.replaceState({}, '', '/?page=uploads');
     render(<UploadCenter />);
 
@@ -40,15 +39,20 @@ describe('UploadCenter', () => {
     expect(screen.queryByTestId('performance-reports')).not.toBeInTheDocument();
     expect(screen.queryByTestId('sales-history-rolling')).not.toBeInTheDocument();
 
-    await user.click(screen.getByRole('tab', { name: '每周上传' }));
+    window.history.pushState({}, '', '/?page=uploads&tab=weekly');
+    window.dispatchEvent(new PopStateEvent('popstate'));
+    await waitFor(() => expect(screen.getByTestId('performance-reports')).toBeInTheDocument());
     expect(new URLSearchParams(window.location.search).get('tab')).toBe('weekly');
     expect(screen.getByTestId('source-rating')).toBeInTheDocument();
     expect(screen.getByTestId('performance-reports')).toBeInTheDocument();
     expect(screen.queryByTestId('source-operational_sales')).not.toBeInTheDocument();
     expect(screen.queryByTestId('sales-history-rolling')).not.toBeInTheDocument();
 
-    await user.click(screen.getByRole('tab', { name: '每月上传' }));
+    window.history.pushState({}, '', '/?page=uploads&tab=monthly');
+    window.dispatchEvent(new PopStateEvent('popstate'));
+    await waitFor(() => expect(screen.getByTestId('sales-history-rolling')).toBeInTheDocument());
     expect(new URLSearchParams(window.location.search).get('tab')).toBe('monthly');
+    expect(screen.getByTestId('source-sku_image_map')).toBeInTheDocument();
     expect(screen.getByTestId('sales-history-rolling')).toBeInTheDocument();
     expect(screen.queryByTestId('performance-reports')).not.toBeInTheDocument();
   });

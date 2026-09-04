@@ -10,6 +10,7 @@ import pandas as pd
 from fastapi.testclient import TestClient
 
 import backend.db as db
+from backend import dashboard_api
 from backend.main import app
 
 
@@ -73,6 +74,19 @@ class PromotionsApiTests(unittest.TestCase):
             "/api/promotions",
             json={"skus": skus, **self.dates(start_offset, end_offset)},
         )
+
+    def test_product_promotions_use_current_date_window(self):
+        self.assertEqual(self.create_manual(["SKU-A"], discount=10, start_offset=-1, end_offset=0).status_code, 201)
+        self.assertEqual(self.create_manual(["SKU-B"], discount=8, start_offset=1, end_offset=2).status_code, 201)
+        self.assertEqual(self.create_manual(["SKU-C"], discount=5, start_offset=-2, end_offset=-1).status_code, 201)
+        self.assertEqual(self.create_manual(["SKU-D"], discount=12, start_offset=-2).status_code, 201)
+
+        active = dashboard_api._active_product_promotion_rows(self.current).set_index("SKU")
+
+        self.assertEqual(active.loc["SKU-A", "促销折扣"], 10)
+        self.assertEqual(active.loc["SKU-D", "促销折扣"], 12)
+        self.assertNotIn("SKU-B", active.index)
+        self.assertNotIn("SKU-C", active.index)
 
     def create_manual(self, skus, discount=12, start_offset=0, end_offset=None, promotion_name="手动促销"):
         return self.client.post(
