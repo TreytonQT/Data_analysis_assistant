@@ -9,6 +9,7 @@ from openpyxl import Workbook
 from dashboard.data_processing import (
     build_available_inventory_monitor_table,
     build_department_inventory_metrics,
+    build_department_assessment_report,
     build_department_performance_tables,
     build_department_onsale_counts,
     build_low_margin_product_table,
@@ -20,10 +21,11 @@ from dashboard.data_processing import (
     build_sales_history_rolling_summary,
     build_sales_dashboard_tables,
     build_slow_moving_inventory_table,
+    slow_moving_inventory_columns,
     compute_commission_table,
     compute_metric_table,
     compute_stopped_commission_table,
-    count_chen_26_onsale_skus,
+    count_26_onsale_skus,
     duplicate_row_issues,
     extract_department_store_code,
     merge_business_config,
@@ -45,6 +47,7 @@ from dashboard.data_processing import (
     normalize_replenishment_listing_dates,
     normalize_replenishment_product_tags,
     normalize_replenishment_switches,
+    normalize_sku_image_map,
     normalize_sales_history_2025,
     with_department_performance_total,
     normalize_store_config,
@@ -56,6 +59,62 @@ from dashboard.data_processing import (
 
 
 class DataProcessingTests(unittest.TestCase):
+    def test_department_assessment_aggregates_sales_range_and_store_countries(self):
+        source = pd.DataFrame([
+            {"销售专员": "运营二十部-甲", "月份": "2026-08", "店铺": "7-YIP 本土法国", "销售额--FBA销售额": "1,000", "中间费用": 200, "COD": -100, "区间外": 9999},
+            {"销售专员": "运营二十部-甲", "月份": "2026-08", "店铺": "7-YIP 本土德国", "销售额--FBA销售额": 100, "中间费用": "", "COD": 0, "区间外": 9999},
+            {"销售专员": "运营二十部-甲", "月份": "2026-08", "店铺": "20-TIS 德国", "销售额--FBA销售额": 300, "中间费用": 0, "COD": 0, "区间外": 9999},
+            {"销售专员": "", "月份": "2026-08", "店铺": "20-TIS 法国", "销售额--FBA销售额": 5, "中间费用": 0, "COD": 0, "区间外": 9999},
+        ])
+        result = build_department_assessment_report(source)
+        self.assertEqual(result["selected_month"], "2026-08")
+        by_developer = {row["开发员"]: row for row in result["rows"]}
+        self.assertEqual(by_developer["甲"]["销售额"], 1500)
+        self.assertEqual(by_developer["甲"]["本土销售额"], 1200)
+        self.assertEqual(by_developer["甲"]["中企销售额"], 300)
+        self.assertEqual([store["店铺"] for store in by_developer["甲"]["店铺明细"]], ["YIP", "TIS"])
+        self.assertEqual(by_developer["未分配开发员"]["销售额"], 5)
+
+    def test_department_assessment_rejects_invalid_month_and_missing_range(self):
+        source = pd.DataFrame([{"销售专员": "甲", "月份": "2026-08", "店铺": "YIP", "销售额--FBA销售额": 1, "COD": 2}])
+        with self.assertRaisesRegex(ValueError, "没有月份 2026-07"):
+            build_department_assessment_report(source, "2026-07")
+        invalid = source.rename(columns={"COD": "其他"})
+        with self.assertRaisesRegex(ValueError, "缺少考核所需列"):
+            build_department_assessment_report(invalid)
+
+    def test_sku_image_map_normalizes_duplicates_and_rejects_conflicts(self):
+        source = pd.DataFrame([
+            {"库存SKU": " local-1 ", "虚拟SKU": "sku-1", "库存图片链接": "https://cdn.example.com/1.jpg"},
+            {"库存SKU": "LOCAL-1", "虚拟SKU": "SKU-1", "库存图片链接": "https://cdn.example.com/1.jpg"},
+        ])
+        normalized = normalize_sku_image_map(source)
+        self.assertEqual(len(normalized), 1)
+        self.assertEqual(normalized.loc[0, "库存SKU"], "local-1")
+
+        with self.assertRaisesRegex(ValueError, "HTTPS"):
+            normalize_sku_image_map(pd.DataFrame([
+                {"库存SKU": "LOCAL-1", "虚拟SKU": "SKU-1", "库存图片链接": "http://cdn.example.com/1.jpg"},
+            ]))
+        with self.assertRaisesRegex(ValueError, "一对多"):
+            normalize_sku_image_map(pd.DataFrame([
+                {"库存SKU": "LOCAL-1", "虚拟SKU": "SKU-1", "库存图片链接": "https://cdn.example.com/1.jpg"},
+                {"库存SKU": "LOCAL-1", "虚拟SKU": "SKU-2", "库存图片链接": "https://cdn.example.com/2.jpg"},
+            ]))
+
+        lowercase_header = pd.DataFrame([
+            {"库存SKU": "LOCAL-2", "虚拟sku": "SKU-2", "库存图片链接": "https://cdn.example.com/2.jpg"},
+        ])
+        normalized_lowercase = normalize_sku_image_map(lowercase_header)
+        self.assertEqual(normalized_lowercase.columns.tolist(), ["库存SKU", "虚拟SKU", "库存图片链接"])
+
+        with_empty_image = normalize_sku_image_map(pd.DataFrame([
+            {"库存SKU": "LOCAL-3", "虚拟SKU": "SKU-3", "库存图片链接": ""},
+            {"库存SKU": "LOCAL-4", "虚拟SKU": "SKU-4", "库存图片链接": "https://cdn.example.com/4.jpg"},
+        ]))
+        self.assertEqual(len(with_empty_image), 1)
+        self.assertEqual(with_empty_image.attrs["empty_url_rows"], 1)
+
     def test_current_month_partial_range_remains_available_to_dashboards(self):
         report = pd.DataFrame(
             {
@@ -658,7 +717,7 @@ class DataProcessingTests(unittest.TestCase):
         self.assertEqual(stores.loc["YIP", "在售个数"], 0)
         self.assertEqual(stores["在售个数"].sum(), 1)
 
-    def test_sales_dashboard_counts_unique_chen_26_onsale_skus(self):
+    def test_sales_dashboard_counts_unique_26_onsale_skus_for_all_developers(self):
         source = pd.DataFrame(
             {
                 "MSKU": ["SKU1", "SKU2", "SKU3", "SKU4"],
@@ -677,8 +736,8 @@ class DataProcessingTests(unittest.TestCase):
 
         normalized = normalize_operational_sales(source)
 
-        self.assertEqual(count_chen_26_onsale_skus(source), 1)
-        self.assertEqual(count_chen_26_onsale_skus(normalized), 1)
+        self.assertEqual(count_26_onsale_skus(source), 2)
+        self.assertEqual(count_26_onsale_skus(normalized), 2)
 
     def test_sales_dashboard_does_not_expand_normalized_data_twice(self):
         source = pd.DataFrame(
@@ -1183,6 +1242,29 @@ class DataProcessingTests(unittest.TestCase):
         self.assertEqual(sku.loc["SKU1", "SKU亚马逊可售"], 13)
         self.assertEqual(sku.loc["SKU1", "SKU角色"], "原SKU")
 
+    def test_replenishment_uses_original_sku_image_then_follower_fallback(self):
+        source = self.replenishment_operational_source().copy()
+        source["本地SKU"] = ["LOCAL1", "LOCAL2", "LOCAL3", "LOCAL4"]
+        image_map = pd.DataFrame([
+            {"库存SKU": "LOCAL1", "虚拟SKU": "SKU1", "库存图片链接": "https://cdn.example.com/original.jpg"},
+            {"库存SKU": "LOCAL2", "虚拟SKU": "SKU2", "库存图片链接": "https://cdn.example.com/follower.jpg"},
+        ])
+        tables = build_replenishment_management_tables(source, sku_image_map=image_map, today="2026-07-29", only_needed=False)
+        row = tables["detail"].set_index("ASIN").loc["B001"]
+        self.assertEqual(row["库存SKU"], "LOCAL1")
+        self.assertEqual(row["虚拟SKU"], "SKU1")
+        self.assertEqual(row["库存图片链接"], "https://cdn.example.com/original.jpg")
+
+        fallback = build_replenishment_management_tables(
+            source,
+            sku_image_map=image_map.iloc[[1]].copy(),
+            today="2026-07-29",
+            only_needed=False,
+        )
+        fallback_row = fallback["detail"].set_index("ASIN").loc["B001"]
+        self.assertEqual(fallback_row["库存SKU"], "LOCAL2")
+        self.assertEqual(fallback_row["虚拟SKU"], "SKU2")
+
     def test_replenishment_sku_site_margins_aggregate_before_ratio(self):
         gross = self.replenishment_gross_source()
         duplicate = gross[gross["MSKU"].eq("SKU2") & gross["国家"].eq("德国")].copy()
@@ -1460,6 +1542,7 @@ class DataProcessingTests(unittest.TestCase):
         self.assertEqual(result.columns[:2].tolist(), ["SKU", "ASIN"])
         self.assertEqual(result["SKU"].tolist(), ["SKU1", "SKU2", "SKU3"])
         self.assertEqual(result["ASIN"].tolist(), ["B001", "B001", "B002"])
+        self.assertEqual(result["开发员"].tolist(), ["A", "B", "C"])
         self.assertNotIn("行类型", result.columns)
         self.assertIn("Rating", result.columns)
         for country in ["德国", "法国", "西班牙", "意大利"]:
@@ -1467,6 +1550,16 @@ class DataProcessingTests(unittest.TestCase):
         self.assertEqual(result.loc[0, "可售数量"], 10)
         self.assertEqual(result.loc[0, "可售天数"], 5)
         self.assertEqual(result.loc[1, "30天销量"], 90)
+
+    def test_product_management_deduplicates_multiple_developers_for_same_sku(self):
+        source = self.product_operational_source()
+        duplicate = source.iloc[[0]].copy()
+        duplicate["开发员"] = " B "
+
+        normalized = normalize_product_operational(pd.concat([source, duplicate], ignore_index=True))
+        row = normalized[normalized["SKU"].eq("SKU1")].iloc[0]
+
+        self.assertEqual(row["开发员"], "A；B")
 
     def test_product_management_gross_profit_and_rating_metrics(self):
         result = build_product_management_table(self.product_operational_source(), self.gross_profit_source(), self.rating_source())
@@ -1565,6 +1658,24 @@ class DataProcessingTests(unittest.TestCase):
         self.assertEqual(result.loc[0, "91-180天库存数"], 10)
         self.assertEqual(result.loc[1, "181-330天占用资金"], 0)
         self.assertEqual(result.loc[2, "91-180天占用资金"], 1000)
+        self.assertTrue(pd.isna(result.loc[0, "日均销量"]))
+
+    def test_slow_moving_inventory_aggregates_optional_daily_sales_and_preserves_zero(self):
+        source = self.aging_source().copy()
+        source["日均销量"] = ["1.25", "2.5", 0]
+        source.loc[2, "91-180天库存数"] = "1"
+
+        result = build_slow_moving_inventory_table(source)
+
+        daily = dict(zip(result["SKU"], result["日均销量"]))
+        self.assertAlmostEqual(daily["SKU1"], 3.75)
+        self.assertEqual(daily["SKU2"], 0)
+
+    def test_slow_moving_inventory_returns_stable_columns_for_empty_source(self):
+        result = build_slow_moving_inventory_table(self.aging_source().iloc[0:0])
+
+        self.assertEqual(result.columns.tolist(), slow_moving_inventory_columns())
+        self.assertTrue(result.empty)
 
     def test_stopped_store_rows_are_excluded_from_operational_reminders(self):
         source = pd.DataFrame(

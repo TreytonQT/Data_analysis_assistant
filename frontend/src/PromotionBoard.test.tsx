@@ -1,4 +1,4 @@
-import { cleanup, render, screen } from '@testing-library/react';
+import { cleanup, render, screen, waitFor } from '@testing-library/react';
 import dayjs from 'dayjs';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -46,6 +46,16 @@ const lastPromotion: LastPromotionRecord = {
   end_date: '2026-07-31',
   updated_at: '2026-07-01T00:00:00Z',
 };
+
+
+function navigatePromotionView(view: string) {
+  const url = new URL(window.location.href);
+  url.searchParams.set('page', 'slow-moving');
+  url.searchParams.set('tab', 'promotion');
+  url.searchParams.set('promotion_view', view);
+  window.history.pushState({}, '', url);
+  window.dispatchEvent(new PopStateEvent('popstate'));
+}
 
 const overview: PromotionOverview = {
   active_sku_count: 1,
@@ -117,7 +127,8 @@ describe('PromotionBoard component', () => {
     expect(await screen.findByText('SKU-ACTIVE')).toBeInTheDocument();
     expect(screen.getAllByText('正在促销').length).toBeGreaterThan(0);
     expect(api.promotionCandidates).not.toHaveBeenCalled();
-    await user.click(screen.getByRole('tab', { name: '促销候选 -10%' }));
+    navigatePromotionView('candidates-10');
+    await waitFor(() => expect(screen.getByText('SKU-CANDIDATE')).toBeInTheDocument());
     expect(await screen.findByText('SKU-CANDIDATE')).toBeInTheDocument();
 
     const markButton = screen.getAllByRole('button', { name: /标记促销/ })
@@ -132,7 +143,8 @@ describe('PromotionBoard component', () => {
     const user = userEvent.setup();
     render(<PromotionBoard />);
 
-    await user.click(screen.getByRole('tab', { name: /促销候选 -10%/ }));
+    navigatePromotionView('candidates-10');
+    await waitFor(() => expect(screen.getByRole('button', { name: /筛选结果创建促销/ })).toBeInTheDocument());
     expect(await screen.findByText('SKU-CANDIDATE')).toBeInTheDocument();
     const search = screen.getByPlaceholderText('搜索 SKU、ASIN、开发员');
     await user.type(search, 'SKU');
@@ -149,7 +161,8 @@ describe('PromotionBoard component', () => {
     vi.mocked(api.promotionCandidates).mockResolvedValue({ columns: [], rows: [], page: 1, page_size: 50, total: 0, developers: [] });
     render(<PromotionBoard />);
 
-    await user.click(screen.getByRole('tab', { name: /促销候选 -10%/ }));
+    navigatePromotionView('candidates-10');
+    await waitFor(() => expect(screen.getByRole('button', { name: /筛选结果创建促销/ })).toBeInTheDocument());
     const button = await screen.findByRole('button', { name: /筛选结果创建促销/ });
     expect(button).toBeDisabled();
   });
@@ -168,6 +181,14 @@ describe('PromotionBoard component', () => {
     expect(screen.getByPlaceholderText('结束日期（可留空）')).toHaveValue('');
   });
 
+  it('keeps promotion subviews as internal tabs without changing the sidebar route', async () => {
+    const user = userEvent.setup();
+    render(<PromotionBoard />);
+    await screen.findByText('SKU-ACTIVE');
+    await user.click(screen.getByRole('tab', { name: '促销候选 -10%' }));
+    expect(new URLSearchParams(window.location.search).get('promotion_view')).toBe('candidates-10');
+    expect(await screen.findByText('SKU-CANDIDATE')).toBeInTheDocument();
+  });
   it('restores the last-promotion tab from the URL and fetches only its table', async () => {
     window.history.replaceState({}, '', '/?page=slow-moving&tab=promotion&promotion_view=last-promotions');
     render(<PromotionBoard />);

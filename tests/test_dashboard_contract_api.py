@@ -202,7 +202,8 @@ class DashboardContractApiTests(unittest.TestCase):
     def test_replenishment_section_returns_structured_group_rows(self) -> None:
         frame = pd.DataFrame([{
             "补货组ID": "B001", "ASIN": "B001", "原SKU": "SKU-1", "跟卖SKU": "SKU-2；SKU-3",
-            "SKU数量": 3, "店铺编码": "ZXU", "店铺状态": "ZXU·正常", "开发员": "甲",
+            "SKU数量": 3, "店铺编码": "ZXU", "店铺状态": "ZXU·正常", "库存SKU": "MIT-SKU-1",
+            "虚拟SKU": "SKU-1", "库存图片链接": "https://cdn.example.com/sku-1.jpg", "开发员": "甲",
             "产品标签": "爆款", "产品标签颜色": "#16A34A", "产品评价数": 120, "产品评分值": 4.5,
             "德国单量": 20, "德国毛利率": 0.25, "德国原因": "",
             "法国单量": 10, "法国毛利率": 0.15, "法国原因": "SKU-2: 广告炸",
@@ -234,6 +235,15 @@ class DashboardContractApiTests(unittest.TestCase):
         payload = dashboard_api._serialized_section(model)
 
         self.assertEqual(payload["group_rows"][0]["identity"]["follower_skus"], ["SKU-2", "SKU-3"])
+        self.assertEqual(
+            payload["group_rows"][0]["identity"]["image"],
+            {
+                "url": "https://cdn.example.com/sku-1.jpg",
+                "inventory_sku": "MIT-SKU-1",
+                "virtual_sku": "SKU-1",
+                "source_role": "original",
+            },
+        )
         self.assertEqual(payload["group_rows"][0]["identity"]["rating"], {"review_count": 120, "score": 4.5})
         self.assertEqual(payload["group_rows"][0]["countries"]["FR"]["margin"], 0.15)
         self.assertEqual(payload["group_rows"][0]["promotion"]["start_date"], "2026-08-01")
@@ -392,6 +402,19 @@ class DashboardContractApiTests(unittest.TestCase):
         self.assertEqual(model["frame"].loc[0, "昨日订单"], 122)
         self.assertEqual(model["frame"].loc[0, "30天日均"], 120.1666666667)
         self.assertEqual(model["frame"].loc[0, "销售额"], 6_781_658.6)
+
+    def test_explicit_number_format_overrides_name_based_integer_detection(self) -> None:
+        model = dashboard_api.section(
+            "slow-moving",
+            "滞销 SKU 明细",
+            pd.DataFrame([{"日均销量": 1.2345}]),
+            formats={"日均销量": "数值"},
+        )
+
+        column = model["columns"][0]
+        self.assertEqual(column["format"], "number")
+        self.assertEqual(column["precision"], 2)
+        self.assertEqual(column["unit"], "")
 
     def test_amount_metadata_uses_wan_without_changing_raw_values(self) -> None:
         amount_values = {

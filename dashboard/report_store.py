@@ -31,6 +31,7 @@ LATEST_SOURCE_DISPLAY_NAMES = {
     "sales_volume_detail": "销量明细",
     "sales_amount_detail": "销售额明细",
     "sales_history_rolling": "往月销量原始表",
+    "sku_image_map": "SKU图片映射表",
 }
 ALLOWED_SOURCE_SUFFIXES = (".xlsx", ".xls", ".csv")
 STRICT_MONTH_PATTERN = re.compile(r"(?P<year>[1-9]\d{3})-(?P<month>0[1-9]|1[0-2])")

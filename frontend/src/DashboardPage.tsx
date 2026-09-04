@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Alert, Button, Card, Input, Pagination, Select, Skeleton, Space, Statistic, Table, Tabs, Typography } from 'antd';
+import { Alert, Button, Card, Input, InputNumber, Pagination, Select, Skeleton, Space, Statistic, Table, Tabs, Typography } from 'antd';
 import { DownloadOutlined, FilterOutlined, ReloadOutlined } from '@ant-design/icons';
 import type { TableProps } from 'antd';
-import { api, type DashboardChartSeries, type DashboardPayload, type DashboardSection } from './api';
+import { api, type DepartmentAssessmentPayload, type DashboardChartSeries, type DashboardPayload, type DashboardSection } from './api';
+import { feedbackMessage as message, downloadBlobWithFeedback, downloadWithFeedback } from './feedback';
 import { DashboardDecisionMatrix, dashboardMatrixKind } from './DashboardDecisionMatrices';
 
 const pageDescriptions: Record<string, string> = {
@@ -15,10 +16,11 @@ export type ProductManagementTab = 'detail' | 'low-margin';
 export function productManagementTabFromSearch(search: string): ProductManagementTab {
   return new URLSearchParams(search).get('tab') === 'low-margin' ? 'low-margin' : 'detail';
 }
-export type DepartmentMonitoringTab = 'performance' | 'commission';
+export type DepartmentMonitoringTab = 'performance' | 'commission' | 'assessment';
 
 export function departmentMonitoringTabFromSearch(search: string): DepartmentMonitoringTab {
-  return new URLSearchParams(search).get('tab') === 'commission' ? 'commission' : 'performance';
+  const tab = new URLSearchParams(search).get('tab');
+  return tab === 'commission' || tab === 'assessment' ? tab : 'performance';
 }
 
 type ValueMeta = { format?: string; type?: string; unit?: string; precision?: number };
@@ -66,8 +68,7 @@ function columnKeys(section: DashboardSection) {
 function exportSection(section: DashboardSection) {
   const escape = (value: unknown) => `"${String(value ?? '').replaceAll('"', '""')}"`;
   const csv = `\ufeff${section.columns.map(column => escape(column.label)).join(',')}\n${section.rows.map(row => section.columns.map(column => escape(row[column.key])).join(',')).join('\n')}`;
-  const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }));
-  const link = document.createElement('a'); link.href = url; link.download = `${section.title}.csv`; link.click(); URL.revokeObjectURL(url);
+  downloadBlobWithFeedback(new Blob([csv], { type: 'text/csv;charset=utf-8' }), `${section.title}.csv`, section.title);
 }
 
 function MiniChart({ section }: { section: DashboardSection }) {
@@ -228,7 +229,7 @@ export function DashboardSectionCard({ initialSection, dashboardPage, filters, c
     showSizeChanger: true, pageSizeOptions: [10, 20, 50, 100, 200], showTotal: (total: number) => `共 ${total} 行`,
   } : { pageSize: compactSales ? 8 : 20, showSizeChanger: true, pageSizeOptions: [10, 20, 50, 100], showTotal: (total: number) => `共 ${total} 行` };
   const exportButton = remote
-    ? <Button size="small" icon={<DownloadOutlined />} disabled={(section.total || 0) === 0} href={sectionExportUrl(dashboardPage, section.key, filters, query)}>导出全部 CSV</Button>
+    ? <Button size="small" icon={<DownloadOutlined />} disabled={(section.total || 0) === 0} href={sectionExportUrl(dashboardPage, section.key, filters, query)} onClick={event => { event.preventDefault(); void downloadWithFeedback(sectionExportUrl(dashboardPage, section.key, filters, query), `${section.title}.csv`, section.title); }}>导出全部 CSV</Button>
     : <Button size="small" icon={<DownloadOutlined />} disabled={!section.rows.length} onClick={() => exportSection(section)}>导出 CSV</Button>;
   const tableSummary = section.summary ? () => <Table.Summary.Row className="dashboard-summary-row">
     {section.columns.map((column, index) => <Table.Summary.Cell key={column.key} index={index}>
@@ -344,6 +345,10 @@ function filtersFromUrl() {
   return params;
 }
 
+function assessmentDeveloperFromSearch(search: string) {
+  return new URLSearchParams(search).get('developer')?.trim() || '';
+}
+
 function updateDashboardUrl(page: string, params: Record<string, string>) {
   const url = new URL(window.location.href);
   filterKeys.forEach(key => url.searchParams.delete(key));
@@ -353,10 +358,117 @@ function updateDashboardUrl(page: string, params: Record<string, string>) {
   window.dispatchEvent(new Event('sales-dashboard-route-change'));
 }
 
-function updatedAtLabel(value: DashboardPayload['updated_at']) {
+function updatedAtLabel(value: DashboardPayload['updated_at'] | null) {
   if (value === undefined || value === null || value === '') return new Date().toLocaleString('zh-CN', { hour12: false });
   const parsed = typeof value === 'number' ? new Date(value < 10_000_000_000 ? value * 1000 : value) : new Date(value);
   return Number.isNaN(parsed.getTime()) ? String(value) : parsed.toLocaleString('zh-CN', { hour12: false });
+}
+
+const ASSESSMENT_RATIO_STORAGE_KEY = 'department-assessment-local-ratio';
+
+function readAssessmentRatio() {
+  try {
+    const stored = window.localStorage.getItem(ASSESSMENT_RATIO_STORAGE_KEY);
+    if (stored === null || stored.trim() === '') return 1;
+    const value = Number(stored);
+    return Number.isFinite(value) && value >= 0 && value <= 1 ? value : 1;
+  } catch {
+    return 1;
+  }
+}
+
+function assessmentAmount(value: unknown) {
+  const numeric = Number(value);
+  const amount = Number.isFinite(numeric) ? numeric : 0;
+  return `${(amount / 10000).toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} 万`;
+}
+
+type AssessmentTableRow = {
+  key: string;
+  开发员?: string;
+  店铺?: string;
+  销售额: number;
+  中企销售额: number;
+  本土销售额: number;
+  children?: AssessmentTableRow[];
+};
+
+function DepartmentAssessmentView({ data, developerFilter, onDeveloperChange, onMonthChange }: { data: DepartmentAssessmentPayload; developerFilter: string; onDeveloperChange: (developer: string) => void; onMonthChange: (month: string) => void }) {
+  const [ratio, setRatio] = useState(readAssessmentRatio);
+  const [ratioError, setRatioError] = useState('');
+  const [selectedDeveloper, setSelectedDeveloper] = useState(developerFilter);
+  useEffect(() => setSelectedDeveloper(developerFilter), [developerFilter]);
+  useEffect(() => {
+    try { window.localStorage.setItem(ASSESSMENT_RATIO_STORAGE_KEY, String(ratio)); } catch { /* 本地存储不可用时仍保留本次输入。 */ }
+  }, [ratio]);
+
+  const assessmentValue = (row: { 中企销售额: number; 本土销售额: number }) => row.中企销售额 + ratio * row.本土销售额;
+  const visibleSourceRows = selectedDeveloper ? data.rows.filter(row => row.开发员 === selectedDeveloper) : data.rows;
+  const rows: AssessmentTableRow[] = visibleSourceRows
+    .map(row => ({
+      key: `developer-${row.开发员}`,
+      开发员: row.开发员,
+      销售额: row.销售额,
+      中企销售额: row.中企销售额,
+      本土销售额: row.本土销售额,
+      children: [...row.店铺明细].sort((left, right) => assessmentValue(right) - assessmentValue(left) || right.销售额 - left.销售额 || String(left.店铺).localeCompare(String(right.店铺), 'zh-CN')).map(store => ({
+        key: `developer-${row.开发员}-store-${store.店铺}`,
+        店铺: store.店铺,
+        销售额: store.销售额,
+        中企销售额: store.中企销售额,
+        本土销售额: store.本土销售额,
+      })),
+    }))
+    .sort((left, right) => assessmentValue(right) - assessmentValue(left) || String(left.开发员).localeCompare(String(right.开发员), 'zh-CN'));
+  const totals = rows.reduce((result, row) => ({
+    销售额: result.销售额 + row.销售额,
+    中企销售额: result.中企销售额 + row.中企销售额,
+    本土销售额: result.本土销售额 + row.本土销售额,
+  }), { 销售额: 0, 中企销售额: 0, 本土销售额: 0 });
+  const columns: TableProps<AssessmentTableRow>['columns'] = [
+    { title: '开发员 / 店铺', key: 'name', render: (_, row) => row.开发员 || row.店铺 || '未分配开发员' },
+    { title: '销售额', key: '销售额', align: 'right', render: (_, row) => assessmentAmount(row.销售额) },
+    { title: '中企销售额', key: '中企销售额', align: 'right', render: (_, row) => assessmentAmount(row.中企销售额) },
+    { title: '本土销售额', key: '本土销售额', align: 'right', render: (_, row) => assessmentAmount(row.本土销售额) },
+    { title: '考核销售额', key: '考核销售额', align: 'right', render: (_, row) => assessmentAmount(assessmentValue(row)) },
+  ];
+  const onRatioChange = (value: number | null) => {
+    if (value === null || !Number.isFinite(value) || value < 0 || value > 1) {
+      setRatioError('请输入 0～1 之间的比例');
+      return;
+    }
+    setRatioError('');
+    setRatio(value);
+  };
+  return <Card className="department-assessment-card" title={`${data.selected_month} 考核销售额`}>
+    <Space wrap className="department-assessment-controls">
+      <Typography.Text>统计月份</Typography.Text>
+      <Select aria-label="考核监控统计月份" value={data.selected_month} options={data.months.map(month => ({ value: month, label: month }))} onChange={onMonthChange} style={{ width: 150 }} />
+      <Typography.Text>开发员筛选</Typography.Text>
+      <Select aria-label="考核监控开发员筛选" allowClear showSearch optionFilterProp="label" value={selectedDeveloper || undefined} placeholder="全部开发员" options={Array.from(new Set(data.rows.map(row => row.开发员))).map(developer => ({ value: developer, label: developer }))} onChange={value => { const next = value || ''; setSelectedDeveloper(next); onDeveloperChange(next); }} style={{ width: 170 }} />
+      <Typography.Text>本土业绩折扣比例 x</Typography.Text>
+      <InputNumber aria-label="本土业绩折扣比例" min={0} max={1} step={0.01} precision={2} value={ratio} onChange={onRatioChange} style={{ width: 120 }} />
+      <Typography.Text type="secondary">考核销售额 = 中企销售额 + x × 本土销售额</Typography.Text>
+      {ratioError && <Typography.Text type="danger">{ratioError}</Typography.Text>}
+    </Space>
+    {!data.has_data ? <Typography.Text type="secondary">{data.message || '当前月份暂无业绩报表数据'}</Typography.Text> : !rows.length ? <Typography.Text type="secondary">当前筛选的开发员暂无业绩数据</Typography.Text> : <Table<AssessmentTableRow>
+      className="department-assessment-table"
+      rowKey="key"
+      size="small"
+      columns={columns}
+      dataSource={rows}
+      pagination={false}
+      rowClassName={row => row.店铺 ? 'department-assessment-store-row' : 'department-assessment-developer-row'}
+      expandable={{ defaultExpandAllRows: false }}
+      summary={() => <Table.Summary.Row className="dashboard-summary-row">
+        <Table.Summary.Cell index={0}><strong>合计</strong></Table.Summary.Cell>
+        <Table.Summary.Cell index={1} align="right"><strong>{assessmentAmount(totals.销售额)}</strong></Table.Summary.Cell>
+        <Table.Summary.Cell index={2} align="right"><strong>{assessmentAmount(totals.中企销售额)}</strong></Table.Summary.Cell>
+        <Table.Summary.Cell index={3} align="right"><strong>{assessmentAmount(totals.本土销售额)}</strong></Table.Summary.Cell>
+        <Table.Summary.Cell index={4} align="right"><strong>{assessmentAmount(assessmentValue(totals))}</strong></Table.Summary.Cell>
+      </Table.Summary.Row>}
+    />}
+  </Card>;
 }
 
 function DashboardSkeleton() {
@@ -371,33 +483,45 @@ export default function DashboardPage({ page, active = true, routeVersion = 0, r
   const [appliedParams, setAppliedParams] = useState<Record<string, string>>({});
   const [searchTerms, setSearchTerms] = useState<Record<string, string>>({});
   const [lastUpdated, setLastUpdated] = useState('');
+  const [assessmentData, setAssessmentData] = useState<DepartmentAssessmentPayload>();
   const [productTab, setProductTab] = useState<ProductManagementTab>(() => productManagementTabFromSearch(window.location.search));
   const [departmentTab, setDepartmentTab] = useState<DepartmentMonitoringTab>(() => departmentMonitoringTabFromSearch(window.location.search));
+  const [assessmentDeveloper, setAssessmentDeveloper] = useState(() => assessmentDeveloperFromSearch(window.location.search));
   const abortRef = useRef<AbortController | undefined>(undefined);
   const requestRef = useRef(0);
   const seenRefreshVersion = useRef(refreshVersion);
   const seenRouteVersion = useRef(routeVersion);
 
-  const load = useCallback(async (params: Record<string, string>) => {
+  const load = useCallback(async (params: Record<string, string>, targetDepartmentTab: DepartmentMonitoringTab = departmentTab) => {
     abortRef.current?.abort();
     const controller = new AbortController(); abortRef.current = controller;
     const requestId = ++requestRef.current;
-    setLoading(true); setError(''); setData(undefined);
+    setLoading(true); setError(''); setData(undefined); setAssessmentData(undefined);
     try {
+      if (page === 'department' && targetDepartmentTab === 'assessment') {
+        const result = await api.departmentAssessment(params.month, controller.signal);
+        if (requestId !== requestRef.current) return;
+        setAssessmentData(result);
+        setLastUpdated(updatedAtLabel(result.updated_at));
+        return true;
+      }
       const result = await api.dashboard(page, params, controller.signal);
       if (requestId !== requestRef.current) return;
       const appliedSelection = selectionFromServer(result.selected);
       setData(result); setSelection(appliedSelection); setAppliedParams(selectionParams(appliedSelection));
       setLastUpdated(updatedAtLabel(result.updated_at));
+      return true;
     } catch (loadError) {
       if (controller.signal.aborted) return;
       if (requestId === requestRef.current) setError(loadError instanceof Error ? loadError.message : '看板加载失败');
+      return false;
     } finally {
       if (requestId === requestRef.current) setLoading(false);
     }
-  }, [page]);
+  }, [departmentTab, page]);
 
   useEffect(() => { void load(filtersFromUrl()); return () => abortRef.current?.abort(); }, [load]);
+  const manualRefresh = async () => { const refreshed = await load(departmentTab === 'assessment' ? { month: assessmentData?.selected_month || '' } : appliedParams); if (refreshed) message.success('数据已刷新'); else if (refreshed === false) message.error('数据刷新失败'); };
   useEffect(() => {
     if (!active || seenRefreshVersion.current === refreshVersion) return;
     seenRefreshVersion.current = refreshVersion;
@@ -407,7 +531,10 @@ export default function DashboardPage({ page, active = true, routeVersion = 0, r
     if (!active || seenRouteVersion.current === routeVersion) return;
     seenRouteVersion.current = routeVersion;
     if (page === 'products') setProductTab(productManagementTabFromSearch(window.location.search));
-    if (page === 'department') setDepartmentTab(departmentMonitoringTabFromSearch(window.location.search));
+    if (page === 'department') {
+      setDepartmentTab(departmentMonitoringTabFromSearch(window.location.search));
+      setAssessmentDeveloper(assessmentDeveloperFromSearch(window.location.search));
+    }
     void load(filtersFromUrl());
   }, [active, load, page, routeVersion]);
   useEffect(() => {
@@ -415,7 +542,10 @@ export default function DashboardPage({ page, active = true, routeVersion = 0, r
       const urlPage = new URLSearchParams(window.location.search).get('page') || 'overview';
       if (active && urlPage === page) {
         if (page === 'products') setProductTab(productManagementTabFromSearch(window.location.search));
-        if (page === 'department') setDepartmentTab(departmentMonitoringTabFromSearch(window.location.search));
+        if (page === 'department') {
+          setDepartmentTab(departmentMonitoringTabFromSearch(window.location.search));
+          setAssessmentDeveloper(assessmentDeveloperFromSearch(window.location.search));
+        }
         void load(filtersFromUrl());
       }
     };
@@ -433,15 +563,24 @@ export default function DashboardPage({ page, active = true, routeVersion = 0, r
     window.dispatchEvent(new Event('sales-dashboard-route-change'));
     setProductTab(next);
   };
-  const changeDepartmentTab = (value: string) => {
-    const next = value === 'commission' ? 'commission' : 'performance';
-    if (next === departmentTab) return;
+  const changeAssessmentMonth = (month: string) => {
     const url = new URL(window.location.href);
     url.searchParams.set('page', 'department');
-    url.searchParams.set('tab', next);
+    url.searchParams.set('tab', 'assessment');
+    url.searchParams.set('month', month);
+    if (assessmentDeveloper) url.searchParams.set('developer', assessmentDeveloper); else url.searchParams.delete('developer');
     window.history.pushState({}, '', url);
     window.dispatchEvent(new Event('sales-dashboard-route-change'));
-    setDepartmentTab(next);
+    void load({ month }, 'assessment');
+  };
+  const changeAssessmentDeveloper = (developer: string) => {
+    const url = new URL(window.location.href);
+    url.searchParams.set('page', 'department');
+    url.searchParams.set('tab', 'assessment');
+    if (developer) url.searchParams.set('developer', developer); else url.searchParams.delete('developer');
+    window.history.pushState({}, '', url);
+    window.dispatchEvent(new Event('sales-dashboard-route-change'));
+    setAssessmentDeveloper(developer);
   };
   const matchedOptions = (key: string, options: string[]) => { const keyword = (searchTerms[key] || '').trim().toLocaleLowerCase(); return keyword ? options.filter(value => value.toLocaleLowerCase().includes(keyword)) : options; };
   const selectMatchedOptions = (key: string, options: string[]) => setSelection(current => ({ ...current, [key]: Array.from(new Set([...(Array.isArray(current[key]) ? current[key] : []), ...matchedOptions(key, options)])) }));
@@ -507,18 +646,9 @@ export default function DashboardPage({ page, active = true, routeVersion = 0, r
         { key: 'low-margin', label: '低毛利率 SKU' },
       ]}
     />}
-    {page === 'department' && <Tabs
-      className="department-monitoring-tabs"
-      activeKey={departmentTab}
-      onChange={changeDepartmentTab}
-      items={[
-        { key: 'performance', label: '业绩监控' },
-        { key: 'commission', label: '提成监控' },
-      ]}
-    />}
-    <div className="page-heading"><div><Typography.Title level={2}>{data?.title || '数据看板'}</Typography.Title><Typography.Text type="secondary">{pageDescriptions[page]}{lastUpdated && ` · 数据更新时间 ${lastUpdated}`}</Typography.Text></div><Button loading={loading} icon={<ReloadOutlined />} onClick={() => void load(appliedParams)}>刷新</Button></div>
+    <div className="page-heading"><div><Typography.Title level={2}>{assessmentData?.title || data?.title || '数据看板'}</Typography.Title><Typography.Text type="secondary">{pageDescriptions[page]}{lastUpdated && ` · 数据更新时间 ${lastUpdated}`}</Typography.Text></div><Button loading={loading} icon={<ReloadOutlined />} onClick={() => void manualRefresh()}>刷新</Button></div>
     {error && <Alert className="persistent-page-error" type="error" showIcon message="看板加载失败" description={error} action={<Button size="small" onClick={() => void load(filtersFromUrl())}>重试</Button>} />}
-    {loading ? <DashboardSkeleton /> : data ? <>
+    {loading ? <DashboardSkeleton /> : departmentTab === 'assessment' && assessmentData ? <DepartmentAssessmentView data={assessmentData} developerFilter={assessmentDeveloper} onDeveloperChange={changeAssessmentDeveloper} onMonthChange={changeAssessmentMonth} /> : data ? <>
       {filterControls && <Card className="filter-card">{filterControls}</Card>}
       {data.warnings?.length && (page !== 'department' || departmentTab === 'performance') ? <Alert className="dashboard-warning" type="warning" showIcon message="数据质量提醒" description={<ul>{data.warnings.map((warning, index) => <li key={`${warning}-${index}`}>{warning}</li>)}</ul>} /> : null}
       {!data.has_data && <Alert type="info" showIcon message={data.message || '当前没有可展示的数据'} />}

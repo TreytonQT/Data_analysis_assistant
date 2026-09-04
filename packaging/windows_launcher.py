@@ -7,7 +7,7 @@ import time
 import urllib.request
 import webbrowser
 
-import uvicorn
+from backend.server_runtime import run_server
 
 
 APP_HOST = "127.0.0.1"
@@ -55,16 +55,8 @@ def main() -> int:
     print("销售数据分析助手正在启动……")
     print(f"就绪后会自动打开浏览器：{APP_URL}")
     print("使用完毕后，请关闭此窗口或按 Ctrl+C 停止程序。")
-    from backend.main import app
-
     threading.Thread(target=open_browser_when_ready, daemon=True).start()
-    uvicorn.run(
-        app,
-        host=APP_HOST,
-        port=APP_PORT,
-        log_level="info",
-        access_log=False,
-    )
+    run_server(host=APP_HOST, port=APP_PORT)
     return 0
 
 

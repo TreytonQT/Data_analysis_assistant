@@ -1,10 +1,11 @@
 import { Tooltip } from 'antd';
-import type { DashboardColumn, DashboardSection } from './api';
+import type { DashboardColumn, DashboardRow, DashboardSection } from './api';
+import SkuImagePreview from './SkuImagePreview';
 
 export type DashboardMatrixKind = 'product-detail' | 'low-margin' | 'slow-moving';
 
 const PRODUCT_GROUPS = {
-  identity: ['SKU', 'ASIN', 'Rating'],
+  identity: ['SKU', 'ASIN', 'Rating', '促销折扣', '开发员'],
   launch: ['开售时间', '开售天数'],
   inventory: ['可售数量', '可售天数'],
   recent: ['日均销量', '昨天销量', '前天销量', '上前销量', '7天销量', '14天销量', '30天销量', '90天销量'],
@@ -25,8 +26,8 @@ const LOW_MARGIN_GROUPS = {
 } as const;
 
 const SLOW_MOVING_GROUPS = {
-  identity: ['SKU', 'ASIN', '开发员'],
-  overview: ['90天以上库存数合计', '90天以上占用资金合计', '库存计提', '弃置费'],
+  identity: ['SKU', 'ASIN', '开发员', '最近促销开始日期', '最近促销截止日期', '最近促销折扣'],
+  overview: ['日均销量', '90天以上库存数合计', '90天以上占用资金合计', '库存计提', '弃置费'],
   stock: ['91-180天库存数', '181-330天库存数', '331-365天库存数', '366-455天库存数', '456天以上库存数'],
   capital: ['91-180天占用资金', '181-330天占用资金', '331-365天占用资金', '366-455天占用资金', '456天占用资金'],
 } as const;
@@ -133,6 +134,25 @@ function CompactText({ value, className = '' }: { value: unknown; className?: st
   return <Tooltip title={text}><span className={`dashboard-matrix-ellipsis ${className}`}>{text}</span></Tooltip>;
 }
 
+function LastPromotion({ row }: { row: DashboardRow }) {
+  const hasPromotionFields = ['最近促销开始日期', '最近促销截止日期', '最近促销折扣']
+    .some(key => Object.prototype.hasOwnProperty.call(row, key));
+  if (!hasPromotionFields) {
+    return <span className="dashboard-matrix-last-promotion dashboard-matrix-last-promotion-unavailable">最近促销：信息未加载</span>;
+  }
+  const start = hasValue(row['最近促销开始日期']) ? String(row['最近促销开始日期']) : '';
+  const end = hasValue(row['最近促销截止日期']) ? String(row['最近促销截止日期']) : '';
+  const discount = numeric(row['最近促销折扣']);
+  if (!start && !end && discount === null) {
+    return <span className="dashboard-matrix-last-promotion dashboard-matrix-last-promotion-empty">最近促销：暂无记录</span>;
+  }
+  const period = start && end ? `${start} 至 ${end}` : start ? `${start} 起` : '日期未知';
+  const discountText = discount === null
+    ? ''
+    : ` · -${discount.toLocaleString('zh-CN', { maximumFractionDigits: 2 })}%`;
+  return <span className="dashboard-matrix-last-promotion">最近促销：{period}{discountText}</span>;
+}
+
 function Metric({
   label,
   value,
@@ -154,21 +174,40 @@ function MatrixHeader({ labels, kind }: { labels: string[]; kind: DashboardMatri
   </div>;
 }
 
+function IdentityImage({ row }: { row: DashboardRow }) {
+  const sku = hasValue(row.SKU) ? String(row.SKU) : 'SKU';
+  return <SkuImagePreview
+    image={row.image}
+    className="dashboard-matrix-image"
+    placeholderClassName="dashboard-matrix-image-placeholder"
+    alt={`${sku}库存图片`}
+    placeholderLabel={`${sku}暂无图片`}
+  />;
+}
+
 function ProductRow({
   row,
   index,
   format,
 }: {
-  row: Record<string, unknown>;
+  row: DashboardRow;
   index: number;
   format: (key: string, value: unknown) => string;
 }) {
   const rating = ratingParts(row.Rating);
+  const promotionDiscount = numeric(row['促销折扣']);
   return <div className="dashboard-matrix-grid dashboard-matrix-row matrix-product-detail" role="row" aria-rowindex={index + 2} tabIndex={0} data-row-index={index}>
     <div className="dashboard-matrix-identity" role="gridcell" data-section="产品识别">
-      <CompactText value={row.SKU} className="dashboard-matrix-sku" />
-      <CompactText value={row.ASIN} />
-      <span className={`dashboard-matrix-rating ${ratingTone(row.Rating)}`}>{rating.text}</span>
+      <IdentityImage row={row} />
+      <div className="dashboard-matrix-identity-content">
+        <CompactText value={row.SKU} className="dashboard-matrix-sku" />
+        <CompactText value={row.ASIN} />
+        <div className="dashboard-matrix-identity-meta">
+          <span className={`dashboard-matrix-rating ${ratingTone(row.Rating)}`}>{rating.text}</span>
+          {promotionDiscount !== null && <span className="dashboard-matrix-promotion">促销 -{promotionDiscount.toLocaleString('zh-CN', { maximumFractionDigits: 2 })}%</span>}
+          <CompactText value={row['开发员']} className="dashboard-matrix-developer" />
+        </div>
+      </div>
     </div>
     <div className="dashboard-matrix-cell dashboard-matrix-lines dashboard-launch-cell" role="gridcell" data-section="开售信息">
       <Metric label="开售时间" value={format('开售时间', row['开售时间'])} />
@@ -209,7 +248,7 @@ function LowMarginRow({
   index,
   format,
 }: {
-  row: Record<string, unknown>;
+  row: DashboardRow;
   index: number;
   format: (key: string, value: unknown) => string;
 }) {
@@ -217,9 +256,12 @@ function LowMarginRow({
   const riskLabel = margin === null ? '暂无数据' : margin < 0 ? '负毛利' : margin < 0.1 ? '高风险' : margin < 0.2 ? '需关注' : '健康';
   return <div className="dashboard-matrix-grid dashboard-matrix-row matrix-low-margin" role="row" aria-rowindex={index + 2} tabIndex={0} data-row-index={index}>
     <div className="dashboard-matrix-identity" role="gridcell" data-section="产品识别">
-      <CompactText value={row.SKU} className="dashboard-matrix-sku" />
-      <CompactText value={row.ASIN} />
-      <CompactText value={row['开发员']} />
+      <IdentityImage row={row} />
+      <div className="dashboard-matrix-identity-content">
+        <CompactText value={row.SKU} className="dashboard-matrix-sku" />
+        <CompactText value={row.ASIN} />
+        <CompactText value={row['开发员']} />
+      </div>
     </div>
     <div className="dashboard-matrix-cell dashboard-matrix-lines" role="gridcell" data-section="站点销量">
       <Metric label="国家" value={format('国家', row['国家'])} />
@@ -243,7 +285,7 @@ function AgingGrid({
   format,
 }: {
   keys: readonly string[];
-  row: Record<string, unknown>;
+  row: DashboardRow;
   format: (key: string, value: unknown) => string;
 }) {
   return <div className="dashboard-aging-grid">
@@ -264,17 +306,22 @@ function SlowMovingRow({
   index,
   format,
 }: {
-  row: Record<string, unknown>;
+  row: DashboardRow;
   index: number;
   format: (key: string, value: unknown) => string;
 }) {
   return <div className="dashboard-matrix-grid dashboard-matrix-row matrix-slow-moving" role="row" aria-rowindex={index + 2} tabIndex={0} data-row-index={index}>
     <div className="dashboard-matrix-identity" role="gridcell" data-section="产品识别">
-      <CompactText value={row.SKU} className="dashboard-matrix-sku" />
-      <CompactText value={row.ASIN} />
-      <CompactText value={row['开发员']} />
+      <IdentityImage row={row} />
+      <div className="dashboard-matrix-identity-content">
+        <CompactText value={row.SKU} className="dashboard-matrix-sku" />
+        <CompactText value={row.ASIN} />
+        <CompactText value={row['开发员']} />
+        <LastPromotion row={row} />
+      </div>
     </div>
     <div className="dashboard-matrix-cell dashboard-matrix-mini-grid slow-overview-grid" role="gridcell" data-section="风险总览">
+      <Metric label="日均销量（件/天）" value={format('日均销量', row['日均销量'])} className="slow-overview-daily" />
       <Metric label="90+库存" value={format('90天以上库存数合计', row['90天以上库存数合计'])} />
       <Metric label="占用资金" value={format('90天以上占用资金合计', row['90天以上占用资金合计'])} />
       <Metric label="库存计提" value={format('库存计提', row['库存计提'])} />

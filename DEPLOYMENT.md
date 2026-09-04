@@ -4,7 +4,7 @@
 
 ## Windows 便携版（推荐）
 
-从 [GitHub Releases](https://github.com/TreytonQT/Data_analysis_assistant/releases/latest) 下载 `DataAnalysisAssistant-windows-x64-v2.0.1.zip` 和对应的 `.sha256.txt`：
+从 [GitHub Releases](https://github.com/TreytonQT/Data_analysis_assistant/releases/latest) 下载 `DataAnalysisAssistant-windows-x64-v2.1.0.zip` 和对应的 `.sha256.txt`：
 
 1. 可选：使用 `Get-FileHash` 核对压缩包 SHA-256。
 2. 将压缩包完整解压到固定目录，不要直接在压缩包中运行。
@@ -12,7 +12,7 @@
 4. 保留启动窗口；关闭窗口或按 `Ctrl+C` 即停止程序。
 
 ```powershell
-Get-FileHash .\DataAnalysisAssistant-windows-x64-v2.0.1.zip -Algorithm SHA256
+Get-FileHash .\DataAnalysisAssistant-windows-x64-v2.1.0.zip -Algorithm SHA256
 ```
 
 便携版内置前端和 Python 运行环境，不要求另行安装 Python、Node.js 或 Docker。首次运行会在程序目录旁创建 `data/` 和空数据库，默认配置位于 `configs/`。
@@ -38,12 +38,12 @@ cd ..
 .\start_dashboard.bat
 ```
 
-脚本按以下顺序启动：
+脚本调用 `scripts/dashboard_launcher.py`，按以下顺序启动：
 
 1. 检查 `.venv` 和 Python 运行依赖。
 2. 检查 `frontend/dist/index.html` 是否存在。
 3. 检查本机 `8000` 端口是否空闲。
-4. 以 `127.0.0.1:8000` 启动 FastAPI。
+4. 使用独立后台进程以 `127.0.0.1:8000` 启动 FastAPI，不依赖启动终端保持打开。
 5. 最多等待 30 秒，只有健康检查成功后才打开浏览器。
 
 标准输出、错误日志和进程号分别位于：
@@ -57,6 +57,14 @@ cd ..
 ```powershell
 Stop-Process -Id (Get-Content .tmp\dashboard.pid)
 ```
+
+首次部署后可安装桌面快捷方式：
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\install_desktop_shortcut.ps1
+```
+
+看板右上角的“重启系统”会等待旧进程退出并自动恢复当前页面；“退出系统”会停止服务，之后可通过桌面快捷方式再次启动。这两个操作只接受本机请求，并带有专用控制标识。
 
 ## Docker（可选）
 
