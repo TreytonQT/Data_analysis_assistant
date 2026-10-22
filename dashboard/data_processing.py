@@ -6,11 +6,12 @@ import ipaddress
 import math
 import re
 import unicodedata
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Iterable
 from urllib.parse import urlparse
 
+import numpy as np
 import pandas as pd
 
 from dashboard.formula_engine import FormulaContext, FormulaError, evaluate_formula, extract_fields, extract_range_sums
@@ -42,6 +43,9 @@ SALES_HISTORY_2025_COUNTRIES = {
     "意大利": "IT",
 }
 SALES_HISTORY_2025_SITE_COLUMNS = [f"{code}总销量" for code in SALES_HISTORY_2025_COUNTRIES.values()]
+SALES_HISTORY_RECENT_SITE_COLUMNS = [
+    f"{code}近30天销量" for code in SALES_HISTORY_2025_COUNTRIES.values()
+]
 SALES_HISTORY_2025_MONTH_COLUMNS = [
     column
     for month in range(1, 13)
@@ -58,7 +62,12 @@ SALES_HISTORY_GENERIC_MONTH_COLUMNS = [
         f"历史{index}月日均销量",
     )
 ]
-SALES_HISTORY_GENERIC_COLUMNS = ["ASIN", *SALES_HISTORY_2025_SITE_COLUMNS, *SALES_HISTORY_GENERIC_MONTH_COLUMNS]
+SALES_HISTORY_GENERIC_COLUMNS = [
+    "ASIN",
+    *SALES_HISTORY_2025_SITE_COLUMNS,
+    *SALES_HISTORY_RECENT_SITE_COLUMNS,
+    *SALES_HISTORY_GENERIC_MONTH_COLUMNS,
+]
 OPERATIONAL_SALES_REQUIRED_COLUMNS = [
     "MSKU",
     "店铺名称",
@@ -113,6 +122,12 @@ REPLENISHMENT_FORMULA_STOCK_COLUMNS = [
     "可售", "待调仓", "调仓中", "待入库", "采购在途", "本地库存", "在途", "计划入库",
 ]
 REPLENISHMENT_SALES_COLUMNS = ["7天销量", "14天销量", "30天销量"]
+REPLENISHMENT_RECENT_SALES_COLUMNS = ["昨天销量", "前天销量", "上前销量"]
+REPLENISHMENT_PERIOD_SALES_COLUMNS = [*REPLENISHMENT_SALES_COLUMNS, "90天销量"]
+REPLENISHMENT_MONITOR_SALES_COLUMNS = [
+    *REPLENISHMENT_RECENT_SALES_COLUMNS,
+    *REPLENISHMENT_PERIOD_SALES_COLUMNS,
+]
 AVAILABLE_INVENTORY_STOCK_COLUMNS = [
     "可售",
     "待调仓",
@@ -132,6 +147,9 @@ AVAILABLE_INVENTORY_SUMMARY_COLUMNS = ["开发员"] + AVAILABLE_INVENTORY_STOCK_
 AVAILABLE_INVENTORY_MONITOR_COLUMNS = ["开发员", "库存总数", "日均订单", "总可售天数"]
 SALES_VOLUME_DETAIL_REQUIRED_COLUMNS = ["msku", "店铺", "开发专员"]
 SALES_AMOUNT_DETAIL_REQUIRED_COLUMNS = ["msku", "店铺", "开发专员"]
+DEPARTMENT_SALES_AMOUNT_HISTORY_COLUMNS = ["日期", "开发专员", "店铺", "销售额（元）"]
+DEPARTMENT_LOCAL_STORE_FACTOR = 1.0
+DEPARTMENT_ENTERPRISE_STORE_FACTOR = 0.8
 DEPARTMENT_PERFORMANCE_FIXED_COLUMNS = [
     "在售SKU数量",
     "库存总数",
@@ -448,7 +466,7 @@ def normalize_report(df: pd.DataFrame, *, today: date | None = None) -> pd.DataF
     return result
 
 
-DEPARTMENT_ASSESSMENT_REQUIRED_COLUMNS = ["销售专员", "月份", "店铺", "销售额--FBA销售额", "COD"]
+DEPARTMENT_ASSESSMENT_REQUIRED_COLUMNS = ["销售专员", "月份", "店铺", "销售额--FBA销售额", "COD", "毛利润"]
 
 
 def build_department_assessment_report(
@@ -478,6 +496,7 @@ def build_department_assessment_report(
         raise ValueError(f"业绩报表没有月份 {selected_month} 的数据")
 
     data["_考核销售额"] = data[sales_columns].apply(normalize_config_number).fillna(0).sum(axis=1)
+    data["_毛利润"] = normalize_config_number(data["毛利润"]).fillna(0)
     data["_开发员"] = data["销售专员"].map(normalize_department_person_name)
     raw_developers = data["销售专员"].fillna("").astype(str).str.strip()
     data["_开发员"] = data["_开发员"].where(data["_开发员"].astype(str).str.strip().ne(""), raw_developers)
@@ -492,21 +511,27 @@ def build_department_assessment_report(
         sales = float(row["_考核销售额"] or 0)
         bucket = developers.setdefault(
             developer,
-            {"开发员": developer, "销售额": 0.0, "中企销售额": 0.0, "本土销售额": 0.0, "店铺明细": {}},
+            {"开发员": developer, "销售额": 0.0, "毛利润": 0.0, "毛利率": None, "中企销售额": 0.0, "本土销售额": 0.0, "店铺明细": {}},
         )
         local = bool(row["_本土"])
         bucket["销售额"] = float(bucket["销售额"]) + sales
+        gross_profit = float(row["_毛利润"] or 0)
+        bucket["毛利润"] = float(bucket["毛利润"]) + gross_profit
         bucket["本土销售额" if local else "中企销售额"] = float(bucket["本土销售额" if local else "中企销售额"]) + sales
         stores = bucket["店铺明细"]
-        store_bucket = stores.setdefault(store, {"店铺": store, "销售额": 0.0, "中企销售额": 0.0, "本土销售额": 0.0})
+        store_bucket = stores.setdefault(store, {"店铺": store, "销售额": 0.0, "毛利润": 0.0, "毛利率": None, "中企销售额": 0.0, "本土销售额": 0.0})
         store_bucket["销售额"] = float(store_bucket["销售额"]) + sales
+        store_bucket["毛利润"] = float(store_bucket["毛利润"]) + gross_profit
         store_bucket["本土销售额" if local else "中企销售额"] = float(store_bucket["本土销售额" if local else "中企销售额"]) + sales
 
     rows = []
     for developer, bucket in developers.items():
         stores = list(bucket.pop("店铺明细").values())
+        for store_bucket in stores:
+            store_bucket["毛利率"] = safe_blank_ratio(store_bucket["毛利润"], store_bucket["销售额"])
         stores.sort(key=lambda item: (-float(item["销售额"]), str(item["店铺"])))
         bucket["店铺明细"] = stores
+        bucket["毛利率"] = safe_blank_ratio(bucket["毛利润"], bucket["销售额"])
         rows.append(bucket)
     rows.sort(key=lambda item: (-float(item["销售额"]), str(item["开发员"])))
     return {"months": available_months, "selected_month": selected_month, "rows": rows}
@@ -826,6 +851,8 @@ def normalize_operational_aging(df: pd.DataFrame) -> pd.DataFrame:
         raise ValueError(f"运营原始表缺少库龄列：{', '.join(missing)}")
 
     result = df[OPERATIONAL_AGING_REQUIRED_COLUMNS].copy()
+    inventory = df.reindex(columns=AVAILABLE_INVENTORY_STOCK_COLUMNS).apply(normalize_config_number)
+    result["总库存数"] = inventory.sum(axis=1, min_count=len(AVAILABLE_INVENTORY_STOCK_COLUMNS))
     if "日均销量" in df.columns:
         result["日均销量"] = normalize_config_number(df["日均销量"])
     else:
@@ -850,6 +877,7 @@ def build_slow_moving_inventory_table(df: pd.DataFrame, discard_threshold: str =
         开发员=("开发员", lambda values: "；".join(sorted({str(value) for value in values if str(value).strip()}))),
         ASIN=("ASIN", lambda values: "；".join(sorted({str(value) for value in values if str(value).strip()}))),
         日均销量=("日均销量", lambda values: values.sum(min_count=1)),
+        总库存数=("总库存数", lambda values: values.sum(min_count=len(values))),
         **agg,
     )
 
@@ -860,6 +888,7 @@ def build_slow_moving_inventory_table(df: pd.DataFrame, discard_threshold: str =
         return pd.DataFrame(columns=slow_moving_inventory_columns())
 
     base["90天以上库存数合计"] = base[AGING_STOCK_COLUMNS].sum(axis=1)
+    base["可售天数"] = base["总库存数"] / base["日均销量"].where(base["日均销量"].gt(0))
     base["90天以上占用资金合计"] = base[AGING_CAPITAL_COLUMNS].sum(axis=1)
     base["库存计提"] = (
         base["91-180天占用资金"] * 0.05
@@ -896,6 +925,8 @@ def slow_moving_inventory_columns() -> list[str]:
         "开发员",
         "ASIN",
         "日均销量",
+        "总库存数",
+        "可售天数",
         "90天以上库存数合计",
         "90天以上占用资金合计",
         "库存计提",
@@ -958,6 +989,159 @@ def normalize_sales_volume_detail(df: pd.DataFrame) -> pd.DataFrame:
 
 def normalize_sales_amount_detail(df: pd.DataFrame) -> pd.DataFrame:
     return normalize_sales_metric_detail(df, SALES_AMOUNT_DETAIL_REQUIRED_COLUMNS, "销售额")
+
+
+def department_sales_amount_store_factor(value: object) -> float:
+    """Return the settlement factor implied by the raw store name."""
+
+    return DEPARTMENT_LOCAL_STORE_FACTOR if "本土" in str(value) else DEPARTMENT_ENTERPRISE_STORE_FACTOR
+
+
+def _sales_detail_date_mapping(
+    df: pd.DataFrame,
+    suffix: str,
+    reference_date=None,
+) -> dict[str, pd.Timestamp]:
+    reference = pd.Timestamp(reference_date).normalize() if reference_date is not None else pd.Timestamp.today().normalize()
+    mapping: dict[str, pd.Timestamp] = {}
+    for column in sales_detail_date_columns(df, suffix):
+        match = re.fullmatch(r"(\d{2}-\d{2})" + re.escape(suffix), str(column).strip())
+        if not match:
+            continue
+        month, day = map(int, match.group(1).split("-"))
+        try:
+            candidate = pd.Timestamp(year=reference.year, month=month, day=day)
+        except ValueError:
+            continue
+        if candidate > reference:
+            candidate = candidate.replace(year=reference.year - 1)
+        mapping[column] = candidate
+    return mapping
+
+
+def build_replenishment_site_sales_summary(
+    volume_df: pd.DataFrame,
+    *,
+    reference_date=None,
+    period_start=None,
+    period_end=None,
+) -> tuple[pd.DataFrame, list[pd.Timestamp]]:
+    """Aggregate the latest sales-volume detail export by ASIN and marketplace."""
+
+    output_columns = ["ASIN", "销量明细已匹配", "销量明细DE销量", "销量明细FR销量", "销量明细ES销量", "销量明细IT销量"]
+    if volume_df is None or volume_df.empty:
+        return pd.DataFrame(columns=output_columns), []
+
+    required_columns = ["asin", "msku", "店铺", "国家", "开发专员"]
+    # Only identical export rows are duplicates; differing SKU/store records count.
+    normalized = normalize_sales_metric_detail(volume_df.drop_duplicates(keep="first"), required_columns, "销量")
+    mapping = _sales_detail_date_mapping(
+        normalized,
+        "销量",
+        reference_date=period_end if period_end is not None else reference_date,
+    )
+    if period_start is not None:
+        start = pd.Timestamp(period_start).normalize()
+        mapping = {column: day for column, day in mapping.items() if day >= start}
+    if period_end is not None:
+        end = pd.Timestamp(period_end).normalize()
+        mapping = {column: day for column, day in mapping.items() if day <= end}
+    dates = sorted(set(mapping.values()))
+    if not mapping:
+        return pd.DataFrame(columns=output_columns), dates
+
+    normalized["ASIN"] = normalized["asin"].fillna("").astype(str).str.strip().str.upper()
+    normalized["国家"] = normalized["国家"].fillna("").astype(str).str.strip()
+    normalized["_站点"] = normalized["国家"].map(SALES_HISTORY_2025_COUNTRIES)
+    normalized = normalized[normalized["ASIN"].ne("") & normalized["_站点"].notna()].copy()
+    if normalized.empty:
+        return pd.DataFrame(columns=output_columns), dates
+
+    normalized["_销量"] = normalized[list(mapping)].sum(axis=1)
+    grouped = normalized.groupby(["ASIN", "_站点"], sort=True, dropna=False)["_销量"].sum().unstack(fill_value=0)
+    grouped = grouped.reindex(columns=["DE", "FR", "ES", "IT"], fill_value=0).reset_index()
+    grouped["销量明细已匹配"] = True
+    grouped = grouped.rename(columns={code: f"销量明细{code}销量" for code in ("DE", "FR", "ES", "IT")})
+    for column in output_columns[2:]:
+        grouped[column] = grouped[column].map(_history_output_number)
+    return grouped[output_columns].reset_index(drop=True), dates
+
+
+def build_department_sales_amount_history(
+    amount_df: pd.DataFrame,
+    reference_date=None,
+    *,
+    normalized: bool = False,
+) -> pd.DataFrame:
+    """Convert a normalized rolling sales amount export into daily history rows."""
+
+    missing = [column for column in SALES_AMOUNT_DETAIL_REQUIRED_COLUMNS if column not in amount_df.columns]
+    date_columns = sales_detail_date_columns(amount_df, "销售额")
+    if missing:
+        raise ValueError(f"销售额明细缺少列：{', '.join(missing)}")
+    if not date_columns:
+        raise ValueError("销售额明细缺少 MM-DD销售额 日期列")
+    mapping = _sales_detail_date_mapping(amount_df, "销售额", reference_date)
+    if not mapping:
+        raise ValueError("销售额明细没有可识别的日期列")
+
+    base = amount_df[SALES_AMOUNT_DETAIL_REQUIRED_COLUMNS + date_columns].copy()
+    for column in SALES_AMOUNT_DETAIL_REQUIRED_COLUMNS:
+        base[column] = base[column].fillna("").astype(str).str.strip()
+    base["msku"] = base["msku"].str.replace(r"^\t+", "", regex=True)
+    for column in date_columns:
+        if normalized:
+            base[column] = pd.to_numeric(base[column], errors="coerce").fillna(0)
+        else:
+            base[column] = normalize_config_number(base[column]).fillna(0)
+    base = base.drop_duplicates(keep="first")
+    melted = base[["开发专员", "店铺", *date_columns]].melt(
+        id_vars=["开发专员", "店铺"],
+        value_vars=date_columns,
+        var_name="日期列",
+        value_name="销售额（元）",
+    )
+    melted["日期"] = melted["日期列"].map(mapping)
+    melted = melted.dropna(subset=["日期"])
+    history = (
+        melted[["日期", "开发专员", "店铺", "销售额（元）"]]
+        .groupby(["日期", "开发专员", "店铺"], dropna=False, as_index=False)["销售额（元）"]
+        .sum()
+    )
+    return history[DEPARTMENT_SALES_AMOUNT_HISTORY_COLUMNS].sort_values(
+        ["日期", "开发专员", "店铺"]
+    ).reset_index(drop=True)
+
+
+def normalize_department_sales_amount_history(history_df: pd.DataFrame | None) -> pd.DataFrame:
+    """Normalize persisted daily history and derive the existing performance groups."""
+
+    derived_columns = ["人员", "店铺前缀", "店铺编码", "店铺部门", "销售额系数", "折算销售额"]
+    columns = [*DEPARTMENT_SALES_AMOUNT_HISTORY_COLUMNS, *derived_columns]
+    if history_df is None or history_df.empty:
+        return pd.DataFrame(columns=columns)
+    missing = [column for column in DEPARTMENT_SALES_AMOUNT_HISTORY_COLUMNS if column not in history_df.columns]
+    if missing:
+        raise ValueError(f"销售额历史缺少列：{', '.join(missing)}")
+
+    base = history_df[DEPARTMENT_SALES_AMOUNT_HISTORY_COLUMNS].copy()
+    base["日期"] = pd.to_datetime(base["日期"], errors="coerce").dt.normalize()
+    if base["日期"].isna().any():
+        raise ValueError("销售额历史包含无效日期")
+    for column in ["开发专员", "店铺"]:
+        base[column] = base[column].fillna("").astype(str).str.strip()
+    base["销售额（元）"] = normalize_config_number(base["销售额（元）"]).fillna(0)
+    base = (
+        base.groupby(["日期", "开发专员", "店铺"], dropna=False, as_index=False)["销售额（元）"]
+        .sum()
+    )
+    base["人员"] = base["开发专员"].map(normalize_department_person_name)
+    base["店铺前缀"] = base["店铺"].map(extract_department_store_prefix)
+    base["店铺编码"] = base["店铺"].map(extract_department_store_code)
+    base["店铺部门"] = base["店铺"].map(department_name_from_store)
+    base["销售额系数"] = base["店铺"].map(department_sales_amount_store_factor)
+    base["折算销售额"] = base["销售额（元）"] * base["销售额系数"]
+    return base[columns].sort_values(["日期", "开发专员", "店铺"]).reset_index(drop=True)
 
 
 def duplicate_row_issues(frame: pd.DataFrame, example_limit: int = 5) -> list[dict]:
@@ -1156,12 +1340,17 @@ def build_department_performance_tables(
     volume_df: pd.DataFrame,
     amount_df: pd.DataFrame,
     today=None,
+    amount_history_df: pd.DataFrame | None = None,
+    *,
+    normalized_inputs: bool = False,
 ) -> dict[str, pd.DataFrame]:
     # Official exports can contain byte-for-byte repeated detail lines. Remove
     # only rows whose normalized calculation fields are completely identical;
     # rows for the same SKU with any differing value remain independent.
-    volume = normalize_sales_volume_detail(volume_df).drop_duplicates(keep="first").reset_index(drop=True)
-    amount = normalize_sales_amount_detail(amount_df).drop_duplicates(keep="first").reset_index(drop=True)
+    volume_source = volume_df if normalized_inputs else normalize_sales_volume_detail(volume_df)
+    amount_source = amount_df if normalized_inputs else normalize_sales_amount_detail(amount_df)
+    volume = volume_source.drop_duplicates(keep="first").reset_index(drop=True)
+    amount = amount_source.drop_duplicates(keep="first").reset_index(drop=True)
     today_ts = pd.Timestamp(today).normalize() if today is not None else latest_department_detail_date(volume, amount)
     if today_ts is None:
         raise ValueError("销量明细与销售额明细没有共同的日期列")
@@ -1175,55 +1364,101 @@ def build_department_performance_tables(
     if missing_amount:
         raise ValueError(f"销售额明细缺少近7天日期列：{', '.join(missing_amount)}")
 
-    month_dates = department_month_dates(today_ts)
-    month_amount_cols = [col for col in department_metric_columns_for_dates(month_dates, "销售额") if col in amount.columns]
-    remaining_days = calendar.monthrange(today_ts.year, today_ts.month)[1] - today_ts.day + 1
+    # The settlement month is the natural month containing the latest source
+    # date, shifted back by seven days on both ends. The latest source date is
+    # treated as incomplete, matching the existing seven-day ranking behavior.
+    target_start = today_ts.replace(day=1) - pd.Timedelta(days=7)
+    target_end = pd.Timestamp(
+        year=today_ts.year,
+        month=today_ts.month,
+        day=calendar.monthrange(today_ts.year, today_ts.month)[1],
+    ) - pd.Timedelta(days=7)
+    completed_through = today_ts - pd.Timedelta(days=1)
+    actual_end = min(completed_through, target_end)
+    actual_dates = (
+        list(pd.date_range(target_start, actual_end, freq="D"))
+        if actual_end >= target_start
+        else []
+    )
+    remaining_days = max(0, int((target_end - completed_through).days))
+
+    current_history = normalize_department_sales_amount_history(
+        build_department_sales_amount_history(amount, reference_date=today_ts, normalized=normalized_inputs)
+    )
+    persisted_history = normalize_department_sales_amount_history(amount_history_df)
+    current_dates = set(current_history["日期"].tolist())
+    if current_dates:
+        persisted_history = persisted_history.loc[~persisted_history["日期"].isin(current_dates)].copy()
+    # Both sides are already grouped and carry the same normalized dimensions;
+    # current source dates replace persisted ones, so a third full normalization
+    # would only repeat hundreds of thousands of string operations.
+    amount_history = pd.concat([persisted_history, current_history], ignore_index=True)
+    available_dates = set(amount_history["日期"].tolist())
+    missing_history_dates = [date for date in actual_dates if date not in available_dates]
+    if amount_history_df is not None and missing_history_dates:
+        formatted = ", ".join(date.strftime("%Y-%m-%d") for date in missing_history_dates)
+        raise ValueError(f"销售额历史缺少预估周期已完成日期：{formatted}")
+
     onsale_counts = build_department_onsale_counts(operational_df)
     inventory_metrics = build_department_inventory_metrics(operational_df)
     department_volume = volume[volume["店铺部门"].ne("")].copy()
     department_amount = amount[amount["店铺部门"].ne("")].copy()
+    department_amount_history = amount_history[amount_history["店铺部门"].ne("")].copy()
     store_codes = build_department_store_codes(operational_df)
     store_volume = volume[volume["店铺编码"].isin(store_codes)].copy()
-    store_amount = amount[amount["店铺编码"].isin(store_codes)].copy()
+    store_amount_history = amount_history[amount_history["店铺编码"].isin(store_codes)].copy()
+    person_labels = sorted(
+        {
+            label
+            for label in [*volume["人员"].tolist(), *amount["人员"].tolist()]
+            if label
+        }
+    )
+    department_labels = sorted(
+        {
+            label
+            for label in [*department_volume["店铺部门"].tolist(), *department_amount["店铺部门"].tolist()]
+            if label
+        }
+    )
     return {
         "开发员业绩排行": build_department_performance_table_for_group(
             "开发员",
             "人员",
             "person",
             volume,
-            amount,
+            amount_history,
             window_dates,
             volume_date_cols,
-            amount_date_cols,
-            month_amount_cols,
+            actual_dates,
             remaining_days,
             onsale_counts,
             inventory_metrics,
+            labels=person_labels,
         ),
         "部门业绩": build_department_performance_table_for_group(
             "部门",
             "店铺部门",
             "department",
             department_volume,
-            department_amount,
+            department_amount_history,
             window_dates,
             volume_date_cols,
-            amount_date_cols,
-            month_amount_cols,
+            actual_dates,
             remaining_days,
             onsale_counts,
             inventory_metrics,
+            labels=department_labels,
         ),
         "店铺业绩排行": build_department_performance_table_for_group(
             "店铺",
             "店铺编码",
             "store",
             store_volume,
-            store_amount,
+            store_amount_history,
             window_dates,
             volume_date_cols,
-            amount_date_cols,
-            month_amount_cols,
+            actual_dates,
             remaining_days,
             onsale_counts,
             inventory_metrics,
@@ -1240,8 +1475,7 @@ def build_department_performance_table_for_group(
     amount: pd.DataFrame,
     window_dates: list[pd.Timestamp],
     volume_date_cols: list[str],
-    amount_date_cols: list[str],
-    month_amount_cols: list[str],
+    actual_dates: list[pd.Timestamp],
     remaining_days: int,
     onsale_counts: dict[tuple[str, str | None], int],
     inventory_metrics: dict[tuple[str, str | None], dict[str, float]],
@@ -1263,8 +1497,7 @@ def build_department_performance_table_for_group(
                 amount[amount[group_col].eq(label)].copy(),
                 window_dates,
                 volume_date_cols,
-                amount_date_cols,
-                month_amount_cols,
+                actual_dates,
                 remaining_days,
                 onsale_counts,
                 inventory_metrics,
@@ -1276,7 +1509,10 @@ def build_department_performance_table_for_group(
     result = pd.DataFrame(rows)
     denominator = result["近7天日均销售额（元）"].sum()
     result["销售额贡献占比"] = result["近7天日均销售额（元）"].map(lambda value: safe_blank_ratio(value, denominator))
-    return result[department_performance_columns(label_col, window_dates)].reset_index(drop=True)
+    columns = department_performance_columns(label_col, window_dates)
+    if label_col == "开发员":
+        columns += ["预估中企原始销售额（元）", "预估本土原始销售额（元）"]
+    return result[columns].reset_index(drop=True)
 
 
 def build_department_performance_row(
@@ -1287,15 +1523,21 @@ def build_department_performance_row(
     amount: pd.DataFrame,
     window_dates: list[pd.Timestamp],
     volume_date_cols: list[str],
-    amount_date_cols: list[str],
-    month_amount_cols: list[str],
+    actual_dates: list[pd.Timestamp],
     remaining_days: int,
     onsale_counts: dict[tuple[str, str | None], int],
     inventory_metrics: dict[tuple[str, str | None], dict[str, float]],
 ) -> dict:
     total_volume_7 = volume[volume_date_cols].sum().sum() if not volume.empty else 0
-    total_amount_7 = amount[amount_date_cols].sum().sum() if not amount.empty else 0
-    month_amount = amount[month_amount_cols].sum().sum() if month_amount_cols and not amount.empty else 0
+    window_date_index = pd.DatetimeIndex(window_dates)
+    actual_date_index = pd.DatetimeIndex(actual_dates)
+    if amount.empty:
+        window_amount = 0.0
+        actual_amount = 0.0
+    else:
+        window_amount = amount.loc[amount["日期"].isin(window_date_index), "折算销售额"].sum()
+        actual_amount = amount.loc[amount["日期"].isin(actual_date_index), "折算销售额"].sum()
+    daily_average_amount = window_amount / 7
     row = {
         label_col: label,
         "在售SKU数量": onsale_counts.get((count_kind, label), 0),
@@ -1303,13 +1545,21 @@ def build_department_performance_row(
         "占用资金": inventory_metrics.get((count_kind, label), {}).get("占用资金", 0),
         "销售额贡献占比": 0,
         "近7天日均订单": total_volume_7 / 7,
-        "近7天日均销售额（元）": total_amount_7 / 7,
-        "预估本月销售额（元）": month_amount + (total_amount_7 / 7) * remaining_days,
+        "近7天日均销售额（元）": daily_average_amount,
+        "预估本月销售额（元）": actual_amount + daily_average_amount * remaining_days,
     }
-    for date, volume_col, amount_col in zip(window_dates, volume_date_cols, amount_date_cols):
+    if label_col == "开发员":
+        for kind, factor in [("中企", 0.8), ("本土", 1.0)]:
+            source = amount[amount["销售额系数"].eq(factor)]
+            actual = source.loc[source["日期"].isin(actual_date_index), "销售额（元）"].sum()
+            recent = source.loc[source["日期"].isin(window_date_index), "销售额（元）"].sum()
+            row[f"预估{kind}原始销售额（元）"] = actual + recent / 7 * remaining_days
+    for date, volume_col in zip(window_dates, volume_date_cols):
         label_prefix = f"{date.month}月{date.day}日"
         row[f"{label_prefix}销量"] = volume[volume_col].sum() if not volume.empty else 0
-        row[f"{label_prefix}销售额（元）"] = amount[amount_col].sum() if not amount.empty else 0
+        row[f"{label_prefix}销售额（元）"] = (
+            amount.loc[amount["日期"].eq(date), "折算销售额"].sum() if not amount.empty else 0
+        )
     return row
 
 
@@ -1418,7 +1668,11 @@ def normalize_replenishment_operational(df: pd.DataFrame) -> pd.DataFrame:
     if missing:
         raise ValueError(f"运营原始表缺少补货管理列：{', '.join(missing)}")
 
-    optional_columns = AGING_STOCK_COLUMNS + ["备注", "本地SKU"]
+    optional_columns = AGING_STOCK_COLUMNS + ["备注", "本地SKU"] + [
+        column
+        for column in REPLENISHMENT_MONITOR_SALES_COLUMNS
+        if column not in REPLENISHMENT_OPERATIONAL_REQUIRED_COLUMNS
+    ]
     base = df[
         REPLENISHMENT_OPERATIONAL_REQUIRED_COLUMNS
         + [column for column in optional_columns if column in df.columns]
@@ -1430,7 +1684,7 @@ def normalize_replenishment_operational(df: pd.DataFrame) -> pd.DataFrame:
         base[col] = base[col].fillna("").astype(str).str.strip()
     base["ASIN"] = base["ASIN"].str.upper()
     base["备注"] = base["备注"].fillna("").astype(str).str.strip()
-    for col in REPLENISHMENT_SALES_COLUMNS + REPLENISHMENT_FORMULA_STOCK_COLUMNS + AGING_STOCK_COLUMNS + ["单品重量(g)"]:
+    for col in REPLENISHMENT_MONITOR_SALES_COLUMNS + REPLENISHMENT_FORMULA_STOCK_COLUMNS + AGING_STOCK_COLUMNS + ["单品重量(g)"]:
         # Do not replace invalid/missing inputs with zero.  A replenishment
         # recommendation is unsafe unless every calculation input is present.
         base[col] = normalize_config_number(base[col])
@@ -1784,10 +2038,18 @@ def normalize_sales_history_2025(df: pd.DataFrame) -> pd.DataFrame:
 
 def normalize_sales_history_summary(df: pd.DataFrame) -> pd.DataFrame:
     """Validate the ASIN-level, fixed-width history used by replenishment."""
-    missing = [column for column in SALES_HISTORY_GENERIC_COLUMNS if column not in df.columns]
+    missing = [
+        column
+        for column in SALES_HISTORY_GENERIC_COLUMNS
+        if column not in df.columns and column not in SALES_HISTORY_RECENT_SITE_COLUMNS
+    ]
     if missing:
         raise ValueError(f"销量历史汇总缺少列：{', '.join(missing)}")
-    data = df[SALES_HISTORY_GENERIC_COLUMNS].copy()
+    data = df.copy()
+    for column in SALES_HISTORY_RECENT_SITE_COLUMNS:
+        if column not in data.columns:
+            data[column] = pd.NA
+    data = data[SALES_HISTORY_GENERIC_COLUMNS].copy()
     data["ASIN"] = data["ASIN"].fillna("").astype(str).str.strip().str.upper()
     if data["ASIN"].eq("").any():
         raise ValueError("销量历史汇总存在空ASIN")
@@ -1935,9 +2197,19 @@ def _build_sales_history_workbook_summary(
 
         all_asins: set[str] = set()
         site_totals: dict[str, dict[str, float]] = {}
+        recent_site_totals: dict[str, dict[str, float]] = {}
         daily_by_asin: dict[str, dict[date, float]] = {}
         total_rows = 0
         maximum_columns = 0
+        recent_end_year, recent_end_month = max(
+            (year, month) for _, year, month in sheet_dates
+        )
+        recent_end = date(
+            recent_end_year,
+            recent_end_month,
+            calendar.monthrange(recent_end_year, recent_end_month)[1],
+        )
+        recent_start = recent_end - timedelta(days=29)
 
         for sheet_name, year, month in sheet_dates:
             sheet = workbook[sheet_name]
@@ -1950,6 +2222,7 @@ def _build_sales_history_workbook_summary(
             header_index = {name: index for index, name in enumerate(headers)}
             expected_days = calendar.monthrange(year, month)[1]
             day_columns = [f"{month:02d}-{day:02d}销量" for day in range(1, expected_days + 1)]
+            dates = [date(year, month, day) for day in range(1, expected_days + 1)]
             required_columns = ["asin", "msku", "国家", "小计", *day_columns]
             missing_columns = [column for column in required_columns if column not in header_index]
             if missing_columns:
@@ -1997,9 +2270,17 @@ def _build_sales_history_workbook_summary(
                     asin, {code: 0.0 for code in SALES_HISTORY_2025_COUNTRIES.values()}
                 )
                 asin_sites[country_code] += daily_sum
+                asin_recent_sites = recent_site_totals.setdefault(
+                    asin, {code: 0.0 for code in SALES_HISTORY_2025_COUNTRIES.values()}
+                )
+                asin_recent_sites[country_code] += sum(
+                    value
+                    for day, value in zip(dates, daily_values)
+                    if recent_start <= day <= recent_end
+                )
                 asin_daily = daily_by_asin.setdefault(asin, {})
-                for index, value in enumerate(daily_values):
-                    asin_daily[date(year, month, index + 1)] = asin_daily.get(date(year, month, index + 1), 0.0) + value
+                for day, value in zip(dates, daily_values):
+                    asin_daily[day] = asin_daily.get(day, 0.0) + value
 
         all_dates = [
             date(year, month, day)
@@ -2032,6 +2313,11 @@ def _build_sales_history_workbook_summary(
             )
             for code in SALES_HISTORY_2025_COUNTRIES.values():
                 row[f"{code}总销量"] = _history_output_number(asin_sites[code])
+            asin_recent_sites = recent_site_totals.get(
+                asin, {code: 0.0 for code in SALES_HISTORY_2025_COUNTRIES.values()}
+            )
+            for code in SALES_HISTORY_2025_COUNTRIES.values():
+                row[f"{code}近30天销量"] = _history_output_number(asin_recent_sites[code])
             daily_values = [daily_by_asin.get(asin, {}).get(day, 0.0) for day in all_dates]
             excluded = excluded_stockout_dates(daily_values)
             for index, (label, dates) in enumerate(zip(month_labels, month_dates), start=1):
@@ -2161,10 +2447,18 @@ def build_sales_history_monthly_summary(
 
     all_asins: set[str] = set()
     site_totals: dict[str, dict[str, float]] = {}
+    recent_site_totals: dict[str, dict[str, float]] = {}
     daily_by_asin: dict[str, dict[date, float]] = {}
     total_rows = 0
     maximum_columns = 0
     month_dates: list[list[date]] = []
+    recent_end_year, recent_end_month = parsed[-1]
+    recent_end = date(
+        recent_end_year,
+        recent_end_month,
+        calendar.monthrange(recent_end_year, recent_end_month)[1],
+    )
+    recent_start = recent_end - timedelta(days=29)
 
     for month, source in ordered_sources:
         year, month_number = int(month[:4]), int(month[5:7])
@@ -2191,6 +2485,15 @@ def build_sales_history_monthly_summary(
             )
             daily_sum = sum(daily_values)
             asin_sites[country_code] += daily_sum
+            asin_recent_sites = recent_site_totals.setdefault(
+                asin,
+                {code: 0.0 for code in SALES_HISTORY_2025_COUNTRIES.values()},
+            )
+            asin_recent_sites[country_code] += sum(
+                value
+                for day, value in zip(dates, daily_values)
+                if recent_start <= day <= recent_end
+            )
             asin_daily = daily_by_asin.setdefault(asin, {})
             for day, value in zip(dates, daily_values):
                 asin_daily[day] = asin_daily.get(day, 0.0) + value
@@ -2215,6 +2518,11 @@ def build_sales_history_monthly_summary(
         asin_sites = site_totals.get(asin, {code: 0.0 for code in SALES_HISTORY_2025_COUNTRIES.values()})
         for code in SALES_HISTORY_2025_COUNTRIES.values():
             row[f"{code}总销量"] = _history_output_number(asin_sites[code])
+        asin_recent_sites = recent_site_totals.get(
+            asin, {code: 0.0 for code in SALES_HISTORY_2025_COUNTRIES.values()}
+        )
+        for code in SALES_HISTORY_2025_COUNTRIES.values():
+            row[f"{code}近30天销量"] = _history_output_number(asin_recent_sites[code])
         daily_values = [daily_by_asin.get(asin, {}).get(day, 0.0) for day in all_dates]
         excluded = excluded_stockout_dates(daily_values)
         for index, (label, dates) in enumerate(zip(labels, month_dates), start=1):
@@ -2452,30 +2760,28 @@ def build_replenishment_management_tables(
         for column in SKU_IMAGE_MAP_COLUMNS:
             data[column] = data.pop(f"{column}_映射")
         data = data.drop(columns=["_库存SKU关联键", "_虚拟SKU关联键"])
-    data["补货组ID"] = data.apply(
-        lambda row: str(row["ASIN"])
-        if str(row["ASIN"]).strip()
-        else f"异常-{str(row['MSKU']).strip() or row.name + 1}",
-        axis=1,
-    )
+    missing_asin = data["ASIN"].astype(str).str.strip().eq("")
+    data["补货组ID"] = data["ASIN"].astype(str)
+    for index in data.index[missing_asin]:
+        msku = str(data.at[index, "MSKU"]).strip()
+        data.at[index, "补货组ID"] = f"异常-{msku or index + 1}"
     calculation_day = pd.Timestamp(today).normalize() if today is not None else pd.Timestamp.today().normalize()
     data["上架天数"] = (calculation_day - data["上架时间"].dt.normalize()).dt.days
     numeric_required = REPLENISHMENT_SALES_COLUMNS + REPLENISHMENT_FORMULA_STOCK_COLUMNS + ["单品重量(g)"]
-    data["数据异常"] = ""
-    for index, row in data.iterrows():
-        issues: list[str] = []
-        if not str(row["ASIN"]).strip():
-            issues.append("缺少ASIN")
-        if not str(row["MSKU"]).strip():
-            issues.append("缺少MSKU")
-        if pd.isna(row["上架时间"]):
-            issues.append("缺少上架时间")
-        elif pd.isna(row["上架天数"]) or row["上架天数"] < 0:
-            issues.append("上架时间无效")
-        for column in numeric_required:
-            if pd.isna(row[column]):
-                issues.append(f"缺少{column}")
-        data.at[index, "数据异常"] = "；".join(issues)
+    issue_lists: list[list[str]] = [[] for _ in range(len(data))]
+
+    def add_issue(mask: pd.Series, label: str) -> None:
+        for position in np.flatnonzero(mask.fillna(True).to_numpy(dtype=bool)):
+            issue_lists[int(position)].append(label)
+
+    add_issue(data["ASIN"].astype(str).str.strip().eq(""), "缺少ASIN")
+    add_issue(data["MSKU"].astype(str).str.strip().eq(""), "缺少MSKU")
+    launch_missing = data["上架时间"].isna()
+    add_issue(launch_missing, "缺少上架时间")
+    add_issue(~launch_missing & (data["上架天数"].isna() | data["上架天数"].lt(0)), "上架时间无效")
+    for column in numeric_required:
+        add_issue(data[column].isna(), f"缺少{column}")
+    data["数据异常"] = ["；".join(issues) for issues in issue_lists]
 
     valid = data["数据异常"].eq("")
     data["校准日销量"] = pd.NA
@@ -2525,9 +2831,32 @@ def build_replenishment_management_tables(
 
     data["店铺状态"] = data["店铺名称"].map(store_status_text)
     data["SKU角色"] = "跟卖SKU"
-    asin_inventory = data.groupby("ASIN", dropna=False, sort=False)["SKU总库存"].agg(
-        lambda values: values.sum(min_count=len(values))
-    )
+    data["_补货组顺序"] = data.groupby("补货组ID", sort=False, dropna=False).ngroup()
+    data = data.sort_values(
+        ["_补货组顺序", "上架时间", "MSKU"],
+        kind="stable",
+        na_position="last",
+    ).drop(columns="_补货组顺序")
+    groups = data.groupby("补货组ID", sort=False, dropna=False)
+    group_positions = groups.indices
+    group_sizes = groups.size()
+    original_positions = [int(positions[0]) for positions in group_positions.values() if len(positions)]
+    data.iloc[original_positions, data.columns.get_loc("SKU角色")] = "原SKU"
+    aggregate_columns = [
+        "校准日销量", "SKU总库存", "SKU亚马逊可售", "T值", "库龄90天以上",
+        "库龄180-365天", "库龄365天以上", *REPLENISHMENT_MONITOR_SALES_COLUMNS,
+    ]
+    group_sums = groups[aggregate_columns].sum(min_count=1)
+    group_counts = groups[aggregate_columns].count()
+    group_sums = group_sums.where(group_counts.eq(group_sizes, axis=0), pd.NA)
+    group_sum_lookup = group_sums.to_dict("index")
+    group_max_weight = groups["单品重量(g)"].max().to_dict()
+
+    asin_groups = data.groupby("ASIN", dropna=False, sort=False)
+    asin_sizes = asin_groups.size()
+    asin_sums = asin_groups["SKU总库存"].sum(min_count=1)
+    asin_counts = asin_groups["SKU总库存"].count()
+    asin_inventory = asin_sums.where(asin_counts.eq(asin_sizes), pd.NA).to_dict()
 
     switch_map = {
         str(row["ASIN"]): (bool(row["是否补货"]), str(row["关闭原因"]))
@@ -2538,89 +2867,97 @@ def build_replenishment_management_tables(
     enabled_rules = rules[rules["是否启用"]].copy()
     enabled_rules["重量上限排序"] = enabled_rules["重量上限"].fillna(float("inf"))
     enabled_rules = enabled_rules.sort_values(["重量下限", "重量上限排序"], kind="stable")
+    sku_columns = [
+        "补货组ID", "ASIN", "SKU角色", "MSKU", "库存SKU", "虚拟SKU", "库存图片链接", "店铺名称", "店铺状态", "开发员",
+        "上架时间", "上架天数", "单品重量(g)", *REPLENISHMENT_MONITOR_SALES_COLUMNS,
+        "T值", "校准日销量", "SKU亚马逊可售", "SKU总库存", "库龄90天以上", "库龄180-365天",
+        "库龄365天以上", *REPLENISHMENT_FORMULA_STOCK_COLUMNS, "数据异常",
+    ]
 
-    for group_id, group in data.groupby("补货组ID", sort=False, dropna=False):
-        group = group.copy()
-        group_issues = [item for item in group["数据异常"].tolist() if item]
-        original_index = group.sort_values(["上架时间", "MSKU"], kind="stable", na_position="last").index[0]
-        group.loc[original_index, "SKU角色"] = "原SKU"
-        image_candidates = group[
-            group["库存图片链接"].fillna("").astype(str).str.strip().ne("")
-        ]
-        if original_index in image_candidates.index:
-            representative_image = image_candidates.loc[original_index]
-        elif not image_candidates.empty:
-            representative_image = image_candidates.sort_values(
-                ["上架时间", "MSKU"], kind="stable", na_position="last"
-            ).iloc[0]
-        else:
-            representative_image = None
-        max_weight = group["单品重量(g)"].max(skipna=True)
-        rule = pd.DataFrame()
+    ordered_records = data[sku_columns].to_dict("records")
+    image_by_group: dict[str, dict] = {}
+    original_by_group: dict[str, dict] = {}
+    for group_id, positions in group_positions.items():
+        if len(positions):
+            first = ordered_records[int(positions[0])]
+            original_by_group[group_id] = first
+            for position in positions:
+                candidate = ordered_records[int(position)]
+                url = candidate["库存图片链接"]
+                if pd.notna(url) and str(url).strip():
+                    image_by_group[group_id] = candidate
+                    break
+
+    group_issue_rows = data.loc[data["数据异常"].ne(""), ["补货组ID", "数据异常"]]
+    issues_by_group: dict[str, list[str]] = {}
+    for group_id, issue in group_issue_rows.itertuples(index=False, name=None):
+        issues_by_group.setdefault(group_id, []).append(issue)
+    rule_rows = enabled_rules.to_dict("records")
+    for group_id, positions in group_positions.items():
+        member_rows = [ordered_records[int(position)] for position in positions]
+        first_row = original_by_group[group_id]
+        group_issues = issues_by_group.get(group_id, [])
+        max_weight = group_max_weight.get(group_id)
+        matched_rules = []
         if not group_issues and pd.notna(max_weight):
-            rule = enabled_rules[(enabled_rules["重量下限"] <= max_weight) & (enabled_rules["重量上限"].isna() | (enabled_rules["重量上限"] > max_weight))]
-            if len(rule) != 1:
+            matched_rules = [
+                rule for rule in rule_rows
+                if rule["重量下限"] <= max_weight
+                and (pd.isna(rule["重量上限"]) or rule["重量上限"] > max_weight)
+            ]
+            if len(matched_rules) != 1:
                 group_issues.append("未匹配唯一库存覆盖规则")
         coverage_days = pd.NA
         transportation = ""
-        if len(rule) == 1:
-            matched = rule.iloc[0]
+        if len(matched_rules) == 1:
+            matched = matched_rules[0]
             transportation = str(matched["运输方式"])
             coverage_days = int(matched["头程时效"] + matched["预警天数"] + matched["补货频次"])
-        calibrated = group["校准日销量"].sum(min_count=len(group)) if not group_issues else pd.NA
-        inventory = group["SKU总库存"].sum(min_count=len(group)) if not group_issues else pd.NA
-        amazon_available = group["SKU亚马逊可售"].sum(min_count=len(group))
-        trend = group["T值"].sum(min_count=len(group))
-        asin_reference_inventory = sum(
-            (asin_inventory.get(asin, pd.NA) for asin in group["ASIN"].dropna().astype(str).unique()),
-            start=0,
-        )
-        if any(pd.isna(asin_inventory.get(asin, pd.NA)) for asin in group["ASIN"].dropna().astype(str).unique()):
+        sums = group_sum_lookup[group_id]
+        calibrated = sums["校准日销量"] if not group_issues else pd.NA
+        inventory = sums["SKU总库存"] if not group_issues else pd.NA
+        amazon_available = sums["SKU亚马逊可售"]
+        trend = sums["T值"]
+        asin_codes = list(dict.fromkeys(row["ASIN"] for row in member_rows if pd.notna(row["ASIN"])))
+        asin_inventory_values = [asin_inventory.get(asin, pd.NA) for asin in asin_codes]
+        asin_reference_inventory = sum(asin_inventory_values, start=0)
+        if any(pd.isna(value) for value in asin_inventory_values):
             asin_reference_inventory = pd.NA
         target_stock = calibrated * coverage_days if not group_issues else pd.NA
         measured = excel_round_to_ten(target_stock - inventory) if not group_issues else pd.NA
         replenishment_enabled, close_reason = switch_map.get(str(group_id), (True, ""))
         official = measured if replenishment_enabled and not group_issues else (0 if not group_issues else pd.NA)
         status = "数据异常" if group_issues else ("已关闭补货" if not replenishment_enabled else "正常")
-        asin_values = join_non_empty_values(group["ASIN"])
-        follower_skus = join_non_empty_values(group.loc[group.index != original_index, "MSKU"])
+        representative_image = image_by_group.get(group_id)
+        asin_values = join_non_empty_values([row["ASIN"] for row in member_rows])
+        follower_skus = join_non_empty_values([row["MSKU"] for row in member_rows[1:]])
         parent_rows.append(
             {
-                "补货组ID": str(group_id), "ASIN": asin_values, "原SKU": str(group.loc[original_index, "MSKU"]),
-                "跟卖SKU": follower_skus, "SKU数量": int(group["MSKU"].nunique()), "店铺编码": join_operational_store_codes(group["店铺名称"]),
-                "店铺状态": join_store_statuses(group["店铺状态"]),
+                "补货组ID": str(group_id), "ASIN": asin_values, "原SKU": str(first_row["MSKU"]),
+                "跟卖SKU": follower_skus, "SKU数量": len({row["MSKU"] for row in member_rows}), "店铺编码": join_operational_store_codes([row["店铺名称"] for row in member_rows]),
+                "店铺状态": join_store_statuses([row["店铺状态"] for row in member_rows]),
                 "库存SKU": representative_image.get("库存SKU") if representative_image is not None else pd.NA,
                 "虚拟SKU": representative_image.get("虚拟SKU") if representative_image is not None else pd.NA,
                 "库存图片链接": representative_image.get("库存图片链接") if representative_image is not None else pd.NA,
-                "开发员": join_non_empty_values(group["开发员"]), "最大重量(g)": max_weight,
+                "开发员": join_non_empty_values([row["开发员"] for row in member_rows]), "最大重量(g)": max_weight,
+                **{
+                    column: sums[column]
+                    for column in REPLENISHMENT_MONITOR_SALES_COLUMNS
+                },
                 "库存覆盖天数": coverage_days, "T值": trend, "校准日销量": calibrated,
                 "亚马逊可售": amazon_available, "总可售": inventory, "跟卖总可售": asin_reference_inventory,
                 "ASIN总库存": inventory,
-                "库龄90天以上": group["库龄90天以上"].sum(min_count=len(group)),
-                "库龄180-365天": group["库龄180-365天"].sum(min_count=len(group)),
-                "库龄365天以上": group["库龄365天以上"].sum(min_count=len(group)),
+                "库龄90天以上": sums["库龄90天以上"],
+                "库龄180-365天": sums["库龄180-365天"],
+                "库龄365天以上": sums["库龄365天以上"],
                 "目标库存": target_stock, "测算建议补货数量": measured, "建议补货数量": official,
                 "是否补货": replenishment_enabled, "关闭原因": close_reason,
                 "数据状态": status, "数据异常": "；".join(dict.fromkeys(group_issues)),
                 "运输方式": transportation,
             }
         )
-        for _, row in group.sort_values(["上架时间", "MSKU"], kind="stable", na_position="last").iterrows():
-            sku_rows.append(
-                {
-                    "补货组ID": str(group_id), "ASIN": row["ASIN"], "SKU角色": row["SKU角色"], "MSKU": row["MSKU"],
-                    "库存SKU": row["库存SKU"], "库存图片链接": row["库存图片链接"],
-                    "店铺名称": row["店铺名称"], "店铺状态": row["店铺状态"], "开发员": row["开发员"],
-                    "上架时间": row["上架时间"], "上架天数": row["上架天数"],
-                    "单品重量(g)": row["单品重量(g)"], "7天销量": row["7天销量"], "14天销量": row["14天销量"],
-                    "30天销量": row["30天销量"], "T值": row["T值"], "校准日销量": row["校准日销量"],
-                    "SKU亚马逊可售": row["SKU亚马逊可售"], "SKU总库存": row["SKU总库存"],
-                    "库龄90天以上": row["库龄90天以上"], "库龄180-365天": row["库龄180-365天"],
-                    "库龄365天以上": row["库龄365天以上"],
-                    **{column: row[column] for column in REPLENISHMENT_FORMULA_STOCK_COLUMNS},
-                    "数据异常": row["数据异常"],
-                }
-            )
+    for row in ordered_records:
+        sku_rows.append({"补货组ID": str(row["补货组ID"]), **row})
 
     detail = pd.DataFrame(parent_rows)
     sku_detail = pd.DataFrame(sku_rows)
@@ -2661,54 +2998,40 @@ def build_replenishment_management_tables(
         if column not in sku_detail.columns:
             sku_detail[column] = pd.NA
     if not sku_detail.empty:
-        promotion_rows: list[dict[str, object]] = []
-        for group_id, group in sku_detail.groupby("补货组ID", sort=False, dropna=False):
-            candidates = group[
-                group[
-                    [
-                        "最近促销开始日期", "最近促销截止日期", "最近促销折扣",
-                        "promotion_name", "promotion_updated_at",
-                    ]
-                ]
-                .notna()
-                .any(axis=1)
-            ].copy()
-            if candidates.empty:
-                continue
+        promotion_fields = [
+            "最近促销开始日期", "最近促销截止日期", "最近促销折扣",
+            "promotion_name", "promotion_updated_at",
+        ]
+        candidates = sku_detail.loc[sku_detail[promotion_fields].notna().any(axis=1)].copy()
+        if not candidates.empty:
             candidates["_开始日期"] = pd.to_datetime(candidates["最近促销开始日期"], errors="coerce")
             candidates["_截止日期"] = pd.to_datetime(candidates["最近促销截止日期"], errors="coerce")
             candidates["_更新时间"] = pd.to_datetime(candidates["promotion_updated_at"], errors="coerce")
             active = candidates[
                 candidates["_开始日期"].le(calculation_day)
                 & (candidates["_截止日期"].isna() | candidates["_截止日期"].ge(calculation_day))
-            ]
-            if not active.empty:
-                selected = active.sort_values(
-                    ["_截止日期", "_开始日期", "_更新时间"],
-                    ascending=[True, False, False],
-                    na_position="last",
-                    kind="stable",
-                ).iloc[0]
-            else:
-                ended = candidates[candidates["_截止日期"].lt(calculation_day)]
-                if ended.empty:
-                    continue
-                selected = ended.sort_values(
-                    ["_截止日期", "_开始日期", "_更新时间"],
-                    ascending=[False, False, False],
-                    na_position="last",
-                    kind="stable",
-                ).iloc[0]
-            promotion_rows.append(
-                {
-                    "补货组ID": str(group_id),
-                    "最近促销开始日期": selected.get("最近促销开始日期"),
-                    "最近促销截止日期": selected.get("最近促销截止日期"),
-                    "最近促销折扣": selected.get("最近促销折扣"),
-                }
-            )
-        if promotion_rows:
-            detail = detail.merge(pd.DataFrame(promotion_rows), on="补货组ID", how="left")
+            ].sort_values(
+                ["_截止日期", "_开始日期", "_更新时间"],
+                ascending=[True, False, False],
+                na_position="last",
+                kind="stable",
+            ).drop_duplicates("补货组ID", keep="first")
+            ended = candidates[
+                candidates["_截止日期"].lt(calculation_day)
+                & ~candidates["补货组ID"].isin(active["补货组ID"])
+            ].sort_values(
+                ["_截止日期", "_开始日期", "_更新时间"],
+                ascending=[False, False, False],
+                na_position="last",
+                kind="stable",
+            ).drop_duplicates("补货组ID", keep="first")
+            selected = pd.concat([active, ended], ignore_index=True, sort=False)
+            if not selected.empty:
+                detail = detail.merge(
+                    selected[["补货组ID", "最近促销开始日期", "最近促销截止日期", "最近促销折扣"]],
+                    on="补货组ID",
+                    how="left",
+                )
 
     enabled_tags = tags[tags["是否启用"]].copy()
     if not enabled_tags.empty:
@@ -2768,7 +3091,7 @@ def build_replenishment_store_distribution(detail: pd.DataFrame) -> pd.DataFrame
 def replenishment_management_columns() -> list[str]:
     return [
         "补货组ID", "ASIN", "原SKU", "跟卖SKU", "SKU数量", "店铺编码", "店铺状态", "库存SKU", "虚拟SKU", "库存图片链接", "开发员",
-        "最大重量(g)", "库存覆盖天数", "T值", "校准日销量", "亚马逊可售", "总可售",
+        "最大重量(g)", *REPLENISHMENT_MONITOR_SALES_COLUMNS, "库存覆盖天数", "T值", "校准日销量", "亚马逊可售", "总可售",
         "跟卖总可售", "ASIN总库存", "库龄90天以上", "库龄180-365天", "库龄365天以上",
         "目标库存", "测算建议补货数量", "建议补货数量", "是否补货", "关闭原因",
         "数据状态", "数据异常", "最近促销开始日期", "最近促销截止日期", "最近促销折扣",
@@ -2780,7 +3103,7 @@ def replenishment_sku_detail_columns() -> list[str]:
     return [
         "补货组ID", "ASIN", "SKU角色", "MSKU", "库存SKU", "库存图片链接", "店铺名称", "店铺状态", "开发员",
         *[f"{country}毛利率" for country in PRODUCT_COUNTRIES],
-        "上架时间", "上架天数", "单品重量(g)", "7天销量", "14天销量", "30天销量",
+        "上架时间", "上架天数", "单品重量(g)", *REPLENISHMENT_MONITOR_SALES_COLUMNS,
         "T值", "校准日销量", "SKU亚马逊可售", "SKU总库存", "库龄90天以上",
         "库龄180-365天", "库龄365天以上", *REPLENISHMENT_FORMULA_STOCK_COLUMNS,
         "最近促销开始日期", "最近促销截止日期", "最近促销折扣", "promotion_name",
@@ -2870,6 +3193,150 @@ def normalize_rating_source(df: pd.DataFrame) -> pd.DataFrame:
     base["Rating总数"] = normalize_config_number(base["Rating总数"]).fillna(0)
     base["评分"] = normalize_config_number(base["评分"])
     return base
+
+
+NEW_PRODUCT_MONITOR_SALES_COLUMNS = [
+    "昨天销量", "前天销量", "上前销量", "7天销量", "14天销量", "30天销量", "90天销量",
+]
+NEW_PRODUCT_MONITOR_COLUMNS = [
+    "SKU", "ASIN", "开发员", "开售时间", "开售天数", "可售数量", "日均销量", "可售覆盖天数",
+    *NEW_PRODUCT_MONITOR_SALES_COLUMNS, "监控状态", "提醒原因",
+]
+
+
+def build_new_product_monitor_table(
+    operational_df: pd.DataFrame,
+    launch_df: pd.DataFrame,
+    reference_date: date | datetime | pd.Timestamp | None = None,
+) -> pd.DataFrame:
+    """Build one null-safe, actionable row per SKU for recent product launches."""
+
+    required = ["MSKU", "ASIN", "开发员", "可售", "日均销量"]
+    missing = [column for column in required if column not in operational_df.columns]
+    if missing:
+        raise ValueError(f"运营原始表缺少新品监控列：{', '.join(missing)}")
+
+    output = pd.DataFrame(columns=NEW_PRODUCT_MONITOR_COLUMNS)
+    output.attrs["excluded_invalid_launch_count"] = 0
+    output.attrs["excluded_invalid_launch_by_developer"] = {}
+    if operational_df.empty:
+        return output
+
+    source = operational_df.copy()
+    source["SKU"] = source["MSKU"].fillna("").astype(str).str.strip()
+    source["_sku_key"] = source["SKU"].str.upper()
+    source = source[source["_sku_key"].ne("")].copy()
+    if source.empty:
+        return output
+
+    source["ASIN"] = source["ASIN"].fillna("").astype(str).str.strip()
+    source["_asin_key"] = source["ASIN"].str.upper()
+    source["开发员"] = source["开发员"].fillna("").astype(str).str.strip()
+
+    invalid_core = pd.Series(False, index=source.index)
+    numeric_columns = ["可售", "日均销量", *NEW_PRODUCT_MONITOR_SALES_COLUMNS]
+    for column in numeric_columns:
+        if column not in source.columns:
+            source[column] = pd.NA
+        raw = source[column]
+        parsed = normalize_config_number(raw)
+        if column in {"可售", "日均销量"}:
+            invalid_core |= parsed.isna() | parsed.lt(0).fillna(False)
+        else:
+            parsed = parsed.mask(parsed.lt(0))
+        source[column] = parsed
+    source["_invalid_core"] = invalid_core
+    source["_row_order"] = range(len(source))
+
+    launch = launch_df.copy()
+    for column in ["SKU", "开售时间"]:
+        if column not in launch.columns:
+            launch[column] = pd.NA
+    launch["_sku_key"] = launch["SKU"].fillna("").astype(str).str.strip().str.upper()
+    launch = launch[launch["_sku_key"].ne("")].drop_duplicates("_sku_key", keep="first")
+    launch_date = pd.to_datetime(launch["开售时间"], errors="coerce")
+    launch["_launch_date"] = launch_date.dt.normalize()
+
+    reference_day = pd.Timestamp(reference_date or date.today()).normalize()
+    source["_asin_missing"] = source["_asin_key"].eq("")
+    grouped = source.groupby("_sku_key", sort=False, dropna=False)
+    rows = grouped.agg(
+        SKU=("SKU", "first"),
+        ASIN=("ASIN", "first"),
+        _asin_count=("_asin_key", "nunique"),
+        _asin_missing=("_asin_missing", "max"),
+        _invalid_core=("_invalid_core", "max"),
+        _row_order=("_row_order", "min"),
+        开发员=("开发员", join_non_empty_values),
+    )
+    # Vectorized sums preserve all-missing groups with min_count=1; Python
+    # callbacks per SKU and metric otherwise dominate each cold calculation.
+    totals = grouped[["可售", "日均销量", *NEW_PRODUCT_MONITOR_SALES_COLUMNS]].sum(min_count=1)
+    rows = rows.join(totals.rename(columns={"可售": "可售数量"})).reset_index()
+    rows = rows.merge(
+        launch[["_sku_key", "_launch_date"]], on="_sku_key", how="left", validate="one_to_one"
+    )
+    rows["开售天数"] = (reference_day - rows["_launch_date"]).dt.days.astype("Int64")
+    valid_launch = rows["_launch_date"].notna() & rows["开售天数"].between(0, 100)
+    invalid_launch = rows["_launch_date"].isna() | rows["开售天数"].lt(0)
+    invalid_launch_rows = rows.loc[invalid_launch, ["_sku_key", "开发员"]]
+    output.attrs["excluded_invalid_launch_count"] = int(len(invalid_launch_rows))
+    output.attrs["excluded_invalid_launch_by_developer"] = {
+        str(sku_key): [name.strip() for name in str(developer_names).split("；") if name.strip()]
+        for sku_key, developer_names in zip(
+            invalid_launch_rows["_sku_key"], invalid_launch_rows["开发员"]
+        )
+    }
+    rows = rows[valid_launch].copy()
+    if rows.empty:
+        return output
+
+    rows["开售时间"] = rows["_launch_date"].dt.strftime("%Y-%m-%d")
+    rows["可售覆盖天数"] = rows["可售数量"] / rows["日均销量"].where(rows["日均销量"].gt(0))
+    rows["提醒原因"] = ""
+    rows["监控状态"] = "正常"
+    conflict = rows["_asin_count"].ne(1) | rows["_asin_missing"].astype(bool)
+    invalid_values = rows["_invalid_core"].astype(bool) | rows[["可售数量", "日均销量"]].isna().any(axis=1)
+    rows.loc[conflict | invalid_values, "监控状态"] = "数据异常"
+    rows.loc[conflict, "提醒原因"] = "同一 SKU 关联多个或缺少 ASIN"
+    rows.loc[~conflict & invalid_values, "提醒原因"] = "可售数量或日均销量缺失、无效"
+
+    eligible = ~conflict & ~invalid_values
+    out_of_stock = eligible & rows["可售数量"].eq(0)
+    zero_sales = eligible & rows["可售数量"].gt(0) & rows["日均销量"].eq(0)
+    raise_price = eligible & rows["可售数量"].gt(0) & rows["日均销量"].gt(0) & rows["可售覆盖天数"].lt(5)
+    lower_price = eligible & rows["可售数量"].gt(0) & rows["日均销量"].gt(0) & rows["可售覆盖天数"].gt(90)
+    observe = zero_sales & rows["开售天数"].lt(7)
+    zero_sales_lower = zero_sales & rows["开售天数"].ge(7)
+    rows.loc[out_of_stock, "监控状态"] = "已断货"
+    rows.loc[out_of_stock, "提醒原因"] = "可售数量为 0，关注补货"
+    rows.loc[observe, "监控状态"] = "新品观察中"
+    rows.loc[observe, "提醒原因"] = "日均销量为 0，开售未满 7 天"
+    rows.loc[zero_sales_lower, "监控状态"] = "建议降价"
+    rows.loc[zero_sales_lower, "提醒原因"] = "开售满 7 天仍无销量"
+    rows.loc[raise_price, "监控状态"] = "建议涨价"
+    rows.loc[raise_price, "提醒原因"] = "可售覆盖不足 5 天"
+    rows.loc[lower_price, "监控状态"] = "建议降价"
+    rows.loc[lower_price, "提醒原因"] = "可售覆盖超过 90 天"
+
+    rows["ASIN"] = rows["ASIN"].where(rows["_asin_count"].eq(1), "多个 ASIN")
+    result = rows[NEW_PRODUCT_MONITOR_COLUMNS].copy()
+    status_order = {"建议涨价": 0, "建议降价": 1, "已断货": 2, "新品观察中": 3, "正常": 4, "数据异常": 5}
+    result["_status_order"] = result["监控状态"].map(status_order)
+    lower_status = result["监控状态"].eq("建议降价")
+    zero_sales_lower = lower_status & result["日均销量"].eq(0)
+    result["_sort_coverage"] = result["可售覆盖天数"]
+    result.loc[lower_status & result["可售覆盖天数"].notna(), "_sort_coverage"] *= -1
+    result.loc[zero_sales_lower, "_sort_coverage"] = float("-inf")
+    result = result.sort_values(
+        ["_status_order", "_sort_coverage", "SKU"],
+        ascending=[True, True, True],
+        na_position="last",
+        kind="stable",
+    ).drop(columns=["_status_order", "_sort_coverage"]).reset_index(drop=True)
+    result.attrs["excluded_invalid_launch_count"] = output.attrs["excluded_invalid_launch_count"]
+    result.attrs["excluded_invalid_launch_by_developer"] = output.attrs["excluded_invalid_launch_by_developer"]
+    return result
 
 
 def build_product_management_table(
@@ -3203,6 +3670,20 @@ def normalize_rate(series: pd.Series) -> pd.Series:
 
 
 def normalize_config_number(series: pd.Series, percent_to_decimal: bool = False) -> pd.Series:
+    if pd.api.types.is_bool_dtype(series.dtype):
+        return pd.Series(float("nan"), index=series.index, dtype="float64")
+    if len(series) >= 512:
+        numeric = pd.to_numeric(series, errors="coerce").astype("float64")
+        fallback_mask = series.notna() & numeric.isna()
+        if fallback_mask.any():
+            text = normalized_numeric_text(series.loc[fallback_mask])
+            percent_mask = text.str.endswith("%", na=False)
+            cleaned = text.str.replace("%", "", regex=False)
+            fallback = pd.to_numeric(cleaned, errors="coerce").astype("float64")
+            if percent_to_decimal:
+                fallback.loc[percent_mask] = fallback.loc[percent_mask] / 100
+            numeric.loc[fallback_mask] = fallback
+        return numeric
     text = normalized_numeric_text(series)
     percent_mask = text.str.endswith("%", na=False)
     cleaned = text.str.replace("%", "", regex=False)
@@ -3213,11 +3694,23 @@ def normalize_config_number(series: pd.Series, percent_to_decimal: bool = False)
 
 
 def normalized_numeric_text(series: pd.Series) -> pd.Series:
-    # ``Series.map`` can infer an integer/boolean dtype when all normalized
-    # values happen to be numbers (with missing values).  The callers below
-    # use pandas' string accessors, so keep the normalized representation on a
-    # StringDtype series regardless of the source column dtype.
-    return series.map(clean_numeric_text).astype("string")
+    """Normalize numeric-like values with pandas string operations.
+
+    Sales exports can contain millions of daily cells. Mapping the scalar
+    cleaner over each value made a cold department calculation spend most of
+    its time in Python; these vectorized steps preserve the same prefix-number,
+    Unicode, currency, missing-token, and parenthesized-negative behavior.
+    """
+    text = series.astype("string").str.normalize("NFKC").str.strip()
+    missing = text.str.lower().isin({"", "nan", "none", "null", "nat", "-", "--", "—", "–", "未配置"})
+    negative = text.str.startswith("(", na=False) & text.str.endswith(")", na=False)
+    text = text.where(~negative, text.str.slice(1, -1).str.strip())
+    text = text.str.replace("[\u00a0\u2007\u202f\u3000 \t,，￥¥$€£]", "", regex=True)
+    text = text.str.replace(r"[−–—]", "-", regex=True)
+    numeric_prefix = text.str.extract(r"^([-+]?(?:\d+(?:\.\d*)?|\.\d+)%?)", expand=False)
+    add_negative = negative & numeric_prefix.notna() & ~numeric_prefix.str.startswith("-", na=False)
+    numeric_prefix = numeric_prefix.where(~add_negative, "-" + numeric_prefix)
+    return numeric_prefix.mask(missing).astype("string")
 
 
 def clean_numeric_text(value) -> str | None:
@@ -3418,6 +3911,156 @@ def build_person_commission_summary(
         total_row["毛利润"] / total_row["营业额"] if pd.notna(total_row["营业额"]) and total_row["营业额"] else pd.NA
     )
     return pd.concat([summary, pd.DataFrame([total_row])[columns]], ignore_index=True)
+
+
+
+COMMISSION_MONITOR_COLUMNS = ["人员", "营业额", "毛利润", "毛利率", "提成预估", "配置状态"]
+COMMISSION_PLACEHOLDER_NAMES = {"", "无销售员", "未分配开发员", "未分配", "无开发员"}
+
+
+def _commission_config_value(row: pd.Series | None, column: str):
+    if row is None or column not in row.index:
+        return None
+    value = row[column]
+    return None if pd.isna(value) else value.item() if hasattr(value, "item") else value
+
+
+def build_commission_monitor_details(
+    df: pd.DataFrame,
+    commission_config: pd.DataFrame,
+    department_fee_config: pd.DataFrame,
+) -> dict[str, dict[str, object]]:
+    """Return editable raw config rows grouped by the displayed developer name."""
+    if df.empty or "月份" not in df.columns or "销售专员" not in df.columns:
+        return {}
+    commission = normalize_commission_config(commission_config)
+    fees = normalize_department_fee_config(department_fee_config)
+    details: dict[str, dict[str, object]] = {}
+    source = df.copy()
+    source["__raw_developer"] = source["销售专员"].fillna("").astype(str).str.strip()
+    source["__display_developer"] = source["__raw_developer"].map(normalize_department_person_name)
+    source["__display_developer"] = source["__display_developer"].where(
+        source["__display_developer"].astype(str).str.strip().ne(""), source["__raw_developer"]
+    )
+    source["__display_developer"] = source["__display_developer"].where(
+        source["__display_developer"].astype(str).str.strip().ne(""), "未分配开发员"
+    )
+    for (month, raw_developer, display_developer), group in source.groupby(
+        ["月份", "__raw_developer", "__display_developer"], dropna=False
+    ):
+        month = normalize_month(month) or str(month)
+        raw_developer = str(raw_developer or "").strip()
+        display_developer = str(display_developer or "未分配开发员").strip()
+        bucket = details.setdefault(
+            display_developer,
+            {"人员": display_developer, "开发员配置": [], "部门费用率": [], "无需配置": False},
+        )
+        placeholder = raw_developer in COMMISSION_PLACEHOLDER_NAMES or display_developer in COMMISSION_PLACEHOLDER_NAMES
+        bucket["无需配置"] = bool(bucket["无需配置"]) or placeholder
+        config_rows = commission[
+            commission["月份"].eq(month) & commission["开发员"].astype(str).str.strip().eq(raw_developer)
+        ]
+        config_row = config_rows.iloc[0] if not config_rows.empty else None
+        missing = [column for column in ("库存计提", "弃置", "职位提点") if _commission_config_value(config_row, column) is None]
+        bucket["开发员配置"].append(
+            {
+                "月份": month,
+                "开发员": raw_developer,
+                "库存计提": _commission_config_value(config_row, "库存计提"),
+                "弃置": _commission_config_value(config_row, "弃置"),
+                "职位提点": _commission_config_value(config_row, "职位提点"),
+                "缺失字段": [] if placeholder else missing,
+                "无需配置": placeholder,
+            }
+        )
+        departments = group.get("部门", pd.Series(dtype=object)).fillna("").astype(str).str.strip().drop_duplicates()
+        for department in departments[departments.ne("")]:
+            fee_rows = fees[fees["月份"].eq(month) & fees["部门"].astype(str).str.strip().eq(department)]
+            fee_row = fee_rows.iloc[0] if not fee_rows.empty else None
+            fee_missing = _commission_config_value(fee_row, "费用率") is None
+            fee_key = (month, department)
+            fee_items = bucket["部门费用率"]
+            if not any((item.get("月份"), item.get("部门")) == fee_key for item in fee_items):
+                fee_items.append(
+                    {
+                        "月份": month,
+                        "部门": department,
+                        "费用率": _commission_config_value(fee_row, "费用率"),
+                        "缺失字段": [] if placeholder else (["费用率"] if fee_missing else []),
+                        "无需配置": placeholder,
+                    }
+                )
+    for bucket in details.values():
+        bucket["开发员配置"] = sorted(bucket["开发员配置"], key=lambda item: str(item.get("开发员") or ""))
+        bucket["部门费用率"] = sorted(bucket["部门费用率"], key=lambda item: str(item.get("部门") or ""))
+    return details
+
+
+def build_department_commission_monitor(
+    df: pd.DataFrame,
+    metric_config: pd.DataFrame,
+    commission_config: pd.DataFrame,
+    department_fee_config: pd.DataFrame,
+) -> tuple[pd.DataFrame, dict[str, dict[str, object]]]:
+    """Build the department commission table with actionable config diagnostics."""
+    detail = compute_commission_table(df, metric_config, commission_config, department_fee_config)
+    if detail.empty:
+        return pd.DataFrame(columns=COMMISSION_MONITOR_COLUMNS), {}
+    numeric = detail.copy()
+    for col in ["营业额", "毛利润", "提成预估"]:
+        numeric[col] = pd.to_numeric(numeric[col], errors="coerce")
+    numeric["人员"] = numeric["开发员"].map(normalize_department_person_name)
+    numeric["人员"] = numeric["人员"].where(numeric["人员"].astype(str).str.strip().ne(""), numeric["开发员"])
+    numeric["人员"] = numeric["人员"].where(numeric["人员"].astype(str).str.strip().ne(""), "未分配开发员")
+    summary = numeric.groupby("人员", dropna=False, as_index=False).agg(
+        营业额=("营业额", "sum"),
+        毛利润=("毛利润", "sum"),
+        提成预估=("提成预估", lambda values: values.sum(min_count=1)),
+    )
+    summary["毛利率"] = summary.apply(
+        lambda row: row["毛利润"] / row["营业额"] if pd.notna(row["营业额"]) and row["营业额"] else pd.NA,
+        axis=1,
+    )
+    details = build_commission_monitor_details(df, commission_config, department_fee_config)
+    statuses: dict[str, str] = {}
+    for person, bucket in details.items():
+        if bucket.get("无需配置") and all(item.get("无需配置") for item in bucket.get("开发员配置", [])):
+            statuses[person] = "无需配置"
+            continue
+        missing_items: list[str] = []
+        for item in bucket.get("开发员配置", []):
+            fields = item.get("缺失字段") or []
+            if fields:
+                missing_items.append(f"{item.get('开发员') or '未分配开发员'}：缺{','.join(fields)}")
+        for item in bucket.get("部门费用率", []):
+            fields = item.get("缺失字段") or []
+            if fields:
+                missing_items.append(f"{item.get('部门')}：缺费用率")
+        statuses[person] = "；".join(dict.fromkeys(missing_items)) if missing_items else "已配置"
+    summary["配置状态"] = summary["人员"].map(statuses).fillna("已配置")
+    summary = summary[COMMISSION_MONITOR_COLUMNS].sort_values(
+        ["提成预估", "人员"], ascending=[False, True], na_position="last"
+    ).reset_index(drop=True)
+    missing_people = int(summary["配置状态"].map(lambda value: value not in {"已配置", "无需配置"}).sum())
+    missing_keys: set[tuple[str, str, str, str]] = set()
+    for bucket in details.values():
+        for item in bucket.get("开发员配置", []):
+            if not item.get("无需配置"):
+                missing_keys.update(("developer", str(item.get("月份") or ""), str(item.get("开发员") or ""), field) for field in (item.get("缺失字段") or []))
+        for item in bucket.get("部门费用率", []):
+            if not item.get("无需配置"):
+                missing_keys.update(("department", str(item.get("月份") or ""), str(item.get("部门") or ""), field) for field in (item.get("缺失字段") or []))
+    missing_items_count = len(missing_keys)
+    total_row = {
+        "人员": "合计",
+        "营业额": summary["营业额"].sum(),
+        "毛利润": summary["毛利润"].sum(),
+        "毛利率": pd.NA,
+        "提成预估": summary["提成预估"].sum(min_count=1),
+        "配置状态": f"缺配置人员 {missing_people} 人 / {missing_items_count} 项" if missing_items_count else "已配置",
+    }
+    total_row["毛利率"] = total_row["毛利润"] / total_row["营业额"] if total_row["营业额"] else pd.NA
+    return pd.concat([summary, pd.DataFrame([total_row])[COMMISSION_MONITOR_COLUMNS]], ignore_index=True), details
 
 
 def compute_stopped_commission_table(

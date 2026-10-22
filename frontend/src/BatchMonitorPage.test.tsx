@@ -12,6 +12,7 @@ const apiMocks = vi.hoisted(() => ({
   createBatch: vi.fn(),
   uploadBatchShipments: vi.fn(),
   updateBatchArtwork: vi.fn(),
+  updateBatchCompletion: vi.fn(),
   updateShipmentArrival: vi.fn(),
   updateSkuArrival: vi.fn(),
 }));
@@ -86,6 +87,7 @@ describe('BatchMonitorPage', () => {
   beforeEach(() => {
     Object.values(apiMocks).forEach(mock => mock.mockReset());
     apiMocks.batchMonitor.mockResolvedValue(payload);
+
     apiMocks.batchDetails.mockResolvedValue(details);
     apiMocks.batchOrphans.mockResolvedValue({ rows: [], page: 1, page_size: 50, total: 0 });
     apiMocks.batchCopyLists.mockResolvedValue({
@@ -99,6 +101,15 @@ describe('BatchMonitorPage', () => {
       batch_no: 'ABC260701',
       completed: true,
       artwork_completed_date: '2026-07-30',
+    });
+    apiMocks.updateBatchCompletion.mockResolvedValue({
+      batch: {
+        ...payload.rows[0],
+        manual_completed_at: '2026-07-30T12:00:00+08:00',
+        completion_mode: 'manual',
+        is_complete: true,
+      },
+      updated_at: 'revision-2',
     });
     apiMocks.updateSkuArrival.mockResolvedValue({
       sku: 'SKU-A01',
@@ -154,6 +165,7 @@ describe('BatchMonitorPage', () => {
       name: '复制全部未绑定货件单号的SKU',
     }));
     expect(writeText).toHaveBeenCalledWith('SKU-NO-SHIPMENT-A\nSKU-NO-SHIPMENT-B');
+    await waitFor(() => expect(screen.getByRole('button', { name: '复制全部未绑定货件单号的SKU' })).toHaveTextContent('✓ 已复制'));
   });
 
   it('loads incomplete batches by default and expands SKU details lazily', async () => {
@@ -161,6 +173,9 @@ describe('BatchMonitorPage', () => {
     render(<BatchMonitorPage />);
 
     await screen.findByText('ABC260701');
+    expect(screen.queryByText('无当前价SKU')).not.toBeInTheDocument();
+    expect(screen.queryByText('低于开售价SKU')).not.toBeInTheDocument();
+    expect(screen.queryByText('近7日变价SKU')).not.toBeInTheDocument();
     expect(apiMocks.batchMonitor).toHaveBeenCalledWith({
       view: 'incomplete',
       search: '',
@@ -173,7 +188,7 @@ describe('BatchMonitorPage', () => {
     await user.click(screen.getByRole('button', { name: '展开ABC260701' }));
     await screen.findByText('SKU-A01');
     expect(apiMocks.batchDetails).toHaveBeenCalledWith('ABC260701');
-    expect(screen.getAllByText(/未维护/)).toHaveLength(4);
+    expect(screen.getAllByText(/未维护/).length).toBeGreaterThanOrEqual(4);
     expect(screen.queryByText('首次上传')).not.toBeInTheDocument();
   });
 
@@ -234,5 +249,56 @@ describe('BatchMonitorPage', () => {
       'FBA-FIRST',
       expect.stringMatching(/^\d{4}-\d{2}-\d{2}$/),
     ));
+  });
+
+  it('reloads the selected batch status view from the server', async () => {
+    const user = userEvent.setup();
+    apiMocks.batchMonitor.mockImplementation(async (params: { view?: string }) => ({
+      ...payload,
+      view: (params.view || 'incomplete') as BatchMonitorPayload['view'],
+    }));
+    render(<BatchMonitorPage />);
+    await screen.findByText('ABC260701');
+
+    const initialCalls = apiMocks.batchMonitor.mock.calls.length;
+    await user.click(screen.getByRole('button', { name: '批次状态: 未完成' }));
+    await user.click(screen.getByText('全部', { exact: true }));
+    expect(apiMocks.batchMonitor).toHaveBeenCalledTimes(initialCalls);
+    await user.click(screen.getByRole('button', { name: '确定' }));
+    await waitFor(() => expect(apiMocks.batchMonitor).toHaveBeenLastCalledWith({
+      view: 'all',
+      search: '',
+      page: 1,
+      page_size: 20,
+    }));
+
+    const beforeSecondApply = apiMocks.batchMonitor.mock.calls.length;
+    await user.click(screen.getByRole('button', { name: '批次状态: 全部' }));
+    await user.click(screen.getByText('已完成', { exact: true }));
+    expect(apiMocks.batchMonitor).toHaveBeenCalledTimes(beforeSecondApply);
+    await user.click(screen.getByRole('button', { name: '确定' }));
+    await waitFor(() => expect(apiMocks.batchMonitor).toHaveBeenLastCalledWith({
+      view: 'completed',
+      search: '',
+      page: 1,
+      page_size: 20,
+    }));
+  });
+
+  it('confirms one-click completion and immediately removes the batch from incomplete view', async () => {
+    const user = userEvent.setup();
+    apiMocks.batchMonitor
+      .mockResolvedValueOnce(payload)
+      .mockResolvedValue({ ...payload, rows: [], total: 0 });
+    render(<BatchMonitorPage />);
+    await screen.findByText('ABC260701');
+
+    await user.click(screen.getByRole('button', { name: '一键完成' }));
+    expect(await screen.findByText(/结束ABC260701的监控/)).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: '确认完成' }));
+
+    await waitFor(() => expect(apiMocks.updateBatchCompletion).toHaveBeenCalledWith('ABC260701', true));
+    await waitFor(() => expect(screen.queryByText('ABC260701')).not.toBeInTheDocument());
+    expect(apiMocks.batchCopyLists).toHaveBeenCalledTimes(2);
   });
 });

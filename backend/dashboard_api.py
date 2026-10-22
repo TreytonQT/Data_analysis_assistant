@@ -1,10 +1,16 @@
 from __future__ import annotations
 
 import io
+import hashlib
 import json
+import math
+import re
 from datetime import date, datetime
 from functools import lru_cache
 from pathlib import Path
+from threading import Lock, Timer
+from concurrent.futures import ThreadPoolExecutor
+import logging
 from typing import Any, Callable, Iterator
 from urllib.parse import quote
 
@@ -13,7 +19,7 @@ from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from backend.batch_monitor import batch_monitor_revision
-from backend.db import DB_PATH, LOCAL_TIMEZONE, connect
+from backend.db import LOCAL_TIMEZONE, connect
 
 from dashboard.data_processing import (
     SALES_HISTORY_GENERIC_COLUMNS,
@@ -21,12 +27,21 @@ from dashboard.data_processing import (
     SALES_HISTORY_2025_MONTH_COLUMNS,
     SALES_HISTORY_2025_SITE_COLUMNS,
     build_alerts,
+
     build_department_performance_tables,
     build_department_assessment_report,
     build_low_margin_product_table,
     build_person_commission_summary,
+    build_department_commission_monitor,
     build_product_management_table,
+    build_new_product_monitor_table,
+    build_product_gross_columns,
+    build_product_rating_columns,
+    normalize_gross_profit_source,
+    normalize_rating_source,
+    PRODUCT_COUNTRIES,
     build_replenishment_management_tables,
+    build_replenishment_site_sales_summary,
     build_sales_history_monthly_summary,
     build_sales_dashboard_tables,
     build_slow_moving_inventory_table,
@@ -61,15 +76,21 @@ from dashboard.parquet_cache import (
     load_or_build_parquet,
     revision_digest,
 )
+from dashboard.derived_table_cache import load_or_build_frame_bundle
 from dashboard.promotions import normalize_promotion_sku
+from backend.listing_prices import cached_listing_bundle, latest_listing_wide, listing_history, listing_index_path, listing_root, observation_rows
 from dashboard.report_store import (
     DATA_DIR,
+    department_sales_amount_history_path,
     get_latest_source_path,
     get_sales_history_paths,
+    latest_source_index_path,
+    load_latest_source_record,
     load_reports_from_records,
     load_sales_history_records,
     load_upload_records,
     sales_history_index_path,
+    load_department_sales_amount_history,
 )
 from app_paths import CONFIG_DIR
 
@@ -200,6 +221,26 @@ def performance_with_total(frame: pd.DataFrame) -> pd.DataFrame:
     return with_department_performance_total(frame)
 
 
+def performance_section(key: str, title: str, frame: pd.DataFrame) -> dict[str, Any]:
+    total_frame = performance_with_total(frame)
+    component_fields = ["预估中企原始销售额（元）", "预估本土原始销售额（元）"]
+    if not all(field in total_frame.columns for field in component_fields):
+        return section(key, title, total_frame, formats={"库存总数": "整数", "占用资金": "金额"})
+    components = {
+        row["开发员"]: {"enterprise": row[component_fields[0]], "local": row[component_fields[1]]}
+        for row in records(total_frame)
+    }
+
+    def serialize_rows(visible: pd.DataFrame) -> list[dict[str, Any]]:
+        return [{**row, "forecast_sales": components[row["开发员"]]} for row in records(visible)]
+
+    return section(
+        key, title, total_frame.drop(columns=component_fields),
+        formats={"库存总数": "整数", "占用资金": "金额"},
+        rows_serializer=serialize_rows,
+    )
+
+
 def selected_values(csv_value: str | None, available: list[str]) -> list[str]:
     if not csv_value:
         return available
@@ -236,7 +277,7 @@ def load_source_frame(key: str, title: str) -> pd.DataFrame:
             for _, row in records_frame.iterrows()
         }
         return load_or_build_parquet(
-            "source-sales_history_rolling-raw",
+            "source-sales_history_rolling-raw-v2",
             [sales_history_index_path(), *paths],
             lambda: build_sales_history_monthly_summary(
                 [(month_by_path[path.name], path) for path in paths]
@@ -328,6 +369,10 @@ def _slow_moving_csv_frame(
         "SKU",
         "ASIN",
         "开发员",
+        "调价生效日期",
+        "本次调价降幅",
+        "累计调价降幅",
+        "最近限时活动名称",
         "最近促销开始日期",
         "最近促销截止日期",
         "最近促销折扣",
@@ -335,7 +380,7 @@ def _slow_moving_csv_frame(
         "库存SKU",
         "虚拟SKU",
     ]
-    overview = ["日均销量", "90天以上库存数合计", "90天以上占用资金合计", "库存计提", "弃置费"]
+    overview = ["日均销量", "总库存数", "可售天数", "90天以上库存数合计", "90天以上占用资金合计", "库存计提", "弃置费"]
     stock = ["91-180天库存数", "181-330天库存数", "331-365天库存数", "366-455天库存数", "456天以上库存数"]
     capital = ["91-180天占用资金", "181-330天占用资金", "331-365天占用资金", "366-455天占用资金", "456天占用资金"]
     ordered = identity + overview + stock + capital
@@ -344,8 +389,12 @@ def _slow_moving_csv_frame(
         "库存计提": "库存计提（元）",
         "弃置费": "弃置费（元）",
         **{column: f"{column}（元）" for column in capital},
+        "本次调价降幅": "本次调价降幅（%）",
+        "累计调价降幅": "累计调价降幅（%）",
         "最近促销折扣": "最近促销折扣（%）",
         "日均销量": "日均销量（件/天）",
+        "总库存数": "总库存数（件）",
+        "可售天数": "可售天数（天）",
     }
 
     def image_value(value: object, field: str) -> object:
@@ -588,6 +637,8 @@ def _build_slow_moving(developers: str | None, threshold: str) -> dict[str, Any]
     image_lookup = _sku_image_lookup(operational, _optional_sku_image_map())
     detail = build_slow_moving_inventory_table(operational, threshold)
     detail = merge_slow_moving_promotion_data(detail, _last_promotion_rows())
+    from backend.pricing import merge_adjustments
+    detail = merge_adjustments(detail)
     metrics = [] if detail.empty else [
         metric("滞销SKU数", len(detail), "integer"),
         metric("90天以上库存数", detail["90天以上库存数合计"].sum(), "integer"),
@@ -609,7 +660,7 @@ def _build_slow_moving(developers: str | None, threshold: str) -> dict[str, Any]
                 "detail",
                 "滞销 SKU 明细",
                 detail,
-                formats={"日均销量": "数值"},
+                formats={"日均销量": "数值", "可售天数": "数值"},
                 rows_serializer=_rows_with_sku_images(image_lookup),
                 export_frame_serializer=_slow_moving_csv_frame(image_lookup),
             )
@@ -618,6 +669,7 @@ def _build_slow_moving(developers: str | None, threshold: str) -> dict[str, Any]
 
 
 SLOW_MOVING_PROMOTION_COLUMNS = [
+    "最近限时活动名称",
     "最近促销开始日期",
     "最近促销截止日期",
     "最近促销折扣",
@@ -641,6 +693,7 @@ def merge_slow_moving_promotion_data(
 
     source = promotions.copy()
     source_columns = {
+        "最近限时活动名称": "promotion_name",
         "最近促销开始日期": "start_date",
         "最近促销截止日期": "end_date",
         "最近促销折扣": "discount_percent",
@@ -840,7 +893,8 @@ def merge_product_promotion_data(detail: pd.DataFrame, promotions: pd.DataFrame)
     )
     result = result.sort_values("_product_row_order", kind="stable")
     result = result.drop(columns=["_product_row_order", "_promotion_sku"])
-    return result.reset_index(drop=True)
+    from backend.pricing import merge_adjustments
+    return merge_adjustments(result.reset_index(drop=True))
 
 
 def _batch_monitor_updated_timestamp() -> float:
@@ -854,28 +908,353 @@ def _batch_monitor_updated_timestamp() -> float:
         return 0.0
 
 
-def _build_products(developers: str | None) -> dict[str, Any]:
+def merge_listing_price_data(detail: pd.DataFrame) -> pd.DataFrame:
+    result = detail.copy()
+    try:
+        source = latest_listing_wide()
+    except Exception:
+        source = pd.DataFrame()
+    if source.empty or "SKU" not in result.columns:
+        return result
+    result["_listing_sku"] = result["SKU"].fillna("").astype(str).str.strip().str.upper()
+    source["_listing_sku"] = source["MSKU"].fillna("").astype(str).str.strip().str.upper()
+    source = source.drop_duplicates("_listing_sku", keep="last")
+    country_names = {"DE": "德国", "FR": "法国", "ES": "西班牙", "IT": "意大利"}
+    selected = ["_listing_sku"]
+    renames = {}
+    for code, country in country_names.items():
+        for field, label in (
+            (f"{code}_当前实际总价", f"{country}Listing当前实际总价"),
+            (f"{code}_Listing原价", f"{country}Listing原价"),
+            (f"{code}_Listing优惠价", f"{country}Listing优惠价"),
+            (f"{code}_较开售价变化", f"{country}较开售价变化"),
+        ):
+            if field in source.columns:
+                selected.append(field)
+                renames[field] = label
+    if len(selected) == 1:
+        return result.drop(columns=["_listing_sku"])
+    merged = result.merge(source[selected].rename(columns=renames), on="_listing_sku", how="left", sort=False, validate="many_to_one")
+    return merged.drop(columns=["_listing_sku"])
+
+
+NEW_PRODUCT_LAUNCH_STAGES = {"all", "0-6", "7-29", "30-59", "60-100"}
+NEW_PRODUCT_STATUSES = {"all", "raise", "lower", "normal", "out_of_stock", "observing", "invalid"}
+NEW_PRODUCT_STATUS_LABELS = {
+    "raise": "建议涨价",
+    "lower": "建议降价",
+    "normal": "正常",
+    "out_of_stock": "已断货",
+    "observing": "新品观察中",
+    "invalid": "数据异常",
+}
+
+
+def _new_product_business_day() -> date:
+    return datetime.now(LOCAL_TIMEZONE).date()
+
+
+def _new_product_source_paths() -> list[Path]:
+    """Only these sources affect new-product calculations and presentation."""
+
+    paths: set[Path] = set()
+    for key in ("operational_sales", "gross_profit", "rating", "sku_image_map"):
+        index = latest_source_index_path(key)
+        if index.exists():
+            paths.add(index)
+        source = get_latest_source_path(key)
+        if source and source.exists():
+            paths.add(source)
+    return sorted(paths, key=str)
+
+
+def _new_product_revision() -> str:
+    sources = revision_digest("new-product-sources-v1", _new_product_source_paths())
+    return f"{sources}:{batch_monitor_revision()}"
+
+
+_NEW_PRODUCT_BASE_LOCK = Lock()
+
+
+@lru_cache(maxsize=2)
+def _cached_new_product_base(revision: str, business_day: str) -> dict[str, Any]:
+    """Aggregate and enrich once per source revision and business date."""
+
+    del revision
+    operational = load_source_frame("operational_sales", "运营原始表")
+    options = developer_options(operational)
+    detail = build_new_product_monitor_table(
+        operational, _product_launch_rows(), reference_date=date.fromisoformat(business_day)
+    )
+    excluded_launch_count = int(detail.attrs.get("excluded_invalid_launch_count", 0))
+    excluded_by_developer = detail.attrs.get("excluded_invalid_launch_by_developer", {})
+    context_columns: list[str] = []
+    if not detail.empty:
+        try:
+            gross = normalize_gross_profit_source(load_source_frame("gross_profit", "毛利原始表"))
+            gross_rows = build_product_gross_columns(gross, ["ASIN", "MSKU"]).rename(columns={"MSKU": "SKU"})
+            gross_rows["_sku_key"] = gross_rows["SKU"].fillna("").astype(str).str.strip().str.upper()
+            gross_rows["_asin_key"] = gross_rows["ASIN"].fillna("").astype(str).str.strip().str.upper()
+            context_columns.extend(
+                column
+                for country in PRODUCT_COUNTRIES
+                for column in (f"{country}销量", f"{country}毛利率")
+                if column in gross_rows.columns
+            )
+            gross_rows = gross_rows.drop_duplicates(["_sku_key", "_asin_key"], keep="first")
+            detail["_sku_key"] = detail["SKU"].fillna("").astype(str).str.strip().str.upper()
+            detail["_asin_key"] = detail["ASIN"].fillna("").astype(str).str.strip().str.upper()
+            detail = detail.merge(
+                gross_rows[["_sku_key", "_asin_key", *context_columns]],
+                on=["_sku_key", "_asin_key"],
+                how="left",
+                validate="many_to_one",
+            ).drop(columns=["_sku_key", "_asin_key"])
+        except Exception:
+            context_columns = []
+        try:
+            rating = normalize_rating_source(load_source_frame("rating", "Rating"))
+            rating_rows = build_product_rating_columns(rating)
+            if "Rating" in rating_rows.columns:
+                detail = detail.merge(rating_rows, on="ASIN", how="left", validate="many_to_one")
+                context_columns.append("Rating")
+        except Exception:
+            pass
+
+    image_lookup: dict[str, dict[str, str]] = {}
+    try:
+        image_lookup = _sku_image_lookup(operational, _optional_sku_image_map())
+    except Exception:
+        pass
+
+    source_records = load_latest_source_record("operational_sales")
+    source_uploaded_at = None
+    if not source_records.empty:
+        uploaded_value = source_records.iloc[-1].get("上传时间")
+        if not pd.isna(uploaded_value):
+            source_uploaded_at = str(uploaded_value).strip() or None
+    updated_at = max(
+        [float(_batch_monitor_updated_timestamp() or 0),
+         *(path.stat().st_mtime for path in _new_product_source_paths())]
+    )
+    return {
+        "detail": detail,
+        "developers": options,
+        "context_columns": context_columns,
+        "image_lookup": image_lookup,
+        "source_uploaded_at": source_uploaded_at,
+        "excluded_invalid_launch_count": excluded_launch_count,
+        "excluded_invalid_launch_by_developer": excluded_by_developer,
+        "updated_at": updated_at,
+    }
+
+
+def _new_product_base(revision: str, business_day: str) -> dict[str, Any]:
+    # lru_cache alone allows duplicate concurrent misses. Keep cold requests
+    # for summary, copy lists and details on the same single calculation.
+    with _NEW_PRODUCT_BASE_LOCK:
+        return _cached_new_product_base(revision, business_day)
+
+
+@lru_cache(maxsize=32)
+def _cached_new_product_bundle(
+    developers: str | None,
+    launch_stage: str,
+    status: str,
+    search: str | None,
+    revision: str,
+    business_day: str,
+) -> dict[str, Any]:
+    base = _new_product_base(revision, business_day)
+    detail = base["detail"]
+    options = base["developers"]
+    chosen = selected_values(developers, options)
+    excluded_launch_count = base["excluded_invalid_launch_count"]
+    if options:
+        chosen_developers = set(chosen)
+        excluded_by_developer = base["excluded_invalid_launch_by_developer"]
+        if developers:
+            excluded_launch_count = sum(
+                bool(chosen_developers.intersection(names))
+                for names in excluded_by_developer.values()
+            )
+        detail_developers = detail["开发员"].fillna("").astype(str)
+        selected_rows = detail_developers.map(
+            lambda value: bool(chosen_developers.intersection(
+                name.strip() for name in value.split("；") if name.strip()
+            ))
+        )
+        detail = detail[selected_rows].copy()
+    stage_bounds = {
+        "0-6": (0, 6),
+        "7-29": (7, 29),
+        "30-59": (30, 59),
+        "60-100": (60, 100),
+    }
+    if launch_stage not in NEW_PRODUCT_LAUNCH_STAGES:
+        raise HTTPException(422, "未知新品开售阶段")
+    if status not in NEW_PRODUCT_STATUSES:
+        raise HTTPException(422, "未知新品提醒状态")
+    scoped = detail.copy()
+    if launch_stage != "all":
+        start, end = stage_bounds[launch_stage]
+        scoped = scoped[scoped["开售天数"].between(start, end)].copy()
+    if search and search.strip():
+        needle = search.strip()
+        search_match = pd.Series(False, index=scoped.index)
+        for column in ("SKU", "ASIN"):
+            if column in scoped.columns:
+                search_match |= scoped[column].fillna("").astype(str).str.contains(
+                    needle, case=False, regex=False
+                )
+        scoped = scoped[search_match].copy()
+    metrics_frame = scoped.copy()
+    if status != "all":
+        scoped = scoped[scoped["监控状态"].eq(NEW_PRODUCT_STATUS_LABELS[status])].copy()
+
+    status_counts = metrics_frame["监控状态"].value_counts() if not metrics_frame.empty else pd.Series(dtype=int)
+    metrics = [
+        metric("新品 SKU 数", len(metrics_frame), "integer"),
+        metric("建议涨价", int(status_counts.get("建议涨价", 0)), "integer"),
+        metric("建议降价", int(status_counts.get("建议降价", 0)), "integer"),
+        metric("可售数量合计", pd.to_numeric(metrics_frame.get("可售数量", pd.Series(dtype=float)), errors="coerce").sum(min_count=1), "integer"),
+        metric("近30天销量", pd.to_numeric(metrics_frame.get("30天销量", pd.Series(dtype=float)), errors="coerce").sum(min_count=1), "integer"),
+        metric("已断货", int(status_counts.get("已断货", 0)), "integer"),
+        metric("新品观察中", int(status_counts.get("新品观察中", 0)), "integer"),
+        metric("数据异常", int(status_counts.get("数据异常", 0)), "integer"),
+    ]
+    context_columns = base["context_columns"]
+    source_uploaded_at = base["source_uploaded_at"]
+    formats = {
+        "开售天数": "整数",
+        "可售数量": "整数",
+        "日均销量": "数值",
+        "可售覆盖天数": "数值",
+        "昨天销量": "数值",
+        "前天销量": "数值",
+        "上前销量": "数值",
+        "7天销量": "数值",
+        "14天销量": "数值",
+        "30天销量": "数值",
+        "90天销量": "数值",
+        **{column: "百分比" for column in context_columns if column.endswith("毛利率")},
+    }
+    return {
+        **_base_payload(
+            "新品监控",
+            {"developers": options, "launch_stages": ["0-6", "7-29", "30-59", "60-100"]},
+            {
+                "developers": explicit_selected_values(developers, options),
+                "launch_stage": launch_stage,
+                "status": status,
+                "search": search or "",
+            },
+        ),
+        "has_data": not metrics_frame.empty,
+        "message": None if not metrics_frame.empty else "当前筛选条件下没有符合范围的新品",
+        "metrics": metrics,
+        "calculation_date": business_day,
+        "source_uploaded_at": source_uploaded_at,
+        "excluded_invalid_launch_count": excluded_launch_count,
+        "copy_lists": {
+            "raise_skus": metrics_frame.loc[metrics_frame["监控状态"].eq("建议涨价"), "SKU"].drop_duplicates().astype(str).tolist(),
+            "lower_skus": metrics_frame.loc[metrics_frame["监控状态"].eq("建议降价"), "SKU"].drop_duplicates().astype(str).tolist(),
+            "calculation_date": business_day,
+        },
+        "sections": [
+            section(
+                "detail",
+                "新品监控明细",
+                scoped,
+                formats=formats,
+                rows_serializer=_rows_with_sku_images(base["image_lookup"]),
+            )
+        ],
+        "_updated_at": base["updated_at"],
+    }
+
+
+def _new_product_bundle(
+    developers: str | None = None,
+    launch_stage: str = "all",
+    status: str = "all",
+    search: str | None = None,
+) -> dict[str, Any]:
+    business_day = _new_product_business_day().isoformat()
+    return _cached_new_product_bundle(
+        developers, launch_stage, status, search, _new_product_revision(), business_day
+    )
+
+
+def _new_product_response(
+    bundle: dict[str, Any],
+    page: int = 1,
+    page_size: int = SUMMARY_PAGE_SIZE,
+    sort_by: str | None = None,
+    sort_order: str = "asc",
+) -> dict[str, Any]:
+    result = {key: value for key, value in bundle.items() if key not in {"sections", "_updated_at"}}
+    result["sections"] = [
+        _serialized_section(_section_model(bundle, "detail"), page, page_size,
+                            sort_by=sort_by, sort_order=sort_order)
+    ]
+    result["updated_at"] = float(bundle.get("_updated_at") or 0)
+    return result
+
+
+def _build_products(developers: str | None, view: str | None = None) -> dict[str, Any]:
+    if view not in {None, "detail", "low-margin"}:
+        raise HTTPException(422, "产品视图只能是 detail 或 low-margin")
+    include_detail = view in {None, "detail"}
+    include_low_margin = view in {None, "low-margin"}
     operational = load_source_frame("operational_sales", "运营原始表")
     gross = load_source_frame("gross_profit", "毛利原始表")
-    rating = load_source_frame("rating", "Rating")
     options = developer_options(operational)
     chosen = selected_values(developers, options)
     if options:
         operational = operational[operational["开发员"].fillna("").astype(str).str.strip().isin(chosen)].copy()
     image_lookup = _sku_image_lookup(operational, _optional_sku_image_map())
-    operational_skus = _normalized_sku_set(operational, "MSKU")
-    detail = merge_product_launch_data(
-        merge_product_promotion_data(
-            product_management_display_table(build_product_management_table(operational, gross, rating)),
-            _active_product_promotion_rows(),
-        ),
-        _product_launch_rows(),
-    )
-    low = build_low_margin_product_table(
-        gross,
-        developers=chosen or None,
-        allowed_skus=operational_skus,
-    )
+    sections = []
+    detail = pd.DataFrame()
+    low = pd.DataFrame()
+
+    if include_detail:
+        rating = load_source_frame("rating", "Rating")
+        detail = merge_listing_price_data(
+            merge_product_launch_data(
+                merge_product_promotion_data(
+                    product_management_display_table(build_product_management_table(operational, gross, rating)),
+                    _active_product_promotion_rows(),
+                ),
+                _product_launch_rows(),
+            )
+        )
+        sections.append(section(
+            "detail",
+            "产品管理明细",
+            detail,
+            formats={
+                "开售天数": "整数",
+                **{column: "数值" for column in PRODUCT_LAUNCH_PRICE_COLUMNS.values()},
+                **{f"{country}较开售价变化": "百分比" for country in ("德国", "法国", "西班牙", "意大利")},
+            },
+            rows_serializer=_rows_with_sku_images(image_lookup),
+        ))
+
+    if include_low_margin:
+        operational_skus = _normalized_sku_set(operational, "MSKU")
+        low = merge_listing_price_data(build_low_margin_product_table(
+            gross,
+            developers=chosen or None,
+            allowed_skus=operational_skus,
+        ))
+        sections.append(section(
+            "low-margin",
+            "低毛利率 SKU",
+            low,
+            rows_serializer=_rows_with_sku_images(image_lookup),
+        ))
+
     metrics = [] if detail.empty else [
         metric("ASIN数", detail["ASIN"].nunique(), "integer"),
         metric("SKU数", len(detail), "integer"),
@@ -883,31 +1262,14 @@ def _build_products(developers: str | None) -> dict[str, Any]:
         metric("日均销量", pd.to_numeric(detail["日均销量"], errors="coerce").sum()),
         metric("30天销量", pd.to_numeric(detail["30天销量"], errors="coerce").sum(), "integer"),
     ]
+    if not include_detail and not low.empty:
+        metrics = [metric("低毛利 SKU 数", len(low), "integer"), metric("涉及 ASIN 数", low["ASIN"].nunique(), "integer")]
     return {
-        **_base_payload("产品管理", {"developers": options}, {"developers": chosen}),
-        "has_data": not detail.empty,
+        **_base_payload("产品管理", {"developers": options}, {"developers": explicit_selected_values(developers, options)}),
+        "has_data": any(not item["frame"].empty for item in sections),
+        "message": "当前筛选条件下没有对应产品" if not any(not item["frame"].empty for item in sections) else None,
         "metrics": metrics,
-        "sections": [
-            section(
-                "low-margin",
-                "低毛利率 SKU",
-                low,
-                rows_serializer=_rows_with_sku_images(image_lookup),
-            ),
-            section(
-                "detail",
-                "产品管理明细",
-                detail,
-                formats={
-                    "开售天数": "整数",
-                    **{
-                        column: "数值"
-                        for column in PRODUCT_LAUNCH_PRICE_COLUMNS.values()
-                    },
-                },
-                rows_serializer=_rows_with_sku_images(image_lookup),
-            ),
-        ],
+        "sections": sections,
         "_updated_at": _batch_monitor_updated_timestamp(),
     }
 
@@ -916,51 +1278,82 @@ def latest_detail_date(volume: pd.DataFrame, amount: pd.DataFrame) -> pd.Timesta
     return latest_department_detail_date(volume, amount)
 
 
-def _build_department(month: str | None) -> dict[str, Any]:
-    home = load_home_data()
+_DEPARTMENT_PERFORMANCE_LOCK = Lock()
+
+
+@lru_cache(maxsize=3)
+def _cached_department_performance(
+    revision: str,
+    business_day: str,
+) -> tuple[dict[str, pd.DataFrame], int, int]:
+    del revision
+    operational = load_source_frame("operational_sales", "运营原始表")
+    volume = normalize_sales_volume_detail(load_source_frame("sales_volume_detail", "销量明细"))
+    amount = normalize_sales_amount_detail(load_source_frame("sales_amount_detail", "销售额明细"))
+    volume_duplicate_count = int(volume.duplicated(keep="first").sum())
+    amount_duplicate_count = int(amount.duplicated(keep="first").sum())
+    performance = build_department_performance_tables(
+        operational,
+        volume,
+        amount,
+        today=business_day,
+        amount_history_df=load_department_sales_amount_history(),
+        normalized_inputs=True,
+    )
+    return performance, volume_duplicate_count, amount_duplicate_count
+
+
+def _department_performance(revision: str, business_day: str) -> tuple[dict[str, pd.DataFrame], int, int]:
+    # lru_cache does not serialize cold misses; this lock merges same-version
+    # builds when several dashboard sections load together after an upload.
+    with _DEPARTMENT_PERFORMANCE_LOCK:
+        return _cached_department_performance(revision, business_day)
+
+
+def _build_department(month: str | None, view: str | None = None) -> dict[str, Any]:
+    if view not in {None, "performance", "commission"}:
+        raise HTTPException(422, "部门视图只能是 performance 或 commission")
+    include_performance = view in {None, "performance"}
+    include_commission = view in {None, "commission"}
+    home = load_home_data() if include_commission else pd.DataFrame()
     months = _non_empty_options(home, "月份")
     chosen_month = month if month in months else (months[-1] if months else None)
     commission = pd.DataFrame()
-    if chosen_month:
+    commission_details: dict[str, dict[str, object]] = {}
+    if include_commission and chosen_month:
         month_data = home[home["月份"].astype(str).eq(chosen_month)].copy()
         counted, _ = split_counted_and_stopped_data(month_data)
-        commission = build_person_commission_summary(
+        commission, commission_details = build_department_commission_monitor(
             counted, load_metric_config(), load_commission_config(), load_department_fee_config()
         )
-    operational = load_source_frame("operational_sales", "运营原始表")
-    volume = load_source_frame("sales_volume_detail", "销量明细")
-    amount = load_source_frame("sales_amount_detail", "销售额明细")
-    volume_duplicate_count = sum(
-        item["duplicate_count"] for item in duplicate_row_issues(normalize_sales_volume_detail(volume))
-    )
-    amount_duplicate_count = sum(
-        item["duplicate_count"] for item in duplicate_row_issues(normalize_sales_amount_detail(amount))
-    )
-    performance = build_department_performance_tables(operational, volume, amount)
-    sections = [section("commission", f"{chosen_month or ''} 人员提成汇总", commission)]
-    sections.extend(
-        section(
-            f"performance-{index}",
-            title,
-            performance_with_total(frame),
-            formats={"库存总数": "整数", "占用资金": "金额"},
+    performance: dict[str, pd.DataFrame] = {}
+    volume_duplicate_count = amount_duplicate_count = 0
+    if include_performance:
+        business_day = datetime.now(LOCAL_TIMEZONE).date().isoformat()
+        performance, volume_duplicate_count, amount_duplicate_count = _department_performance(
+            _page_revision("department", "performance"),
+            business_day,
         )
-        for index, (title, frame) in enumerate(performance.items())
-    )
+    sections = []
+    if include_commission:
+        sections.append(section("commission", f"{chosen_month or ''} 人员提成汇总", commission))
+    if include_performance:
+        sections.extend(
+            performance_section(f"performance-{index}", title, frame)
+            for index, (title, frame) in enumerate(performance.items())
+        )
+    has_data = (any(not frame.empty for frame in performance.values()) if include_performance else False) or (not commission.empty if include_commission else False)
     payload = {
         **_base_payload("部门监控", {"months": months}, {"month": chosen_month}),
-        "has_data": any(not frame.empty for frame in performance.values()) or not commission.empty,
+        "has_data": has_data,
         "sections": sections,
+        "commission_config": {"month": chosen_month, "details": commission_details} if include_commission else None,
     }
     warnings = []
     if volume_duplicate_count:
-        warnings.append(
-            f"现有销量明细含 {volume_duplicate_count} 条完全重复记录，计算时已自动去重，原始上传文件仍保留"
-        )
+        warnings.append(f"现有销量明细含 {volume_duplicate_count} 条完全重复记录，计算时已自动去重，原始上传文件仍保留")
     if amount_duplicate_count:
-        warnings.append(
-            f"现有销售额明细含 {amount_duplicate_count} 条完全重复记录，计算时已自动去重，原始上传文件仍保留"
-        )
+        warnings.append(f"现有销售额明细含 {amount_duplicate_count} 条完全重复记录，计算时已自动去重，原始上传文件仍保留")
     if warnings:
         payload["warnings"] = warnings
     return payload
@@ -998,12 +1391,72 @@ def _last_promotion_rows() -> pd.DataFrame:
         return pd.DataFrame(columns=["sku", "promotion_name", "discount_percent", "start_date", "end_date", "updated_at"])
 
 
+_SALES_VOLUME_RANGE_PATTERN = re.compile(
+    r"(?P<start>\d{4}-\d{2}-\d{2})\s*[~～]\s*(?P<end>\d{4}-\d{2}-\d{2})"
+)
+
+
+def _replenishment_site_sales_source() -> tuple[pd.DataFrame, dict[str, Any]]:
+    source_path = get_latest_source_path("sales_volume_detail")
+    empty = pd.DataFrame(
+        columns=["ASIN", "销量明细已匹配", "销量明细DE销量", "销量明细FR销量", "销量明细ES销量", "销量明细IT销量"]
+    )
+    metadata: dict[str, Any] = {
+        "source": None,
+        "available": False,
+        "period_start": None,
+        "period_end": None,
+        "day_count": 0,
+    }
+    if source_path is None:
+        return empty, metadata
+
+    metadata["source"] = "sales_volume_detail"
+    records = load_latest_source_record("sales_volume_detail")
+    original_name = str(records.iloc[-1]["原始文件名"]) if not records.empty else source_path.name
+    uploaded_at = pd.to_datetime(records.iloc[-1]["上传时间"], errors="coerce") if not records.empty else pd.NaT
+    period_start = None
+    period_end = None
+    match = _SALES_VOLUME_RANGE_PATTERN.search(original_name)
+    if match:
+        parsed_start = pd.to_datetime(match.group("start"), errors="coerce")
+        parsed_end = pd.to_datetime(match.group("end"), errors="coerce")
+        if not pd.isna(parsed_start) and not pd.isna(parsed_end) and parsed_start <= parsed_end:
+            period_start = parsed_start
+            period_end = parsed_end
+    reference_date = period_end if period_end is not None else (uploaded_at if not pd.isna(uploaded_at) else None)
+
+    try:
+        summary, dates = build_replenishment_site_sales_summary(
+            load_source_frame("sales_volume_detail", "销量明细"),
+            reference_date=reference_date,
+            period_start=period_start,
+            period_end=period_end,
+        )
+    except (KeyError, TypeError, ValueError):
+        return empty, metadata
+    if not dates:
+        return empty, metadata
+    metadata.update(
+        {
+            "available": True,
+            "period_start": dates[0].date().isoformat(),
+            "period_end": dates[-1].date().isoformat(),
+            "day_count": len(dates),
+        }
+    )
+    return summary, metadata
+
+
 def _replenishment_base_paths() -> list[Path]:
     paths: list[Path] = []
-    for key in ("operational_sales", "gross_profit", "rating", "sku_image_map"):
+    for key in ("operational_sales", "gross_profit", "rating", "sales_volume_detail", "sku_image_map"):
         path = get_latest_source_path(key)
         if path:
             paths.append(path)
+        index_path = latest_source_index_path(key)
+        if index_path.exists():
+            paths.append(index_path)
     for name in ("replenishment_coverage_rules", "replenishment_product_tags", "store_config"):
         path = CONFIG_DIR / f"{name}.csv"
         if path.exists():
@@ -1012,34 +1465,70 @@ def _replenishment_base_paths() -> list[Path]:
     if history_index.exists():
         paths.append(history_index)
     paths.extend(get_sales_history_paths())
-    if DB_PATH.exists():
-        paths.append(DB_PATH)
+    paths.extend(
+        [
+            Path(__file__).resolve(),
+            Path(build_replenishment_management_tables.__code__.co_filename).resolve(),
+        ]
+    )
     return sorted(set(paths), key=str)
+
+
+def _promotion_snapshot_revision() -> str:
+    promotions = _last_promotion_rows()
+    if not promotions.empty and "sku" in promotions.columns:
+        promotions = promotions.sort_values("sku", kind="stable")
+    payload = promotions.astype(object).where(pd.notna(promotions), None).to_dict("records")
+    return hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    ).hexdigest()
 
 
 @lru_cache(maxsize=4)
 def _cached_replenishment_base_tables(revision: str) -> dict[str, pd.DataFrame]:
-    del revision
-    operational = load_source_frame("operational_sales", "运营原始表")
-    gross = load_source_frame("gross_profit", "毛利原始表") if get_latest_source_path("gross_profit") else pd.DataFrame()
-    rating = load_source_frame("rating", "Rating") if get_latest_source_path("rating") else pd.DataFrame()
-    image_map = load_source_frame("sku_image_map", "SKU图片映射表") if get_latest_source_path("sku_image_map") else pd.DataFrame()
-    history_paths = get_sales_history_paths()
-    history = load_source_frame("sales_history_rolling", "往月销量原始表") if history_paths else pd.DataFrame()
-    tables = build_replenishment_management_tables(
-        operational,
-        gross,
-        rating,
-        coverage_rules=_read_optional_replenishment_config("replenishment_coverage_rules", normalize_replenishment_coverage_rules),
-        product_tags=_read_optional_replenishment_config("replenishment_product_tags", normalize_replenishment_product_tags),
-        store_config=_read_optional_replenishment_config("store_config", normalize_store_config),
-        sales_history_rolling=history if history_paths else None,
-        promotions=_last_promotion_rows(),
-        sku_image_map=normalize_sku_image_map(image_map) if not image_map.empty else None,
-        only_needed=False,
-    )
-    tables["history_source"] = "rolling" if history_paths else None
-    return tables
+    def build() -> tuple[dict[str, pd.DataFrame], dict[str, Any]]:
+        operational = load_source_frame("operational_sales", "运营原始表")
+        gross = load_source_frame("gross_profit", "毛利原始表") if get_latest_source_path("gross_profit") else pd.DataFrame()
+        rating = load_source_frame("rating", "Rating") if get_latest_source_path("rating") else pd.DataFrame()
+        image_map = load_source_frame("sku_image_map", "SKU图片映射表") if get_latest_source_path("sku_image_map") else pd.DataFrame()
+        history_paths = get_sales_history_paths()
+        history = load_source_frame("sales_history_rolling", "往月销量原始表") if history_paths else pd.DataFrame()
+        tables = build_replenishment_management_tables(
+            operational,
+            gross,
+            rating,
+            coverage_rules=_read_optional_replenishment_config("replenishment_coverage_rules", normalize_replenishment_coverage_rules),
+            product_tags=_read_optional_replenishment_config("replenishment_product_tags", normalize_replenishment_product_tags),
+            store_config=_read_optional_replenishment_config("store_config", normalize_store_config),
+            sales_history_rolling=history if history_paths else None,
+            promotions=_last_promotion_rows(),
+            sku_image_map=normalize_sku_image_map(image_map) if not image_map.empty else None,
+            only_needed=False,
+        )
+        site_sales, site_sales_metadata = _replenishment_site_sales_source()
+        site_columns = [f"销量明细{code}销量" for code in ("DE", "FR", "ES", "IT")]
+        detail = tables["detail"].drop(columns=["销量明细已匹配", *site_columns], errors="ignore").copy()
+        if not site_sales.empty:
+            detail = detail.merge(site_sales, on="ASIN", how="left", sort=False, validate="many_to_one")
+        else:
+            detail["销量明细已匹配"] = False
+            for column in site_columns:
+                detail[column] = pd.NA
+        detail["销量明细已匹配"] = detail["销量明细已匹配"].fillna(False).astype(bool)
+        for column in site_columns:
+            if column not in detail:
+                detail[column] = pd.NA
+        tables["detail"] = detail
+        return (
+            {key: tables[key] for key in ("detail", "sku_detail", "history")},
+            {
+                "site_sales_metadata": site_sales_metadata,
+                "history_source": "rolling" if history_paths else None,
+            },
+        )
+
+    frames, metadata = load_or_build_frame_bundle("replenishment-base", revision, build)
+    return {**frames, **metadata}
 
 
 def _apply_replenishment_switches(
@@ -1067,7 +1556,9 @@ def _apply_replenishment_switches(
 
 def _replenishment_tables() -> dict[str, pd.DataFrame]:
     paths = _replenishment_base_paths()
-    revision = revision_digest("replenishment-base", paths) if paths else "empty"
+    source_revision = revision_digest("replenishment-base-v2", paths)
+    calculation_day = datetime.now(LOCAL_TIMEZONE).date().isoformat()
+    revision = f"{source_revision}:{calculation_day}:{_promotion_snapshot_revision()}"
     base = _cached_replenishment_base_tables(revision)
     switches = _read_optional_replenishment_config(
         "replenishment_switches",
@@ -1077,6 +1568,43 @@ def _replenishment_tables() -> dict[str, pd.DataFrame]:
         **base,
         "detail": _apply_replenishment_switches(base["detail"], switches),
     }
+
+
+_REPLENISHMENT_WARM_LOCK = Lock()
+_REPLENISHMENT_WARM_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="replenishment-warm")
+_REPLENISHMENT_WARM_TIMER: Timer | None = None
+_LOGGER = logging.getLogger(__name__)
+
+
+def _warm_replenishment_sources() -> None:
+    try:
+        _replenishment_tables()
+        cached_listing_bundle()
+    except Exception:
+        _LOGGER.exception("补货数据后台预热失败；后续请求会按当前版本重试")
+
+
+def _submit_replenishment_warmup() -> None:
+    global _REPLENISHMENT_WARM_TIMER
+    with _REPLENISHMENT_WARM_LOCK:
+        _REPLENISHMENT_WARM_TIMER = None
+    try:
+        _REPLENISHMENT_WARM_EXECUTOR.submit(_warm_replenishment_sources)
+    except RuntimeError:
+        # A debounced timer can fire while the process or test interpreter exits.
+        _LOGGER.debug("Skipping replenishment warmup because the executor is shutting down")
+
+
+def schedule_replenishment_warmup() -> None:
+    """Debounce source/config writes and warm current tables off the request path."""
+    global _REPLENISHMENT_WARM_TIMER
+    with _REPLENISHMENT_WARM_LOCK:
+        if _REPLENISHMENT_WARM_TIMER is not None:
+            _REPLENISHMENT_WARM_TIMER.cancel()
+        timer = Timer(0.35, _submit_replenishment_warmup)
+        timer.daemon = True
+        _REPLENISHMENT_WARM_TIMER = timer
+        timer.start()
 
 
 def _split_compact(value: Any) -> list[str]:
@@ -1108,11 +1636,30 @@ def _replenishment_history(
     *,
     include_months: bool = False,
     source: str | None = None,
+    operational_row: dict[str, Any] | None = None,
+    site_sales_metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    monitor_row = operational_row if operational_row is not None else row
+    recent_sales = {
+        "yesterday": _replenishment_number(monitor_row.get("昨天销量")),
+        "day_before_yesterday": _replenishment_number(monitor_row.get("前天销量")),
+        "two_days_before": _replenishment_number(monitor_row.get("上前销量")),
+    }
+    period_sales = {
+        "days_7": _replenishment_number(monitor_row.get("7天销量")),
+        "days_14": _replenishment_number(monitor_row.get("14天销量")),
+        "days_30": _replenishment_number(monitor_row.get("30天销量")),
+        "days_90": _replenishment_number(monitor_row.get("90天销量")),
+    }
     raw_values = [row.get(column) for column in SALES_HISTORY_GENERIC_MONTH_COLUMNS]
     available = any(value is not None and not pd.isna(value) for value in raw_values)
+    site_metadata = site_sales_metadata or {}
+    source_available = bool(site_metadata.get("available"))
+    matched = monitor_row.get("销量明细已匹配")
+    site_matched = matched is not None and not pd.isna(matched) and bool(matched)
     site_sales = {
-        code: (_replenishment_number(row.get(f"{code}总销量")) or 0)
+        code: (_replenishment_number(monitor_row.get(f"销量明细{code}销量")) or 0)
+        if source_available and site_matched else None
         for code in ("DE", "FR", "ES", "IT")
     }
     if available:
@@ -1150,17 +1697,360 @@ def _replenishment_history(
     result: dict[str, Any] = {
         "available": available,
         "site_sales": site_sales,
+        "site_sales_source": site_metadata.get("source"),
+        "site_sales_available": source_available,
+        "site_sales_matched": site_matched,
+        "site_sales_period_start": site_metadata.get("period_start"),
+        "site_sales_period_end": site_metadata.get("period_end"),
+        "site_sales_days": int(site_metadata.get("day_count") or 0),
         "peak_months": peak_months,
+        "recent_sales": recent_sales,
+        "period_sales": period_sales,
         **metadata,
         "period_start": months[0]["month"] if months else None,
         "period_end": months[-1]["month"] if months else None,
+        # Keep the full chronological series on both group rows and details.
+        # ``peak_months`` remains the legacy ranked compatibility field.
+        "months": months if available else [],
     }
     if include_months:
-        result["months"] = months
+        result["months"] = months if available else []
     return result
 
 
-def _replenishment_group_rows(frame: pd.DataFrame, history_source: str | None = None) -> list[dict[str, Any]]:
+def _listing_price_values(values: Any) -> list[float]:
+    result: list[float] = []
+    for value in values or []:
+        try:
+            if value is None or pd.isna(value):
+                continue
+            result.append(float(value))
+        except (TypeError, ValueError):
+            continue
+    return result
+
+
+def _listing_prices_match(values: list[float]) -> bool:
+    return not values or max(values) - min(values) <= 0.01
+
+
+def _listing_event_item(event: dict[str, Any]) -> dict[str, Any]:
+    old_price = _listing_history_number(event.get("old_effective_price"))
+    new_price = _listing_history_number(event.get("new_effective_price"))
+    amount_change = new_price - old_price if old_price is not None and new_price is not None else None
+    percent_change = (
+        new_price / old_price - 1
+        if old_price is not None and new_price is not None and old_price > 0
+        else None
+    )
+    return {
+        "sku": str(event.get("sku") or ""),
+        "date": event.get("date"),
+        "previous_date": event.get("previous_date"),
+        "gap_days": event.get("gap_days"),
+        "observed_as": event.get("observed_as"),
+        "type": event.get("type"),
+        "old_price": old_price,
+        "new_price": new_price,
+        "amount_change": amount_change,
+        "percent_change": percent_change,
+    }
+
+
+def _replenishment_sku_sales_scores(sku_detail: pd.DataFrame | None) -> dict[str, float]:
+    """Return one comparable sales score per SKU for representative pricing.
+
+    Replenishment SKU rows can contain more than one store row, so the score is
+    summed by SKU. The 30-day volume is the primary signal, with shorter
+    windows used only when the longer window is unavailable.
+    """
+    if sku_detail is None or sku_detail.empty or "MSKU" not in sku_detail.columns:
+        return {}
+    metrics = [column for column in ("30天销量", "14天销量", "7天销量", "昨天销量", "前天销量", "上前销量") if column in sku_detail.columns]
+    if not metrics:
+        return {}
+    frame = sku_detail[["MSKU", *metrics]].copy()
+    frame["_sku"] = frame["MSKU"].fillna("").astype(str).str.strip().str.upper()
+    frame = frame[frame["_sku"].ne("")]
+    if frame.empty:
+        return {}
+    numeric = frame[metrics].apply(pd.to_numeric, errors="coerce")
+    frame["_sales_score"] = numeric.bfill(axis=1).iloc[:, 0]
+    grouped = frame.groupby("_sku", sort=False)["_sales_score"].sum(min_count=1).dropna()
+    return {str(sku): float(score) for sku, score in grouped.items()}
+
+
+def _replenishment_representative_sku(sku_set: set[str], sales_scores: dict[str, float] | None) -> str | None:
+    if not sku_set:
+        return None
+    scores = {str(sku).strip().upper(): score for sku, score in (sales_scores or {}).items()}
+    return sorted(
+        sku_set,
+        key=lambda sku: (-scores.get(str(sku).strip().upper(), float("-inf")), str(sku)),
+    )[0]
+
+
+def _latest_replenishment_price_change(
+    asin: str,
+    sku_set: set[str],
+    country: str,
+    events: list[dict[str, Any]],
+    sales_scores: dict[str, float] | None = None,
+    history: pd.DataFrame | None = None,
+) -> dict[str, Any] | None:
+    relevant_types = {"实际总价涨跌", "恢复可售", "失去可售"}
+    candidates = [
+        event for event in events
+        if str(event.get("asin") or "").strip().upper() == asin
+        and str(event.get("sku") or "").strip().upper() in sku_set
+        and str(event.get("country") or "").strip().upper() == country
+        and event.get("type") in relevant_types
+    ]
+    if not candidates:
+        return None
+    candidates.sort(
+        key=lambda event: (
+            str(event.get("date") or ""),
+            str(event.get("previous_date") or ""),
+            str(event.get("sku") or ""),
+        ),
+        reverse=True,
+    )
+    latest_key = (
+        str(candidates[0].get("date") or ""),
+        str(candidates[0].get("previous_date") or ""),
+    )
+    latest = [
+        event for event in candidates
+        if (
+            str(event.get("date") or ""),
+            str(event.get("previous_date") or ""),
+        ) == latest_key
+    ]
+    availability = [event for event in latest if event.get("type") in {"恢复可售", "失去可售"}]
+    selected = availability or [event for event in latest if event.get("type") == "实际总价涨跌"]
+    if not selected:
+        return None
+    items = [_listing_event_item(event) for event in selected]
+    signatures = {
+        (
+            None if item["old_price"] is None else round(item["old_price"], 2),
+            None if item["new_price"] is None else round(item["new_price"], 2),
+        )
+        for item in items
+    }
+    mixed = len(signatures) > 1
+    status = "多SKU变价" if mixed else (
+        "变价" if items[0]["type"] == "实际总价涨跌" else str(items[0]["type"] or "变价")
+    )
+    normalized_scores = {str(sku).strip().upper(): score for sku, score in (sales_scores or {}).items()}
+    representative = sorted(
+        items,
+        key=lambda item: (
+            -normalized_scores.get(str(item["sku"]).strip().upper(), float("-inf")),
+            str(item["sku"]),
+        ),
+    )[0]
+    first = items[0]
+    return {
+        "status": status,
+        "type": "多SKU变价" if mixed else first["type"],
+        "date": first["date"],
+        "previous_date": first["previous_date"],
+        "gap_days": first["gap_days"],
+        "observed_as": first["observed_as"],
+        "old_price": None if mixed else first["old_price"],
+        "new_price": None if mixed else first["new_price"],
+        "amount_change": None if mixed else first["amount_change"],
+        "percent_change": None if mixed else first["percent_change"],
+        "sku_count": len(items),
+        "items": items,
+        "representative_sku": representative["sku"] if mixed else None,
+        "representative_sales": normalized_scores.get(str(representative["sku"]).strip().upper()) if mixed else None,
+        "representative_old_price": representative["old_price"] if mixed else None,
+        "representative_new_price": representative["new_price"] if mixed else None,
+        "representative_amount_change": representative["amount_change"] if mixed else None,
+        "representative_percent_change": representative["percent_change"] if mixed else None,
+    }
+
+
+def _listing_history_number(value: object) -> float | None:
+    if value is None or pd.isna(value):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _listing_event_response(event: dict[str, Any]) -> dict[str, Any]:
+    result = {key: None if value is None or pd.isna(value) else value for key, value in event.items()}
+    for column in ("old_base_price", "new_base_price", "old_effective_price", "new_effective_price"):
+        if column in result:
+            result[column] = _listing_history_number(result[column])
+    return result
+
+
+def _listing_history_flag(value: object) -> bool:
+    if value is None or pd.isna(value):
+        return False
+    return str(value).strip().lower() in {"true", "1", "yes", "是"}
+
+
+def _replenishment_price_history(
+    history: pd.DataFrame | None,
+    asin: str,
+    country: str,
+    representative_sku: str | None,
+    history_index: dict[tuple[str, str, str], pd.DataFrame] | None = None,
+) -> list[dict[str, Any]]:
+    if history is None or history.empty or not representative_sku:
+        return []
+    required = {"日期", "MSKU", "ASIN", "国家"}
+    if not required.issubset(history.columns):
+        return []
+    if history_index is not None:
+        subset = history_index.get((str(asin).strip().upper(), str(representative_sku).strip().upper(), country.upper()), history.iloc[:0])
+    else:
+        subset = history[
+            history["ASIN"].astype(str).str.strip().str.upper().eq(str(asin).strip().upper())
+            & history["MSKU"].astype(str).str.strip().str.upper().eq(str(representative_sku).strip().upper())
+            & history["国家"].astype(str).str.strip().str.upper().eq(country.upper())
+        ].copy()
+    if subset.empty:
+        return []
+    subset["_date"] = pd.to_datetime(subset["日期"], errors="coerce")
+    subset = subset.dropna(subset=["_date"]).sort_values("_date", kind="stable")
+    points: list[dict[str, Any]] = []
+    previous_date: date | None = None
+    previous_price: float | None = None
+    for row in subset.to_dict("records"):
+        current_date = pd.Timestamp(row["_date"]).date()
+        current_price = _listing_history_number(row.get("当前实际总价"))
+        base_price = _listing_history_number(row.get("Listing原价"))
+        promo_price = _listing_history_number(row.get("Listing优惠价"))
+        gap_days = (current_date - previous_date).days if previous_date else None
+        amount_change = None
+        percent_change = None
+        if previous_price is not None and current_price is not None and abs(current_price - previous_price) > 0.01:
+            amount_change = round(current_price - previous_price, 2)
+            percent_change = (current_price / previous_price - 1) if previous_price > 0 else None
+        points.append({
+            "date": current_date.isoformat(),
+            "current_price": current_price,
+            "listing_price": base_price,
+            "promotion_price": promo_price,
+            "currency": str(row.get("币种") or "").strip() or None,
+            "is_promotion": _listing_history_flag(row.get("促销中")),
+            "is_available": current_price is not None,
+            "anomaly": None if row.get("异常类型") is None or pd.isna(row.get("异常类型")) else str(row.get("异常类型")),
+            "gap_days": gap_days,
+            "observed_as": "首次观察到" if gap_days is not None and gap_days > 1 else None,
+            "previous_price": previous_price,
+            "amount_change": amount_change,
+            "percent_change": percent_change,
+        })
+        previous_date = current_date
+        previous_price = current_price
+    return points
+
+def _replenishment_listing_summary(
+    asin: str,
+    sku_values: list[str],
+    source: pd.DataFrame,
+    events: list[dict[str, Any]],
+    sales_scores: dict[str, float] | None = None,
+    history: pd.DataFrame | None = None,
+    source_by_asin: dict[str, pd.DataFrame] | None = None,
+    history_by_key: dict[tuple[str, str, str], pd.DataFrame] | None = None,
+    events_by_asin_country: dict[tuple[str, str], list[dict[str, Any]]] | None = None,
+) -> dict[str, Any] | None:
+    if source.empty:
+        return None
+    normalized_asin = str(asin or "").strip().upper()
+    candidates = (source_by_asin.get(normalized_asin) if source_by_asin is not None else source[source["ASIN"].astype(str).str.upper().eq(normalized_asin)].copy())
+    if candidates is None:
+        return None
+    if candidates.empty:
+        return None
+    sku_set = {str(value).strip().upper() for value in sku_values if str(value).strip()}
+    selected = candidates[candidates["MSKU"].astype(str).str.upper().isin(sku_set)]
+    if selected.empty:
+        selected = candidates
+        sku_set = {str(value).strip().upper() for value in selected["MSKU"].dropna().tolist() if str(value).strip()}
+    sales_scores = {str(sku).strip().upper(): score for sku, score in (sales_scores or {}).items()}
+    representative_sku = _replenishment_representative_sku(sku_set, sales_scores)
+    countries = {}
+    for code in ("DE", "FR", "ES", "IT"):
+        history_points = _replenishment_price_history(history, normalized_asin, code, representative_sku, history_by_key)
+        current = _listing_price_values(selected.get(f"{code}_当前实际总价", pd.Series(dtype=float)).dropna().tolist())
+        launch = _listing_price_values(selected.get(f"{code}_开售价", pd.Series(dtype=float)).dropna().tolist())
+        changes = _listing_price_values(selected.get(f"{code}_较开售价变化", pd.Series(dtype=float)).dropna().tolist())
+        current_matches = _listing_prices_match(current)
+        launch_matches = _listing_prices_match(launch)
+        change_matches = _listing_prices_match(changes)
+        latest_change = _latest_replenishment_price_change(normalized_asin, sku_set, code, events_by_asin_country.get((normalized_asin, code), []) if events_by_asin_country is not None else events, sales_scores)
+        if not current_matches:
+            representative_sku = _replenishment_representative_sku(sku_set, sales_scores)
+            representative_values = selected.loc[
+                selected["MSKU"].astype(str).str.strip().str.upper().eq(str(representative_sku or "").upper()),
+                f"{code}_当前实际总价",
+            ] if representative_sku and f"{code}_当前实际总价" in selected.columns else pd.Series(dtype=float)
+            representative_current = _listing_price_values(representative_values.dropna().tolist())
+            if latest_change is None:
+                latest_change = {
+                    "status": "多SKU变价",
+                    "type": "多SKU变价",
+                    "date": None,
+                    "previous_date": None,
+                    "gap_days": None,
+                    "observed_as": None,
+                    "old_price": None,
+                    "new_price": None,
+                    "amount_change": None,
+                    "percent_change": None,
+                    "sku_count": len(current),
+                    "items": [],
+                    "representative_sku": representative_sku,
+                    "representative_sales": (sales_scores or {}).get(str(representative_sku or "").upper()),
+                    "representative_old_price": None,
+                    "representative_new_price": representative_current[0] if representative_current else None,
+                    "representative_amount_change": None,
+                    "representative_percent_change": None,
+                }
+            else:
+                latest_change = {
+                    **latest_change,
+                    "status": "多SKU变价",
+                    "type": "多SKU变价",
+                    "old_price": None,
+                    "new_price": None,
+                    "amount_change": None,
+                    "percent_change": None,
+                }
+                if representative_current:
+                    latest_change["representative_new_price"] = representative_current[0]
+        countries[code] = {
+            "current_price": current[0] if current_matches and current else None,
+            "launch_price": launch[0] if launch_matches and launch else None,
+            "launch_change": changes[0] if change_matches and changes else None,
+            "status": "不一致" if not current_matches or not launch_matches or not change_matches else ("无当前价" if not current else "有价格"),
+            "representative_sku": representative_sku,
+            "history": history_points,
+            "latest_change": latest_change,
+        }
+    recent = [item for item in events if item["asin"].upper() == normalized_asin and item["sku"].upper() in {str(value).strip().upper() for value in sku_values}]
+    return {"status": "不一致" if any(item["status"] == "不一致" for item in countries.values()) else "一致", "recent_event": _listing_event_response(recent[0]) if recent else None, "countries": countries}
+
+
+def _replenishment_group_rows(
+    frame: pd.DataFrame,
+    history_source: str | None = None,
+    site_sales_metadata: dict[str, Any] | None = None,
+    sku_detail: pd.DataFrame | None = None,
+    include_pricing: bool = True,
+) -> list[dict[str, Any]]:
     country_columns = {
         "DE": "德国",
         "FR": "法国",
@@ -1168,6 +2058,30 @@ def _replenishment_group_rows(frame: pd.DataFrame, history_source: str | None = 
         "IT": "意大利",
     }
     result: list[dict[str, Any]] = []
+    if include_pricing:
+        listing_source, listing_history_source, listing_events = cached_listing_bundle()
+    else:
+        listing_source = pd.DataFrame()
+        listing_history_source = pd.DataFrame()
+        listing_events = ()
+    sales_scores = _replenishment_sku_sales_scores(sku_detail)
+    source_by_asin: dict[str, pd.DataFrame] = {}
+    if include_pricing and not listing_source.empty and "ASIN" in listing_source.columns:
+        source_by_asin = {
+            str(key).strip().upper(): group
+            for key, group in listing_source.groupby(listing_source["ASIN"].astype(str).str.strip().str.upper(), sort=False)
+        }
+    history_by_key: dict[tuple[str, str, str], pd.DataFrame] = {}
+    if include_pricing and not listing_history_source.empty:
+        history_by_key = {
+            (str(key[0]).strip().upper(), str(key[1]).strip().upper(), str(key[2]).strip().upper()): group
+            for key, group in listing_history_source.groupby(["ASIN", "MSKU", "国家"], sort=False)
+        }
+    events_by_asin_country: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    if include_pricing:
+        for event in listing_events:
+            key = (str(event.get("asin") or "").strip().upper(), str(event.get("country") or "").strip().upper())
+            events_by_asin_country.setdefault(key, []).append(event)
     for row in records(frame):
         tag_labels = _split_compact(row.get("产品标签"))
         raw_colors = str(row.get("产品标签颜色") or "").split("；")
@@ -1213,6 +2127,9 @@ def _replenishment_group_rows(frame: pd.DataFrame, history_source: str | None = 
                 "end_date": row.get("最近促销截止日期"),
                 "discount_percent": row.get("最近促销折扣"),
             }
+        asin_value = str(row.get("ASIN") or "").split("；")[0]
+        sku_values = [str(row.get("原SKU") or "")] + _split_compact(row.get("跟卖SKU"))
+        pricing = _replenishment_listing_summary(asin_value, sku_values, listing_source, listing_events, sales_scores, listing_history_source, source_by_asin, history_by_key, events_by_asin_country) if include_pricing else None
         result.append(
             {
                 "group_id": str(row.get("补货组ID") or ""),
@@ -1245,7 +2162,8 @@ def _replenishment_group_rows(frame: pd.DataFrame, history_source: str | None = 
                     "coverage_days": row.get("库存覆盖天数"),
                 },
                 "promotion": promotion,
-                "history": _replenishment_history(row, source=history_source),
+                "pricing": pricing,
+                "history": _replenishment_history(row, source=history_source, site_sales_metadata=site_sales_metadata),
                 "recommendation": {
                     "target_inventory": row.get("目标库存"),
                     "measured_quantity": row.get("测算建议补货数量"),
@@ -1305,7 +2223,13 @@ def _build_replenishment(developers: str | None, min_qty: int = 30) -> dict[str,
                 "detail",
                 "ASIN补货汇总",
                 detail,
-                row_serializer=lambda frame: _replenishment_group_rows(frame, tables.get("history_source")),
+                row_serializer=lambda frame, include_pricing=True: _replenishment_group_rows(
+                    frame,
+                    tables.get("history_source"),
+                    tables.get("site_sales_metadata"),
+                    tables.get("sku_detail"),
+                    include_pricing=include_pricing,
+                ),
             )
         ],
     }
@@ -1325,10 +2249,19 @@ def _revision_paths() -> list[Path]:
         source_index = DATA_DIR / "sources" / f"{key}_source.csv"
         if source_index.exists():
             paths.append(source_index)
+    department_amount_history = department_sales_amount_history_path()
+    if department_amount_history.exists():
+        paths.append(department_amount_history)
     history_index = sales_history_index_path()
     if history_index.exists():
         paths.append(history_index)
     paths.extend(get_sales_history_paths())
+    listing_index = listing_index_path()
+    if listing_index.exists():
+        paths.append(listing_index)
+    listing_dir = listing_root()
+    paths.extend(path for path in listing_dir.glob('*.csv') if path.is_file())
+    paths.extend(path for path in listing_dir.glob('*.xlsx') if path.is_file())
     return sorted(set(paths), key=str)
 
 
@@ -1337,20 +2270,76 @@ def dashboard_revision() -> str:
     return revision_digest("dashboard-derived", paths) if paths else "empty"
 
 
-def _page_revision(page_name: str) -> str:
-    base_revision = dashboard_revision()
+def _page_dependency_paths(page_name: str, view: str | None = None) -> list[Path]:
+    source_keys: dict[str, tuple[str, ...]] = {
+        "sales": ("operational_sales",),
+        "slow-moving": ("operational_sales", "sku_image_map"),
+        "products": ("operational_sales", "gross_profit", "sku_image_map", "rating"),
+        "department": ("operational_sales", "sales_volume_detail", "sales_amount_detail"),
+        "replenishment": ("operational_sales", "gross_profit", "rating", "sku_image_map", "sales_volume_detail"),
+    }
+    paths: list[Path] = []
+    if page_name == "overview" or (page_name == "department" and view != "performance"):
+        paths.append(DATA_DIR / "upload_records.csv")
+        records_frame = load_upload_records()
+        paths.extend(_report_paths(records_frame))
+    page_source_keys = source_keys.get(page_name, ())
+    if page_name == "department" and view == "commission":
+        page_source_keys = ()
+    for key in page_source_keys:
+        paths.extend([DATA_DIR / "sources" / f"{key}_source.csv"])
+        source = get_latest_source_path(key)
+        if source:
+            paths.append(source)
+    config_names: dict[str, tuple[str, ...]] = {
+        "overview": ("metrics_config", "store_config", "monthly_targets", "commission_config", "department_fee_config"),
+        "sales": ("store_config",),
+        "slow-moving": ("store_config",),
+        "department": ("store_config", "metrics_config", "commission_config", "department_fee_config", "sales_amount_detail"),
+        "replenishment": ("replenishment_coverage_rules", "replenishment_switches", "replenishment_product_tags"),
+    }
+    if page_name == "department":
+        if view == "performance":
+            config_names["department"] = ("store_config",)
+            paths.append(department_sales_amount_history_path())
+        elif view == "commission":
+            config_names["department"] = ("store_config", "metrics_config", "commission_config", "department_fee_config")
+    paths.extend(CONFIG_DIR / f"{name}.csv" for name in config_names.get(page_name, ()))
+    if page_name == "replenishment":
+        paths.extend(get_sales_history_paths())
+        paths.extend([sales_history_index_path(), DATA_DIR / "sources" / "sales_history_rolling_source.csv"])
     if page_name == "products":
-        # Import lazily because backend.promotions imports dashboard_api for source loading.
-        from backend.promotions import promotion_revision
+        paths.append(listing_index_path())
+        try:
+            listing_index = pd.read_csv(listing_index_path(), encoding="utf-8-sig")
+            if not listing_index.empty and "保存文件名" in listing_index.columns:
+                latest_name = str(listing_index.iloc[-1]["保存文件名"] or "").strip()
+                if latest_name and Path(latest_name).name == latest_name:
+                    paths.append(listing_root() / latest_name)
+        except Exception:
+            pass
+    return sorted(set(paths), key=str)
 
-        return f"{base_revision}:{batch_monitor_revision()}:{promotion_revision()}"
-    if page_name == "slow-moving":
-        # Promotion snapshots are part of the slow-moving identity, but batch
-        # monitor changes do not affect this page.
-        from backend.promotions import promotion_revision
 
-        return f"{base_revision}:{promotion_revision()}"
-    return base_revision
+def _page_revision(page_name: str, view: str | None = None) -> str:
+    paths = _page_dependency_paths(page_name, view)
+    digest = hashlib.sha256(f"dashboard-page-v2:{page_name}:{view or 'all'}".encode("utf-8"))
+    updated_at = 0.0
+    for path in paths:
+        try:
+            stat = path.stat()
+            digest.update(f"{path.resolve()}:{stat.st_size}:{stat.st_mtime_ns}".encode("utf-8"))
+            updated_at = max(updated_at, stat.st_mtime)
+        except OSError:
+            digest.update(f"{path}:missing".encode("utf-8"))
+    if page_name == "products":
+        from backend.promotions import promotion_revision
+        digest.update(batch_monitor_revision().encode("ascii"))
+        digest.update(promotion_revision().encode("ascii"))
+    elif page_name in {"slow-moving", "replenishment"}:
+        from backend.promotions import promotion_revision
+        digest.update(promotion_revision().encode("ascii"))
+    return f"{digest.hexdigest()}|{updated_at:.6f}"
 
 
 @lru_cache(maxsize=48)
@@ -1363,6 +2352,7 @@ def _cached_bundle(
     threshold: str,
     month: str | None,
     min_qty: int,
+    view: str | None,
     revision: str,
 ) -> dict[str, Any]:
     del revision
@@ -1372,10 +2362,11 @@ def _cached_bundle(
         return _build_sales(developers)
     if page_name == "slow-moving":
         return _build_slow_moving(developers, threshold)
+
     if page_name == "products":
-        return _build_products(developers)
+        return _build_products(developers, view)
     if page_name == "department":
-        return _build_department(month)
+        return _build_department(month, view)
     if page_name == "replenishment":
         return _build_replenishment(developers, min_qty)
     raise HTTPException(404, "未知看板页面")
@@ -1383,6 +2374,9 @@ def _cached_bundle(
 
 def clear_dashboard_caches() -> None:
     _cached_bundle.cache_clear()
+    _cached_department_performance.cache_clear()
+    _cached_new_product_bundle.cache_clear()
+    _cached_new_product_base.cache_clear()
     _cached_replenishment_base_tables.cache_clear()
     clear_parquet_memory_cache()
 
@@ -1402,8 +2396,10 @@ def _bundle(
     threshold: str = "90天以上",
     month: str | None = None,
     min_qty: int = 30,
+    view: str | None = None,
 ) -> dict[str, Any]:
-    return _cached_bundle(
+    revision = _page_revision(page_name, view)
+    bundle = _cached_bundle(
         page_name,
         developers,
         months,
@@ -1412,8 +2408,15 @@ def _bundle(
         threshold,
         month,
         min_qty,
-        _page_revision(page_name),
+        view,
+        revision.split("|", 1)[0],
     )
+    if "_updated_at" not in bundle:
+        try:
+            bundle["_updated_at"] = float(revision.rsplit("|", 1)[1])
+        except (IndexError, ValueError):
+            bundle["_updated_at"] = 0.0
+    return bundle
 
 
 def _sort_key(series: pd.Series, definition: dict[str, Any] | None = None) -> pd.Series:
@@ -1537,6 +2540,7 @@ def _serialized_section(
     search: str | None = None,
     sort_by: str | None = None,
     sort_order: str = "asc",
+    include_pricing: bool = True,
 ) -> dict[str, Any]:
     filtered = _query_frame(model["frame"], search, sort_by, sort_order, model.get("columns"))
     total = len(filtered)
@@ -1557,33 +2561,33 @@ def _serialized_section(
     }
     row_serializer = model.get("row_serializer")
     if row_serializer:
-        result["group_rows"] = row_serializer(visible)
+        if model.get("key") == "detail" and model.get("title") == "ASIN补货汇总":
+            result["group_rows"] = row_serializer(visible, include_pricing=include_pricing)
+        else:
+            result["group_rows"] = row_serializer(visible)
     return result
 
 
-def _serialize_bundle(bundle: dict[str, Any]) -> dict[str, Any]:
+def _serialize_bundle(bundle: dict[str, Any], include_pricing: bool = True) -> dict[str, Any]:
     result = {
         key: value
         for key, value in bundle.items()
         if key not in {"sections", "_updated_at"}
     }
-    result["sections"] = [_serialized_section(item) for item in bundle.get("sections", [])]
+    result["sections"] = [_serialized_section(item, include_pricing=include_pricing) for item in bundle.get("sections", [])]
     replenishment_section = next(
         (item for item in result["sections"] if item.get("key") == "detail" and "group_rows" in item),
         None,
     )
     if replenishment_section:
         result["group_rows"] = replenishment_section["group_rows"]
-    result["updated_at"] = max(
-        max((path.stat().st_mtime for path in _revision_paths()), default=0),
-        float(bundle.get("_updated_at") or 0),
-    )
+    result["updated_at"] = float(bundle.get("_updated_at") or 0)
     return result
 
 
-def _dashboard_response(page_name: str, **filters: Any) -> dict[str, Any]:
+def _dashboard_response(page_name: str, include_pricing: bool = True, **filters: Any) -> dict[str, Any]:
     try:
-        return _serialize_bundle(_bundle(page_name, **filters))
+        return _serialize_bundle(_bundle(page_name, **filters), include_pricing=include_pricing)
     except HTTPException:
         raise
     except Exception as exc:
@@ -1617,13 +2621,131 @@ def slow_moving(developers: str | None = None, threshold: str = "90天以上"):
 
 
 @router.get("/products")
-def products(developers: str | None = None):
-    return _dashboard_response("products", developers=developers)
+def products(developers: str | None = None, view: str | None = Query(None, pattern="^(detail|low-margin)$")):
+    return _dashboard_response("products", developers=developers, view=view)
+
+
+@router.get("/new-products")
+def new_products(
+    developers: str | None = None,
+    launch_stage: str = "all",
+    search: str | None = Query(None, max_length=200),
+):
+    return _new_product_response(
+        _new_product_bundle(developers=developers, launch_stage=launch_stage, search=search)
+    )
+
+
+@router.get("/new-products/view")
+def new_products_view(
+    developers: str | None = None,
+    launch_stage: str = "all",
+    status: str = "all",
+    search: str | None = Query(None, max_length=200),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(SUMMARY_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
+    sort_by: str | None = Query(None, max_length=100),
+    sort_order: str = Query("asc", pattern="^(asc|desc)$"),
+):
+    """Return one consistent summary, full copy lists and requested table page."""
+
+    bundle = _new_product_bundle(developers=developers, launch_stage=launch_stage, status=status, search=search)
+    return _new_product_response(bundle, page, page_size, sort_by, sort_order)
+
+
+@router.get("/new-products/copy-lists")
+def new_product_copy_lists(
+    developers: str | None = None,
+    launch_stage: str = "all",
+    search: str | None = Query(None, max_length=200),
+):
+    bundle = _new_product_bundle(
+        developers=developers,
+        launch_stage=launch_stage,
+        status="all",
+        search=search,
+    )
+    frame = _section_model(bundle, "detail")["frame"]
+    raise_skus = frame.loc[frame["监控状态"].eq("建议涨价"), "SKU"].drop_duplicates().astype(str).tolist()
+    lower_skus = frame.loc[frame["监控状态"].eq("建议降价"), "SKU"].drop_duplicates().astype(str).tolist()
+    return {
+        "raise_skus": raise_skus,
+        "lower_skus": lower_skus,
+        "calculation_date": bundle["calculation_date"],
+    }
 
 
 @router.get("/department")
-def department(month: str | None = None):
-    return _dashboard_response("department", month=month)
+def department(
+    month: str | None = None,
+    view: str | None = Query(None, pattern="^(performance|commission)$"),
+):
+    return _dashboard_response("department", month=month, view=view)
+
+
+
+@router.put("/department/commission-config")
+def save_department_commission_config(payload: dict[str, Any]):
+    """Update selected-month raw commission and department fee rows from the department page."""
+    month = str(payload.get("month") or "").strip()
+    if not month:
+        raise HTTPException(422, "缺少配置月份")
+    commission_rows = payload.get("commission_rows") or []
+    fee_rows = payload.get("department_fee_rows") or []
+    if not isinstance(commission_rows, list) or not isinstance(fee_rows, list):
+        raise HTTPException(422, "配置行必须是数组")
+    try:
+        from backend.config_api import (
+            _CONFIG_WRITE_LOCK,
+            _atomic_write_config,
+            _invalidate_dashboard_cache,
+            read_config,
+            validate_and_normalize_config,
+        )
+        from dashboard.data_processing import normalize_month
+
+        month = normalize_month(month) or month
+        with _CONFIG_WRITE_LOCK:
+            existing_commission = read_config("commission_config")
+            existing_fee = read_config("department_fee_config")
+            updates_commission = pd.DataFrame(commission_rows)
+            updates_fee = pd.DataFrame(fee_rows)
+            for frame, expected_month, name in (
+                (updates_commission, month, "commission_config"),
+                (updates_fee, month, "department_fee_config"),
+            ):
+                if not frame.empty and "月份" in frame.columns:
+                    normalized_months = frame["月份"].map(normalize_month).fillna("")
+                    if normalized_months.ne(expected_month).any():
+                        raise ValueError(f"{name}只能修改当前月份")
+            def merge_updates(existing: pd.DataFrame, updates: pd.DataFrame, keys: list[str]) -> pd.DataFrame:
+                if updates.empty:
+                    return existing
+                working = existing.copy()
+                existing_key = working[keys].fillna("").astype(str).apply(lambda column: column.str.strip()).astype(str).agg("|".join, axis=1)
+                update_key = updates.reindex(columns=keys).fillna("").astype(str).apply(lambda column: column.str.strip()).astype(str).agg("|".join, axis=1)
+                working = working[~existing_key.isin(set(update_key))]
+                return pd.concat([working, updates], ignore_index=True)
+            commission_frame = validate_and_normalize_config(
+                "commission_config", merge_updates(existing_commission, updates_commission, ["月份", "开发员"])
+            )
+            fee_frame = validate_and_normalize_config(
+                "department_fee_config", merge_updates(existing_fee, updates_fee, ["月份", "部门"])
+            )
+            for frame, column in ((commission_frame, "职位提点"), (fee_frame, "费用率")):
+                values = pd.to_numeric(frame[column], errors="coerce").dropna()
+                if ((values < 0) | (values > 1)).any():
+                    raise ValueError(f"{column}必须在0到1之间")
+            commission_path = _atomic_write_config("commission_config", commission_frame)
+            fee_path = _atomic_write_config("department_fee_config", fee_frame)
+            _invalidate_dashboard_cache()
+        return {"ok": True, "updated_at": max(commission_path.stat().st_mtime, fee_path.stat().st_mtime)}
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(422, f"提成配置保存失败：{exc}") from exc
 
 
 @router.get("/department/assessment")
@@ -1640,9 +2762,59 @@ def department_assessment(month: str | None = None):
 def replenishment(
     developers: str | None = None,
     min_qty: int = Query(30, ge=0),
+    include_pricing: bool = True,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(SUMMARY_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
+    search: str | None = Query(None, max_length=200),
+    sort_by: str | None = Query(None, max_length=100),
+    sort_order: str = Query("asc", pattern="^(asc|desc)$"),
 ):
-    return _dashboard_response("replenishment", developers=developers, min_qty=min_qty)
+    try:
+        bundle = _bundle("replenishment", developers=developers, min_qty=min_qty)
+        result = {key: value for key, value in bundle.items() if key not in {"sections", "_updated_at"}}
+        result["sections"] = [
+            _serialized_section(
+                _section_model(bundle, "detail"), page, page_size, search, sort_by, sort_order,
+                include_pricing=include_pricing,
+            )
+        ]
+        result["group_rows"] = result["sections"][0].get("group_rows", [])
+        result["updated_at"] = float(bundle.get("_updated_at") or 0)
+        return result
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(422, f"补货看板计算失败：{exc}") from exc
 
+
+@router.get("/replenishment/pricing")
+def replenishment_pricing(group_ids: str = Query("", max_length=5000)):
+    identifiers = [item.strip() for item in group_ids.split(",") if item.strip()]
+    if len(identifiers) > MAX_PAGE_SIZE:
+        raise HTTPException(422, f"一次最多查询 {MAX_PAGE_SIZE} 个补货组")
+    try:
+        tables = _replenishment_tables()
+        detail = tables["detail"]
+        if identifiers:
+            wanted = set(identifiers)
+            frame = detail[detail["补货组ID"].astype(str).isin(wanted)].reset_index(drop=True)
+        else:
+            frame = detail.iloc[:0].copy()
+        rows = _replenishment_group_rows(
+            frame,
+            tables.get("history_source"),
+            tables.get("site_sales_metadata"),
+            tables.get("sku_detail"),
+            include_pricing=True,
+        )
+        return {
+            "revision": _page_revision("replenishment"),
+            "rows": {row["group_id"]: row.get("pricing") for row in rows},
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(422, f"补货价格读取失败：{exc}") from exc
 
 class ReplenishmentSwitchInput(BaseModel):
     is_replenishment: bool
@@ -1678,21 +2850,24 @@ def replenishment_group_details(group_id: str):
             raise HTTPException(404, "补货组不存在")
         sku_detail = tables["sku_detail"]
         sku_detail = sku_detail[sku_detail["补货组ID"].astype(str).eq(group_id)].reset_index(drop=True)
+        if "MSKU" in sku_detail.columns:
+            sku_prices = latest_listing_wide()
+            if not sku_prices.empty:
+                sku_detail = sku_detail.merge(sku_prices, left_on="MSKU", right_on="MSKU", how="left", sort=False)
         asin = str(match.iloc[0]["ASIN"]).split("；")[0]
+        summary_row = records(match.head(1))[0]
         history = tables["history"]
         history_row = records(history[history["ASIN"].astype(str).eq(asin)].head(1)) if not history.empty else []
         return {
-            "group": records(match.head(1))[0],
+            "group": summary_row,
             "sku_columns": column_definitions(sku_detail),
             "sku_rows": records(sku_detail),
-            "sales_history": (
-                _replenishment_history(
-                    history_row[0],
-                    include_months=True,
-                    source=tables.get("history_source"),
-                )
-                if history_row
-                else {**_history_metadata(tables.get("history_source")), "available": False, "site_sales": {}, "peak_months": [], "months": [], "period_start": None, "period_end": None}
+            "sales_history": _replenishment_history(
+                history_row[0] if history_row else {},
+                include_months=True,
+                source=tables.get("history_source"),
+                operational_row=summary_row,
+                site_sales_metadata=tables.get("site_sales_metadata"),
             ),
         }
     except HTTPException:
@@ -1705,14 +2880,21 @@ def replenishment_group_details(group_id: str):
 def export_replenishment(
     developers: str | None = None,
     min_qty: int = Query(30, ge=0),
+    search: str | None = Query(None, max_length=200),
+    sort_by: str | None = Query(None, max_length=100),
+    sort_order: str = Query('asc', pattern='^(asc|desc)$'),
 ):
     try:
         tables = _replenishment_tables()
         operational = load_source_frame("operational_sales", "运营原始表")
         options = developer_options(operational)
         detail = _filter_replenishment_detail(tables["detail"], developers, min_qty, options)
+        detail = _query_frame(detail, search, sort_by, sort_order, column_definitions(detail))
         sku_detail = tables["sku_detail"].copy()
         sku_detail = sku_detail[sku_detail["补货组ID"].isin(set(detail["补货组ID"]))].copy()
+        group_order = {group_id: index for index, group_id in enumerate(detail["补货组ID"].tolist())}
+        sku_detail["_export_order"] = sku_detail["补货组ID"].map(group_order).fillna(len(group_order))
+        sku_detail = sku_detail.sort_values("_export_order", kind="stable").drop(columns=["_export_order"])
         export_detail = detail.drop(columns=SALES_HISTORY_GENERIC_MONTH_COLUMNS, errors="ignore").copy()
         history_source = tables.get("history_source")
         peak_sets = [_replenishment_history(row, source=history_source)["peak_months"] for row in records(detail)]
@@ -1751,6 +2933,53 @@ def _section_model(bundle: dict[str, Any], section_key: str) -> dict[str, Any]:
     raise HTTPException(404, "未知看板区块")
 
 
+@router.get("/new-products/sections/detail")
+def new_products_section(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(SUMMARY_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
+    search: str | None = Query(None, max_length=200),
+    sort_by: str | None = Query(None, max_length=100),
+    sort_order: str = Query("asc", pattern="^(asc|desc)$"),
+    developers: str | None = None,
+    launch_stage: str = "all",
+    status: str = "all",
+):
+    bundle = _new_product_bundle(
+        developers=developers,
+        launch_stage=launch_stage,
+        status=status,
+        search=search,
+    )
+    return _serialized_section(
+        _section_model(bundle, "detail"), page, page_size, search, sort_by, sort_order
+    )
+
+
+@router.get("/new-products/sections/detail/export.csv")
+def export_new_products(
+    search: str | None = Query(None, max_length=200),
+    sort_by: str | None = Query(None, max_length=100),
+    sort_order: str = Query("asc", pattern="^(asc|desc)$"),
+    developers: str | None = None,
+    launch_stage: str = "all",
+    status: str = "all",
+):
+    bundle = _new_product_bundle(
+        developers=developers,
+        launch_stage=launch_stage,
+        status=status,
+        search=search,
+    )
+    model = _section_model(bundle, "detail")
+    frame = _query_frame(model["frame"], search, sort_by, sort_order, model.get("columns"))
+    filename = quote(f"{model['title']}.csv")
+    return StreamingResponse(
+        _csv_chunks(frame),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{filename}"},
+    )
+
+
 @router.get("/{page_name}/sections/{section_key}")
 def dashboard_section(
     page_name: str,
@@ -1767,6 +2996,8 @@ def dashboard_section(
     threshold: str = "90天以上",
     month: str | None = None,
     min_qty: int = Query(30, ge=0),
+    include_pricing: bool = True,
+    view: str | None = None,
 ):
     try:
         bundle = _bundle(
@@ -1778,8 +3009,9 @@ def dashboard_section(
             threshold=threshold,
             month=month,
             min_qty=min_qty,
+            view=view,
         )
-        return _serialized_section(_section_model(bundle, section_key), page, page_size, search, sort_by, sort_order)
+        return _serialized_section(_section_model(bundle, section_key), page, page_size, search, sort_by, sort_order, include_pricing=include_pricing)
     except HTTPException:
         raise
     except Exception as exc:
@@ -1811,6 +3043,7 @@ def export_dashboard_section(
     threshold: str = "90天以上",
     month: str | None = None,
     min_qty: int = Query(30, ge=0),
+    view: str | None = None,
 ):
     try:
         bundle = _bundle(
@@ -1822,6 +3055,7 @@ def export_dashboard_section(
             threshold=threshold,
             month=month,
             min_qty=min_qty,
+            view=view,
         )
         model = _section_model(bundle, section_key)
         frame = _query_frame(model["frame"], search, sort_by, sort_order, model.get("columns"))

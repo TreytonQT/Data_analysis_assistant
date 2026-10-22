@@ -4,7 +4,7 @@
 
 ## Windows 便携版（推荐）
 
-从 [GitHub Releases](https://github.com/TreytonQT/Data_analysis_assistant/releases/latest) 下载 `DataAnalysisAssistant-windows-x64-v2.1.0.zip` 和对应的 `.sha256.txt`：
+从 [GitHub Releases](https://github.com/TreytonQT/Data_analysis_assistant/releases/latest) 下载 `DataAnalysisAssistant-windows-x64-v2.2.0.zip` 和对应的 `.sha256.txt`：
 
 1. 可选：使用 `Get-FileHash` 核对压缩包 SHA-256。
 2. 将压缩包完整解压到固定目录，不要直接在压缩包中运行。
@@ -12,7 +12,7 @@
 4. 保留启动窗口；关闭窗口或按 `Ctrl+C` 即停止程序。
 
 ```powershell
-Get-FileHash .\DataAnalysisAssistant-windows-x64-v2.1.0.zip -Algorithm SHA256
+Get-FileHash .\DataAnalysisAssistant-windows-x64-v2.2.0.zip -Algorithm SHA256
 ```
 
 便携版内置前端和 Python 运行环境，不要求另行安装 Python、Node.js 或 Docker。首次运行会在程序目录旁创建 `data/` 和空数据库，默认配置位于 `configs/`。
@@ -64,7 +64,7 @@ Stop-Process -Id (Get-Content .tmp\dashboard.pid)
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\install_desktop_shortcut.ps1
 ```
 
-看板右上角的“重启系统”会等待旧进程退出并自动恢复当前页面；“退出系统”会停止服务，之后可通过桌面快捷方式再次启动。这两个操作只接受本机请求，并带有专用控制标识。
+看板右上角“系统”菜单中的“重启系统”会等待旧进程退出并自动恢复当前页面；“退出系统”会停止服务，之后可通过桌面快捷方式再次启动。这两个操作只接受本机请求，并带有专用控制标识。
 
 ## Docker（可选）
 
@@ -97,9 +97,20 @@ docker compose down
 
 - `data/` 下所有原始 CSV/XLS/XLSX 和上传记录
 - `data/app.db`
+- `data/listing_prices/` 下的 Listing 原始快照、标准化文件与索引
+- `data/department_sales_amount_history.csv` 销售额按日历史，以及 `data/batch_monitor/uploads/` 批次与货件附件
 - `configs/` 下所有配置 CSV
 
 `data/cache/` 是可重建的 Parquet 加速层，不是备份。服务停止后可以删除该目录；下次读取源文件时会自动补建。恢复时以原始文件、上传记录、配置 CSV 和 SQLite 数据库为准。
+
+## 从 v2.1.x 升级到 v2.2.0
+
+1. 停止旧程序，完整备份 `data/` 与 `configs/`，再将其复制到已完整解压的新版本目录。
+2. 启动新版；SQLite 会自动补建长期调价、审计、请求幂等和批次手动完成所需结构，原有业务记录继续保留。完成升级后如需退回旧版，请使用升级前的数据库备份。
+3. 检查“调价与促销”中的旧记录。旧版没有截止日期的记录不一定表示长期调价，启动时不会自动转换。代码中的 `migrate_legacy` 是针对特定历史清单的操作工具，并非通用升级命令，不应直接用于其他数据库；如需整理旧记录，请先核对清单并另存备份。
+4. 新品监控依赖运营原始表及有效开售日期；实际价格依赖按日上传的 Listing 快照，部门预测依赖销售额按日历史。首次升级缺少这些数据时，先按上传中心提示补充，历史间隔不会被虚构为连续观测。
+
+本土考核比例保存在当前浏览器的 localStorage 中，复制 `data/` 和 `configs/` 不会把该偏好带到另一台电脑或浏览器。提成与部门费用率请在部门提成监控的展开行中维护。
 
 ## 常见问题
 

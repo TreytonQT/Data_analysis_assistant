@@ -41,7 +41,7 @@ const amountFields = new Set([
 
 function column(key: string): DashboardColumn {
   const percent = key.includes('毛利率') || key.includes('广告费占比');
-  const dailySales = key === '日均销量';
+  const dailySales = key === '日均销量' || key === '可售天数';
   const text = ['SKU', 'ASIN', 'Rating', '开发员', '国家', '开售时间'].includes(key);
   const launchPrice = key.endsWith('开售价格');
   return {
@@ -152,8 +152,8 @@ describe('DashboardDecisionMatrix', () => {
     expect(new Set(PRODUCT_MATRIX_FIELDS).size).toBe(36);
     expect(LOW_MARGIN_MATRIX_FIELDS).toHaveLength(8);
     expect(new Set(LOW_MARGIN_MATRIX_FIELDS).size).toBe(8);
-    expect(SLOW_MOVING_MATRIX_FIELDS).toHaveLength(21);
-    expect(new Set(SLOW_MOVING_MATRIX_FIELDS).size).toBe(21);
+    expect(SLOW_MOVING_MATRIX_FIELDS).toHaveLength(22);
+    expect(new Set(SLOW_MOVING_MATRIX_FIELDS).size).toBe(22);
     expect(dashboardMatrixKind('products', 'detail')).toBe('product-detail');
     expect(dashboardMatrixKind('products', 'low-margin')).toBe('low-margin');
     expect(dashboardMatrixKind('slow-moving', 'detail')).toBe('slow-moving');
@@ -200,7 +200,7 @@ describe('DashboardDecisionMatrix', () => {
     rerender(<DashboardDecisionMatrix kind="slow-moving" section={slow} />);
     expect(screen.getByLabelText('SKU-SLOW-001暂无图片')).toBeInTheDocument();
     expect(container.querySelector('.dashboard-matrix-image')).not.toBeInTheDocument();
-    expect(screen.getByText('最近促销：2026-08-01 至 2026-08-15 · -20%')).toBeInTheDocument();
+    expect(screen.getByText('最近限时：2026-08-01 至 2026-08-15 · -20%')).toBeInTheDocument();
     expect(container.querySelector('.slow-overview-daily strong')).toHaveTextContent('5.68');
   });
 
@@ -210,8 +210,8 @@ describe('DashboardDecisionMatrix', () => {
     const slow = section('detail', '滞销 SKU 明细', SLOW_MOVING_MATRIX_FIELDS, [openEnded, missing]);
     render(<DashboardDecisionMatrix kind="slow-moving" section={slow} />);
 
-    expect(screen.getByText('最近促销：2026-08-01 起 · -20%')).toBeInTheDocument();
-    expect(screen.getByText('最近促销：暂无记录')).toBeInTheDocument();
+    expect(screen.getByText('最近限时：2026-08-01 起 · -20%')).toBeInTheDocument();
+    expect(screen.getByText('最近限时：暂无记录')).toBeInTheDocument();
   });
 
   it('renders missing daily sales as a dash without changing the risk metrics', () => {
@@ -230,7 +230,19 @@ describe('DashboardDecisionMatrix', () => {
     const slow = section('detail', '滞销 SKU 明细', SLOW_MOVING_MATRIX_FIELDS, [legacyRow]);
     render(<DashboardDecisionMatrix kind="slow-moving" section={slow} />);
 
-    expect(screen.getByText('最近促销：信息未加载')).toBeInTheDocument();
+    expect(screen.getByText('最近限时：信息未加载')).toBeInTheDocument();
+  });
+
+  it('renders coverage decimals, zero and missing values with its formula tooltip', async () => {
+    const user = userEvent.setup();
+    const slow = section('detail', '滞销 SKU 明细', SLOW_MOVING_MATRIX_FIELDS,
+      [100 / 3, 0, null].map(可售天数 => ({ ...slowMovingRow, 可售天数 })));
+    const { container } = render(<DashboardDecisionMatrix kind="slow-moving" section={slow} />);
+    expect(Array.from(container.querySelectorAll('.slow-overview-coverage strong')).map(node => node.textContent))
+      .toEqual(['33.33', '0', '-']);
+    expect(screen.getByRole('grid')).toHaveAttribute('aria-colcount', '4');
+    await user.hover(screen.getAllByText('可售天数（天）')[0]);
+    expect(await screen.findByRole('tooltip')).toHaveTextContent('可售、待调仓、调仓中、待入库、采购在途、本地库存、在途、计划入库');
   });
 
   it('hides the promotion badge when a SKU is not currently promoted', () => {
@@ -307,6 +319,9 @@ describe('DashboardDecisionMatrix', () => {
     expect(screen.getAllByText('在售SKU数量')).toHaveLength(3);
     expect(screen.getAllByText('库存总数')).toHaveLength(3);
     expect(screen.getAllByText('占用资金')).toHaveLength(3);
+    expect(screen.getAllByText('（前移7天）')).toHaveLength(4);
+    expect(screen.queryByText('（万）')).not.toBeInTheDocument();
+    expect(screen.getAllByText('考核销售额')).toHaveLength(1);
     expect(screen.getAllByText('1,234')).toHaveLength(2);
     expect(screen.getAllByText('1.23 万')).toHaveLength(2);
     expect(screen.getByRole('img', { name: '开发员业绩排行全量数据概览图' })).toHaveAttribute(
@@ -331,6 +346,52 @@ describe('DashboardDecisionMatrix', () => {
     await waitFor(() => expect(screen.getByText('店铺业绩排行榜')).toBeInTheDocument());
   });
 
+
+  it('expands the inline commission configuration for the matching person row key', async () => {
+    const user = userEvent.setup();
+    const commission = section(
+      'commission',
+      '2026-07 人员提成汇总',
+      ['人员', '营业额', '毛利润', '毛利率', '提成预估', '配置状态'],
+      [{ 人员: '陈千潼', 营业额: 10000, 毛利润: 3000, 毛利率: 0.3, 提成预估: 200, 配置状态: '已配置' }],
+    );
+    const { container } = render(<DashboardSectionCard
+      initialSection={commission}
+      dashboardPage="department"
+      filters={{ month: '2026-07' }}
+      compactSales={false}
+      commissionConfig={{
+        month: '2026-07',
+        details: {
+          陈千潼: {
+            人员: '陈千潼',
+            开发员配置: [{
+              月份: '2026-07',
+              开发员: '运营二十部-陈千潼',
+              库存计提: 0,
+              弃置: 0,
+              职位提点: 0.1,
+              缺失字段: [],
+            }],
+            部门费用率: [{
+              月份: '2026-07',
+              部门: '运营二十部',
+              费用率: 0.095,
+              缺失字段: [],
+            }],
+          },
+        },
+      }}
+    />);
+    expect(screen.queryByText('配置明细 · 陈千潼')).not.toBeInTheDocument();
+    const expandButton = container.querySelector('.ant-table-row-expand-icon-collapsed');
+    expect(expandButton).not.toBeNull();
+    await user.click(expandButton as HTMLElement);
+    expect(await screen.findByText('配置明细 · 陈千潼')).toBeInTheDocument();
+    expect(screen.getByText('运营二十部-陈千潼')).toBeInTheDocument();
+    expect(screen.getByText('运营二十部')).toBeInTheDocument();
+  });
+
   it('renders assessment monitoring with expandable stores and recalculates the local discount', async () => {
     const user = userEvent.setup();
     window.history.replaceState({}, '', '/?page=department&tab=assessment&month=2026-08');
@@ -340,11 +401,11 @@ describe('DashboardDecisionMatrix', () => {
       selected_month: '2026-08',
       has_data: true,
       rows: [{
-        开发员: '甲', 销售额: 30000, 中企销售额: 10000, 本土销售额: 20000,
+        开发员: '甲', 销售额: 30000, 毛利润: 6000, 毛利率: 0.2, 中企销售额: 10000, 本土销售额: 20000,
         店铺明细: [
-          { 店铺: 'YIP', 销售额: 20000, 中企销售额: 0, 本土销售额: 20000 },
-          { 店铺: 'TIS', 销售额: 10000, 中企销售额: 10000, 本土销售额: 0 },
-          { 店铺: 'ZXU', 销售额: 15000, 中企销售额: 15000, 本土销售额: 0 },
+          { 店铺: 'YIP', 销售额: 20000, 毛利润: 3000, 毛利率: 0.15, 中企销售额: 0, 本土销售额: 20000 },
+          { 店铺: 'TIS', 销售额: 10000, 毛利润: 1000, 毛利率: 0.1, 中企销售额: 10000, 本土销售额: 0 },
+          { 店铺: 'ZXU', 销售额: 15000, 毛利润: 2000, 毛利率: 0.1333, 中企销售额: 15000, 本土销售额: 0 },
         ],
       }],
       updated_at: '2026-08-31T10:00:00+08:00',
@@ -353,9 +414,12 @@ describe('DashboardDecisionMatrix', () => {
     await waitFor(() => expect(screen.getByText('考核销售额 = 中企销售额 + x × 本土销售额')).toBeInTheDocument());
     expect(await screen.findByText('甲')).toBeInTheDocument();
     expect(screen.getAllByText('3.00 万')).not.toHaveLength(0);
+    expect(screen.getAllByText('毛利率')).toHaveLength(1);
+    expect(screen.getAllByText('20.00%')).toHaveLength(2);
     expect(screen.getByText('考核销售额 = 中企销售额 + x × 本土销售额')).toBeInTheDocument();
     await user.click(screen.getAllByRole('button').find(button => button.className.includes('ant-table-row-expand-icon'))!);
     expect(screen.getByText('YIP')).toBeInTheDocument();
+    expect(screen.getByText('15.00%')).toBeInTheDocument();
     const storeRows = Array.from(container.querySelectorAll('tr.department-assessment-store-row'));
     expect(storeRows[0]).toHaveTextContent('YIP');
     expect(storeRows[0]).toHaveClass('department-assessment-store-row');
@@ -377,8 +441,8 @@ describe('DashboardDecisionMatrix', () => {
       selected_month: '2026-08',
       has_data: true,
       rows: [
-        { 开发员: '付凯乐', 销售额: 10000, 中企销售额: 10000, 本土销售额: 0, 店铺明细: [] },
-        { 开发员: '陈千潼', 销售额: 90000, 中企销售额: 90000, 本土销售额: 0, 店铺明细: [] },
+        { 开发员: '付凯乐', 销售额: 10000, 毛利润: 5000, 毛利率: 0.5, 中企销售额: 10000, 本土销售额: 0, 店铺明细: [] },
+        { 开发员: '陈千潼', 销售额: 90000, 毛利润: 45000, 毛利率: 0.5, 中企销售额: 90000, 本土销售额: 0, 店铺明细: [] },
       ],
       updated_at: '2026-08-31T10:00:00+08:00',
     });
@@ -386,14 +450,16 @@ describe('DashboardDecisionMatrix', () => {
     await waitFor(() => expect(screen.getByText('考核监控')).toBeInTheDocument());
     expect(await screen.findByText('付凯乐')).toBeInTheDocument();
     expect(screen.getByText('陈千潼')).toBeInTheDocument();
-    const developerSelect = screen.getByRole('combobox', { name: '考核监控开发员筛选' });
-    await user.click(developerSelect);
-    await user.click(screen.getByText('付凯乐', { selector: '.ant-select-item-option-content' }));
+    await user.click(screen.getByRole('button', { name: '考核监控开发员筛选: 全部开发员' }));
+    await user.click(screen.getByRole('checkbox', { name: '付凯乐' }));
+    expect(Array.from(container.querySelectorAll('.department-assessment-table tbody tr td:first-child')).map(cell => cell.textContent?.trim()).sort()).toEqual(['付凯乐', '陈千潼']);
+    expect(new URLSearchParams(window.location.search).get('developers')).toBeNull();
+    await user.click(screen.getByRole('button', { name: '确定' }));
     await waitFor(() => {
       const developerCells = Array.from(container.querySelectorAll('.department-assessment-table tbody tr td:first-child')).map(cell => cell.textContent?.trim());
       expect(developerCells).toEqual(['付凯乐']);
     });
-    expect(new URLSearchParams(window.location.search).get('developer')).toBe('付凯乐');
+    expect(new URLSearchParams(window.location.search).get('developers')).toBe('付凯乐');
     expect(apiMocks.departmentAssessment).toHaveBeenCalledTimes(1);
   });
 
@@ -451,10 +517,9 @@ describe('DashboardDecisionMatrix', () => {
       compactSales={false}
     />);
 
-    const sortField = screen.getByRole('combobox', { name: '产品管理明细排序字段' });
-    await user.click(sortField);
-    await user.type(sortField, '30天销量');
-    await user.click(await screen.findByTitle('30天销量'));
+    await user.click(screen.getByRole('button', { name: '产品管理明细排序字段: 默认排序' }));
+    await user.click(screen.getByRole('radio', { name: '30天销量' }));
+    await user.click(screen.getByRole('button', { name: '确定' }));
     await waitFor(() => expect(apiMocks.dashboardSection).toHaveBeenCalledWith(
       'products',
       'detail',

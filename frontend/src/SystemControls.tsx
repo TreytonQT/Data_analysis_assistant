@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
-import { Button, Modal, Result, Space, Spin, Typography } from 'antd';
-import { PoweroffOutlined, ReloadOutlined } from '@ant-design/icons';
+import { Button, Dropdown, Modal, Result, Space, Spin, Typography } from 'antd';
+import { MoreOutlined, PoweroffOutlined, ReloadOutlined } from '@ant-design/icons';
 
 import { api, type SystemStatus } from './api';
 
@@ -13,6 +13,7 @@ export interface SystemControlsProps {
   pollDelayMs?: number;
   restartTimeoutMs?: number;
   shutdownTimeoutMs?: number;
+  compact?: boolean;
 }
 
 const wait = (milliseconds: number) => new Promise<void>(resolve => window.setTimeout(resolve, milliseconds));
@@ -22,6 +23,7 @@ export default function SystemControls({
   pollDelayMs = 500,
   restartTimeoutMs = 60_000,
   shutdownTimeoutMs = 15_000,
+  compact = false,
 }: SystemControlsProps) {
   const [status, setStatus] = useState<SystemStatus | null>(null);
   const [phase, setPhase] = useState<ControlPhase>('idle');
@@ -116,10 +118,10 @@ export default function SystemControls({
   };
 
   return <>
-    <Space className="system-actions" size={8}>
+    <>{compact ? <Dropdown menu={{ items: [{ key: 'restart', label: '重启系统', icon: <ReloadOutlined />, disabled: !available || busy }, { key: 'shutdown', label: '退出系统', icon: <PoweroffOutlined />, danger: true, disabled: !available || busy }], onClick: ({ key }) => setConfirmAction(key as ConfirmAction) }}><Button icon={<MoreOutlined />} aria-label="系统操作" title={!available ? unavailableHint : undefined}>系统</Button></Dropdown> : <Space className="system-actions" size={8}>
       <Button icon={<ReloadOutlined />} onClick={() => setConfirmAction('restart')} disabled={!available || busy} title={!available ? unavailableHint : undefined}>重启系统</Button>
       <Button danger icon={<PoweroffOutlined />} onClick={() => setConfirmAction('shutdown')} disabled={!available || busy} title={!available ? unavailableHint : undefined}>退出系统</Button>
-    </Space>
+    </Space>}</>
     <Modal
       open={confirmAction !== null}
       title={confirmAction === 'restart' ? '确认重启系统？' : '确认退出系统？'}

@@ -123,6 +123,7 @@ class SalesHistoryRollingTests(unittest.TestCase):
             row = summary.loc[summary["ASIN"].eq("B001")].iloc[0]
             self.assertEqual(row["历史1月计入天数"], 26)
             self.assertEqual(row["历史2月计入天数"], 25)
+            self.assertEqual(row["DE近30天销量"], 30)
 
 
 if __name__ == "__main__":

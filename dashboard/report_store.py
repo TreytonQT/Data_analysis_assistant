@@ -11,7 +11,15 @@ from typing import Iterable
 
 import pandas as pd
 
-from dashboard.data_processing import normalize_report, read_csv_bytes, read_local_table
+from dashboard.data_processing import (
+    DEPARTMENT_SALES_AMOUNT_HISTORY_COLUMNS,
+    build_department_sales_amount_history,
+    normalize_department_sales_amount_history,
+    normalize_report,
+    normalize_sales_amount_detail,
+    read_csv_bytes,
+    read_local_table,
+)
 from app_paths import APP_ROOT, DATA_DIR
 
 ROOT = APP_ROOT
@@ -20,6 +28,7 @@ SOURCES_DIR = DATA_DIR / "sources"
 INDEX_PATH = DATA_DIR / "upload_records.csv"
 SALES_HISTORY_DIR = DATA_DIR / "sales_history"
 SALES_HISTORY_INDEX_PATH = DATA_DIR / "sales_history_records.csv"
+DEPARTMENT_SALES_AMOUNT_HISTORY_FILENAME = "department_sales_amount_history.csv"
 INDEX_COLUMNS = ["月份", "原始文件名", "保存文件名", "上传时间", "文件大小"]
 OPERATIONAL_SALES_BASENAME = "operational_sales"
 OPERATIONAL_SALES_INDEX_PATH = SOURCES_DIR / "operational_sales_source.csv"
@@ -450,6 +459,104 @@ def get_latest_source_path(source_key: str, data_dir: Path = DATA_DIR) -> Path |
 
 def persist_operational_sales_source(uploaded_file, data_dir: Path = DATA_DIR) -> Path:
     return persist_latest_source(uploaded_file, "operational_sales", LATEST_SOURCE_DISPLAY_NAMES["operational_sales"], data_dir)
+
+
+def department_sales_amount_history_path(data_dir: Path = DATA_DIR) -> Path:
+    return data_dir / DEPARTMENT_SALES_AMOUNT_HISTORY_FILENAME
+
+
+def load_department_sales_amount_history(data_dir: Path = DATA_DIR) -> pd.DataFrame:
+    path = department_sales_amount_history_path(data_dir)
+    if not path.exists():
+        return pd.DataFrame(columns=DEPARTMENT_SALES_AMOUNT_HISTORY_COLUMNS)
+    frame = pd.read_csv(path, encoding="utf-8-sig")
+    return normalize_department_sales_amount_history(frame)[DEPARTMENT_SALES_AMOUNT_HISTORY_COLUMNS]
+
+
+def save_department_sales_amount_history(history: pd.DataFrame, data_dir: Path = DATA_DIR) -> None:
+    path = department_sales_amount_history_path(data_dir)
+    normalized = normalize_department_sales_amount_history(history)
+    _atomic_write_frame(path, normalized[DEPARTMENT_SALES_AMOUNT_HISTORY_COLUMNS])
+
+
+def persist_sales_amount_detail_source(
+    uploaded_file,
+    normalized: pd.DataFrame,
+    display_name: str | None = None,
+    data_dir: Path = DATA_DIR,
+    reference_date=None,
+) -> Path:
+    """Persist the rolling amount export and update daily history atomically."""
+
+    source_key = "sales_amount_detail"
+    sources_dir = data_dir / "sources"
+    sources_dir.mkdir(parents=True, exist_ok=True)
+    index_path = latest_source_index_path(source_key, data_dir)
+    data = uploaded_file.getvalue()
+    suffix = Path(uploaded_file.name).suffix.lower()
+    if suffix not in ALLOWED_SOURCE_SUFFIXES:
+        raise ValueError(f"不支持的数据源文件类型：{suffix or '无扩展名'}")
+    if not isinstance(data, bytes) or not data:
+        raise ValueError("数据源文件为空")
+    saved_name = f"{source_key}{suffix}"
+    saved_path = _source_path(sources_dir, source_key, saved_name)
+    history_path = department_sales_amount_history_path(data_dir)
+    ref = pd.Timestamp(reference_date).normalize() if reference_date is not None else pd.Timestamp.today().normalize()
+
+    new_history = build_department_sales_amount_history(normalized, reference_date=ref)
+    old_history = load_department_sales_amount_history(data_dir)
+    old_path = get_latest_source_path(source_key, data_dir)
+    old_history_from_source = pd.DataFrame(columns=DEPARTMENT_SALES_AMOUNT_HISTORY_COLUMNS)
+    if old_path is not None and old_path.exists():
+        old_frame = normalize_sales_amount_detail(read_local_table(old_path))
+        old_history_from_source = build_department_sales_amount_history(old_frame, reference_date=ref)
+    if not old_history.empty and not old_history_from_source.empty:
+        existing_keys = set(
+            old_history[["日期", "开发专员", "店铺"]]
+            .astype({"日期": "string", "开发专员": "string", "店铺": "string"})
+            .itertuples(index=False, name=None)
+        )
+        old_history_from_source = old_history_from_source.loc[
+            ~old_history_from_source[["日期", "开发专员", "店铺"]]
+            .astype({"日期": "string", "开发专员": "string", "店铺": "string"})
+            .apply(tuple, axis=1)
+            .isin(existing_keys)
+        ].copy()
+    incoming_dates = set(new_history["日期"].tolist())
+    merged = pd.concat([old_history, old_history_from_source], ignore_index=True)
+    if incoming_dates:
+        merged = merged.loc[~pd.to_datetime(merged["日期"], errors="coerce").isin(incoming_dates)]
+    merged = pd.concat([merged, new_history], ignore_index=True)
+    merged = normalize_department_sales_amount_history(merged)[DEPARTMENT_SALES_AMOUNT_HISTORY_COLUMNS]
+
+    records = pd.DataFrame(
+        [
+            {
+                "数据源": display_name or LATEST_SOURCE_DISPLAY_NAMES[source_key],
+                "原始文件名": uploaded_file.name,
+                "保存文件名": saved_name,
+                "上传时间": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "文件大小": str(len(data)),
+            }
+        ],
+        columns=SOURCE_INDEX_COLUMNS,
+    )
+    source_paths = [
+        _source_path(sources_dir, source_key, f"{source_key}{candidate_suffix}")
+        for candidate_suffix in ALLOWED_SOURCE_SUFFIXES
+    ]
+    snapshot = _snapshot([*source_paths, index_path, history_path])
+    try:
+        _atomic_write_bytes(saved_path, data)
+        _atomic_write_frame(index_path, records)
+        _atomic_write_frame(history_path, merged)
+        for old_source_path in source_paths:
+            if old_source_path != saved_path and old_source_path.exists():
+                old_source_path.unlink()
+    except Exception:
+        _restore_snapshot(snapshot)
+        raise
+    return saved_path
 
 
 def persist_latest_source(uploaded_file, source_key: str, display_name: str | None = None, data_dir: Path = DATA_DIR) -> Path:

@@ -23,6 +23,7 @@ RUN pip install --no-cache-dir -r requirements.txt \
     && mkdir -p /app/data /app/configs \
     && chown -R dashboard:dashboard /app
 
+COPY --chown=dashboard:dashboard app_paths.py ./app_paths.py
 COPY --chown=dashboard:dashboard backend ./backend
 COPY --chown=dashboard:dashboard dashboard ./dashboard
 COPY --chown=dashboard:dashboard --from=frontend-build /build/frontend/dist ./frontend/dist

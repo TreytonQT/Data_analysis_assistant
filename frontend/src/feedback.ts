@@ -1,4 +1,5 @@
 import { message as antdMessage } from 'antd';
+import type { MessageInstance } from 'antd/es/message/interface';
 
 export type OperationFeedbackOptions<T> = {
   key: string;
@@ -10,9 +11,11 @@ export type OperationFeedbackOptions<T> = {
 };
 
 export const feedbackMessage = antdMessage;
+let activeMessage: MessageInstance = antdMessage;
 
-export function configureFeedback() {
-  antdMessage.config({ top: 24, maxCount: 3, duration: 2.5 });
+export function configureFeedback(messageApi?: MessageInstance) {
+  activeMessage = messageApi || antdMessage;
+  if (!messageApi) antdMessage.config({ top: 24, maxCount: 3, duration: 2.5 });
 }
 
 export const feedbackError = (reason: unknown, fallback = '操作失败') => reason instanceof Error && reason.message ? reason.message : fallback;
@@ -28,20 +31,20 @@ function messageText<T>(value: string | ((value: T) => string) | undefined, data
 }
 
 export async function runOperation<T>(operation: () => Promise<T>, options: OperationFeedbackOptions<T>) {
-  if (options.loading) feedbackMessage.loading({ key: options.key, content: options.loading, duration: 0 });
+  if (options.loading) activeMessage.loading({ key: options.key, content: options.loading, duration: 0 });
   try {
     const result = await operation();
     const hasWarning = Boolean(options.warningWhen?.(result));
     if (hasWarning && options.warning) {
-      feedbackMessage.warning({ key: options.key, content: messageText(options.warning, result, '操作完成，但有部分结果需要注意'), duration: 6 });
+      activeMessage.warning({ key: options.key, content: messageText(options.warning, result, '操作完成，但有部分结果需要注意'), duration: 6 });
     } else if (options.success) {
-      feedbackMessage.success({ key: options.key, content: messageText(options.success, result, '操作已完成'), duration: 2.5 });
+      activeMessage.success({ key: options.key, content: messageText(options.success, result, '操作已完成'), duration: 2.5 });
     } else if (options.warning) {
-      feedbackMessage.warning({ key: options.key, content: messageText(options.warning, result, '操作完成，但有部分结果需要注意'), duration: 6 });
+      activeMessage.warning({ key: options.key, content: messageText(options.warning, result, '操作完成，但有部分结果需要注意'), duration: 6 });
     }
     return result;
   } catch (reason) {
-    if (!isAbortError(reason)) feedbackMessage.error({ key: options.key, content: messageText(options.error, reason, feedbackError(reason)), duration: 6 });
+    if (!isAbortError(reason)) activeMessage.error({ key: options.key, content: messageText(options.error, reason, feedbackError(reason)), duration: 6 });
     throw reason;
   }
 }
@@ -71,15 +74,16 @@ export async function writeClipboardText(text: string) {
 export async function copyWithFeedback(text: string, label: string, count?: number) {
   const key = `copy-${label}`;
   if (!text.trim()) {
-    feedbackMessage.info({ key, content: `暂无${label}可复制`, duration: 3 });
+    activeMessage.info({ key, content: `暂无${label}可复制`, duration: 3 });
     return false;
   }
   try {
+    activeMessage.loading({ key, content: `正在复制${label}…`, duration: 0 });
     await writeClipboardText(text);
-    feedbackMessage.success({ key, content: `已复制${count === undefined ? '' : ` ${count} 个`}${label}`, duration: 2.5 });
+    activeMessage.success({ key, content: `已复制${count === undefined ? '' : ` ${count} 个`}${label}`, duration: 2.5 });
     return true;
   } catch (reason) {
-    feedbackMessage.error({ key, content: feedbackError(reason, `复制${label}失败，请重试`), duration: 6 });
+    activeMessage.error({ key, content: feedbackError(reason, `复制${label}失败，请手动复制`), duration: 6 });
     return false;
   }
 }
@@ -110,17 +114,17 @@ function responseFilename(response: Response, fallback: string) {
 export function downloadBlobWithFeedback(blob: Blob, filename: string, label = filename) {
   try {
     triggerBlobDownload(blob, filename);
-    feedbackMessage.success({ content: `${label}已生成并开始下载`, duration: 2.5 });
+    activeMessage.success({ content: `${label}已生成并开始下载`, duration: 2.5 });
     return true;
   } catch (reason) {
-    feedbackMessage.error({ content: feedbackError(reason, `${label}下载失败，请重试`), duration: 6 });
+    activeMessage.error({ content: feedbackError(reason, `${label}下载失败，请重试`), duration: 6 });
     return false;
   }
 }
 
 export async function downloadWithFeedback(url: string, fallbackFilename: string, label = fallbackFilename) {
   const key = `download-${url}`;
-  feedbackMessage.loading({ key, content: `正在生成${label}…`, duration: 0 });
+  activeMessage.loading({ key, content: `正在生成${label}…`, duration: 0 });
   try {
     const response = await fetch(url, { credentials: 'same-origin' });
     if (!response.ok) {
@@ -129,10 +133,10 @@ export async function downloadWithFeedback(url: string, fallbackFilename: string
       throw new Error(detail);
     }
     triggerBlobDownload(await response.blob(), responseFilename(response, fallbackFilename));
-    feedbackMessage.success({ key, content: `${label}已生成并开始下载`, duration: 2.5 });
+    activeMessage.success({ key, content: `${label}已生成并开始下载`, duration: 2.5 });
     return true;
   } catch (reason) {
-    if (!isAbortError(reason)) feedbackMessage.error({ key, content: feedbackError(reason, `${label}下载失败，请重试`), duration: 6 });
+    if (!isAbortError(reason)) activeMessage.error({ key, content: feedbackError(reason, `${label}下载失败，请重试`), duration: 6 });
     return false;
   }
 }

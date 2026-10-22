@@ -35,6 +35,7 @@ from dashboard.data_processing import (
     read_local_table,
     read_upload_table,
 )
+from backend.listing_prices import listing_download, listing_preview, reports_listing_index, upload_listing_file
 from dashboard.report_store import (
     DATA_DIR,
     delete_upload_record,
@@ -45,6 +46,7 @@ from dashboard.report_store import (
     load_latest_source_record,
     load_upload_records,
     persist_latest_source,
+    persist_sales_amount_detail_source,
     persist_uploaded_sales_history,
     persist_uploaded_reports,
     validate_report_month,
@@ -228,9 +230,10 @@ def _duplicate_upload_warning(source_key: str, issues: list[dict]) -> tuple[int,
 
 
 def _invalidate_dashboard_cache() -> None:
-    from backend.dashboard_api import clear_dashboard_caches
+    from backend.dashboard_api import clear_dashboard_caches, schedule_replenishment_warmup
 
     clear_dashboard_caches()
+    schedule_replenishment_warmup()
 
 
 def _warm_source_cache(source_key: str) -> None:
@@ -251,7 +254,9 @@ def reports():
         "sources": {
             key: {"title": title, "records": frame_records(load_latest_source_record(key))}
             for key, (title, _) in SOURCE_DEFINITIONS.items()
-        } | {"sales_history_rolling": {"title": "往月销量原始表", "records": frame_records(history_records)}},
+        }
+        | {"sales_history_rolling": {"title": "往月销量原始表", "records": frame_records(history_records)}}
+        | {"listing_prices": {"title": "Listing价格", "records": reports_listing_index()["records"]}},
     }
 
 
@@ -339,6 +344,40 @@ async def upload_sales_history(files: Annotated[list[UploadFile], File(...)]):
         raise HTTPException(422, str(exc)) from exc
 
 
+@router.post("/listing-prices")
+async def upload_listing_prices(file: UploadFile):
+    name, data = await read_upload_limited(
+        file,
+        fallback_name="Listing.xlsx",
+        max_bytes=MAX_SOURCE_FILE_BYTES,
+        allowed={".xlsx", ".xls"},
+    )
+    try:
+        result = upload_listing_file(name, data)
+        _invalidate_dashboard_cache()
+        return result | {"warnings": result.get("warnings", []) + ([result["cleanup_warning"]] if result.get("cleanup_warning") else [])}
+    except HTTPException:
+        raise
+    except (ValueError, TypeError, KeyError, OSError) as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@router.get("/listing-prices")
+def listing_prices():
+    return reports_listing_index()
+
+
+@router.get("/listing-prices/{listing_date}/preview")
+def preview_listing_prices(listing_date: str, limit: int = 50):
+    return listing_preview(listing_date, limit)
+
+
+@router.get("/listing-prices/{listing_date}/download")
+def download_listing_prices(listing_date: str):
+    path = listing_download(listing_date)
+    return FileResponse(path, filename=path.name)
+
+
 @router.post("/source/{source_key}")
 async def upload_source(source_key: str, file: Annotated[UploadFile, File(...)]):
     title, validator = source_or_404(source_key)
@@ -372,7 +411,11 @@ async def upload_source(source_key: str, file: Annotated[UploadFile, File(...)])
             unmatched_warning = _sku_image_map_unmatched_warning(normalized)
             if unmatched_warning:
                 source_warnings.append(unmatched_warning)
-        path = persist_latest_source(upload, source_key, title)
+        path = (
+            persist_sales_amount_detail_source(upload, normalized, title)
+            if source_key == "sales_amount_detail"
+            else persist_latest_source(upload, source_key, title)
+        )
         _invalidate_dashboard_cache()
         _warm_source_cache(source_key)
         warnings = [warning for warning in [duplicate_warning, *source_warnings] if warning]

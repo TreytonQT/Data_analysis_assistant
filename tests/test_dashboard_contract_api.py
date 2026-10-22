@@ -12,6 +12,20 @@ from backend.main import app
 
 
 class DashboardContractApiTests(unittest.TestCase):
+    def test_developer_forecast_components_are_hidden_columns_with_exact_total(self):
+        frame = pd.DataFrame([
+            {"开发员": "甲", "预估本月销售额（元）": 280, "预估中企原始销售额（元）": 100, "预估本土原始销售额（元）": 200},
+            {"开发员": "乙", "预估本月销售额（元）": -28, "预估中企原始销售额（元）": -10, "预估本土原始销售额（元）": -20},
+        ])
+        result = dashboard_api.performance_section("performance-0", "开发员业绩排行", frame)
+        self.assertEqual([column["key"] for column in result["columns"]], ["开发员", "预估本月销售额（元）"])
+        rows = result["rows_serializer"](result["frame"])
+        by_name = {row["开发员"]: row for row in rows}
+        self.assertEqual(by_name["甲"]["forecast_sales"], {"enterprise": 100, "local": 200})
+        self.assertEqual(by_name["合计"]["forecast_sales"], {"enterprise": 90, "local": 180})
+        for row in rows:
+            self.assertAlmostEqual(row["预估本月销售额（元）"], row["forecast_sales"]["enterprise"] * 0.8 + row["forecast_sales"]["local"])
+
     def setUp(self) -> None:
         self.client = TestClient(app)
 
@@ -214,6 +228,9 @@ class DashboardContractApiTests(unittest.TestCase):
             "最大重量(g)": 120, "库存覆盖天数": 90, "最近促销开始日期": "2026-08-01",
             "最近促销截止日期": "2026-08-10", "最近促销折扣": 10,
             "DE总销量": 120, "FR总销量": 80, "ES总销量": 60, "IT总销量": 40,
+            "DE近30天销量": 30, "FR近30天销量": 90, "ES近30天销量": 20, "IT近30天销量": 60,
+            "昨天销量": 8, "前天销量": 6, "上前销量": 5,
+            "7天销量": 50, "14天销量": 96, "30天销量": 210, "90天销量": 720,
             **{
                 key: value
                 for month in range(1, 13)
@@ -247,10 +264,45 @@ class DashboardContractApiTests(unittest.TestCase):
         self.assertEqual(payload["group_rows"][0]["identity"]["rating"], {"review_count": 120, "score": 4.5})
         self.assertEqual(payload["group_rows"][0]["countries"]["FR"]["margin"], 0.15)
         self.assertEqual(payload["group_rows"][0]["promotion"]["start_date"], "2026-08-01")
-        self.assertEqual(payload["group_rows"][0]["history"]["site_sales"]["DE"], 120)
+        # Historical totals must never stand in for a missing sales-detail source.
+        self.assertEqual(payload["group_rows"][0]["history"]["site_sales"], {"DE": None, "FR": None, "ES": None, "IT": None})
+        self.assertEqual(payload["group_rows"][0]["history"]["recent_sales"], {"yesterday": 8, "day_before_yesterday": 6, "two_days_before": 5})
+        self.assertEqual(payload["group_rows"][0]["history"]["period_sales"], {"days_7": 50, "days_14": 96, "days_30": 210, "days_90": 720})
         self.assertEqual(payload["group_rows"][0]["history"]["peak_months"][0]["month"], 12)
         self.assertNotIn("remarks", payload["group_rows"][0]["identity"])
         self.assertEqual(payload["group_rows"][0]["recommendation"]["official_quantity"], 310)
+
+    def test_replenishment_pricing_serializes_missing_event_prices_as_null(self) -> None:
+        frame = pd.DataFrame([{
+            "补货组ID": "B001", "ASIN": "B001", "原SKU": "SKU-1",
+            "跟卖SKU": "", "是否补货": True, "建议补货数量": 40,
+        }])
+        source = pd.DataFrame([{
+            "MSKU": "SKU-1", "ASIN": "B001", "DE_当前实际总价": 8,
+        }])
+        event = {
+            "sku": "SKU-1", "asin": "B001", "country": "DE", "type": "恢复可售",
+            "date": "2026-09-11", "previous_date": "2026-09-10", "gap_days": 1,
+            "observed_as": "2026-09-11", "old_base_price": float("nan"),
+            "new_base_price": 10, "old_effective_price": float("nan"),
+            "new_effective_price": 8, "anomaly": pd.NA,
+        }
+        with (
+            patch("backend.dashboard_api._replenishment_tables", return_value={"detail": frame}),
+            patch("backend.dashboard_api._page_revision", return_value="test-revision"),
+            patch("backend.dashboard_api.cached_listing_bundle", return_value=(source, pd.DataFrame(), (event,))),
+        ):
+            response = self.client.get("/api/dashboard/replenishment/pricing", params={"group_ids": "B001"})
+
+        self.assertEqual(response.status_code, 200, response.text)
+        pricing = response.json()["rows"]["B001"]
+        self.assertIsNone(pricing["recent_event"]["old_base_price"])
+        self.assertIsNone(pricing["recent_event"]["old_effective_price"])
+        self.assertIsNone(pricing["recent_event"]["anomaly"])
+        change = pricing["countries"]["DE"]["latest_change"]
+        self.assertIsNone(change["old_price"])
+        self.assertEqual(change["new_price"], 8)
+        self.assertIsNone(change["amount_change"])
 
     def test_replenishment_sku_detail_exposes_four_site_margins(self) -> None:
         summary = pd.DataFrame([{"补货组ID": "B001", "ASIN": "B001"}])
@@ -267,6 +319,8 @@ class DashboardContractApiTests(unittest.TestCase):
         payload = response.json()
         self.assertEqual(payload["sku_rows"][0]["德国毛利率"], 0.25)
         self.assertEqual(payload["sku_rows"][0]["意大利毛利率"], -0.1)
+        self.assertEqual(payload["sales_history"]["recent_sales"], {"yesterday": None, "day_before_yesterday": None, "two_days_before": None})
+        self.assertEqual(payload["sales_history"]["period_sales"], {"days_7": None, "days_14": None, "days_30": None, "days_90": None})
         self.assertEqual(
             {column["key"] for column in payload["sku_columns"] if column["key"].endswith("毛利率")},
             {"德国毛利率", "法国毛利率", "西班牙毛利率", "意大利毛利率"},
@@ -472,6 +526,48 @@ class DashboardContractApiTests(unittest.TestCase):
         exported = pd.read_csv(io.BytesIO(response.content), encoding="utf-8-sig")
         self.assertEqual(exported["姓名"].tolist(), ["丁冬", "陈晨", "安娜"])
         self.assertEqual(exported["销售额"].tolist(), [400.5, 300.5, 100.5])
+
+    def test_slow_moving_coverage_agrees_in_summary_paging_search_sort_and_csv(self) -> None:
+        frame = pd.DataFrame({
+            "SKU": ["KEEP-A", "KEEP-B", "KEEP-C", "OTHER"],
+            "ASIN": ["A", "B", "C", "D"],
+            "开发员": ["甲", "甲", "甲", "乙"],
+            "日均销量": [3.0, 2.0, 0.0, 1.0],
+            "总库存数": [100.0, 20.0, 5.0, 2.0],
+            "可售天数": [100 / 3, 10.0, None, 2.0],
+        })
+        with (
+            patch("backend.dashboard_api.load_source_frame", return_value=pd.DataFrame()),
+            patch("backend.dashboard_api.load_business_config", return_value=(pd.DataFrame(), pd.DataFrame())),
+            patch("backend.dashboard_api.exclude_stopped_store_operational_rows", return_value=pd.DataFrame()),
+            patch("backend.dashboard_api.developer_options", return_value=[]),
+            patch("backend.dashboard_api._sku_image_lookup", return_value={}),
+            patch("backend.dashboard_api._optional_sku_image_map", return_value=pd.DataFrame()),
+            patch("backend.dashboard_api._last_promotion_rows", return_value=pd.DataFrame()),
+            patch("backend.dashboard_api.build_slow_moving_inventory_table", return_value=frame.assign(
+                **{"90天以上库存数合计": 1, "90天以上占用资金合计": 10.0, "库存计提": 0.5, "弃置费": 21.0})),
+        ):
+            bundle = dashboard_api._build_slow_moving(None, "90天以上")
+        params = {"search": "KEEP", "sort_by": "可售天数", "sort_order": "asc"}
+        with patch("backend.dashboard_api._bundle", return_value=bundle), patch("backend.dashboard_api._revision_paths", return_value=[]):
+            summary = self.client.get("/api/dashboard/slow-moving").json()["sections"][0]
+            page = self.client.get("/api/dashboard/slow-moving/sections/detail", params={**params, "page": 2, "page_size": 1})
+            csv = self.client.get("/api/dashboard/slow-moving/sections/detail/export.csv", params=params)
+        self.assertEqual(page.status_code, 200, page.text)
+        self.assertEqual(csv.status_code, 200, csv.text)
+        self.assertEqual(page.json()["rows"][0]["SKU"], "KEEP-A")
+        self.assertAlmostEqual(page.json()["rows"][0]["可售天数"], summary["rows"][0]["可售天数"])
+        self.assertIsNone(summary["rows"][2]["可售天数"])
+        metadata = next(column for column in summary["columns"] if column["key"] == "可售天数")
+        self.assertEqual((metadata["format"], metadata["precision"]), ("number", 2))
+        exported = pd.read_csv(io.BytesIO(csv.content), encoding="utf-8-sig")
+        self.assertTrue(csv.content.startswith(b"\xef\xbb\xbf"))
+        self.assertEqual(exported["SKU"].tolist(), ["KEEP-B", "KEEP-A", "KEEP-C"])
+        self.assertAlmostEqual(exported.iloc[1]["可售天数（天）"], 100 / 3)
+        self.assertEqual(exported.iloc[1]["总库存数（件）"], 100)
+        self.assertTrue(any("可售天数" in str(column) for column in exported.columns))
+        self.assertTrue(any("库存" in str(column) for column in exported.columns))
+        self.assertTrue(any("日均" in str(column) for column in exported.columns))
 
     def test_large_api_response_is_gzip_compressed(self) -> None:
         frame = pd.DataFrame(

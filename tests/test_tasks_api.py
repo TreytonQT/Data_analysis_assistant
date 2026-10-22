@@ -118,13 +118,13 @@ class TasksApiTests(unittest.TestCase):
         current = next(task for task in tasks if task["id"] == created["id"])
         self.assertEqual(current["status"], "current")
 
-    def test_old_completed_non_repeating_task_is_removed(self):
+    def test_old_completed_non_repeating_task_is_kept_until_deleted(self):
         created = self.client.post("/api/tasks", json=self.task_payload(
             due_at="2020-01-01T09:00:00Z", remind_at="2020-01-01T09:00:00Z"
         )).json()
         self.client.post(f"/api/tasks/{created['id']}/transition", json={"status": "completed"})
 
-        self.assertNotIn(created["id"], [task["id"] for task in self.client.get("/api/tasks").json()])
+        self.assertIn(created['id'], [task['id'] for task in self.client.get('/api/tasks').json()])
 
     def test_notifications_include_due_task_and_can_be_marked_read(self):
         created = self.client.post("/api/tasks", json=self.task_payload(remind_at="2020-01-01T09:00:00Z")).json()
@@ -132,6 +132,18 @@ class TasksApiTests(unittest.TestCase):
         self.assertEqual(notices[0]["id"], created["id"])
         self.assertEqual(self.client.post(f"/api/notifications/{created['id']}/read").status_code, 200)
 
+    def test_recurrence_rules_normalize_and_reject_invalid_dates(self):
+        daily = self.client.post("/api/tasks", json=self.task_payload(recurrence_type="daily", recurrence_days=[4]))
+        self.assertEqual(daily.status_code, 201)
+        self.assertEqual(daily.json()["recurrence_days"], [])
+        weekly = self.client.post("/api/tasks", json=self.task_payload(recurrence_type="weekly", recurrence_days=[6, 0, 6]))
+        self.assertEqual(weekly.status_code, 201)
+        self.assertEqual(weekly.json()["recurrence_days"], [0, 6])
+        self.assertEqual(self.client.post("/api/tasks", json=self.task_payload(recurrence_type="weekly", recurrence_days=[7])).status_code, 422)
+        self.assertEqual(self.client.post("/api/tasks", json=self.task_payload(recurrence_type="monthly", recurrence_days=[1, 2])).status_code, 422)
+        monthly = self.client.post("/api/tasks", json=self.task_payload(recurrence_type="monthly", recurrence_days=[31]))
+        self.assertEqual(monthly.status_code, 201)
+        self.assertEqual(monthly.json()["recurrence_days"], [31])
     def test_import_tasks(self):
         response = self.client.post("/api/tasks/import", json=[self.task_payload(title="导入任务")])
         self.assertEqual(response.status_code, 200)

@@ -11,13 +11,15 @@ import {
   Pagination,
   Popconfirm,
   Progress,
-  Segmented,
   Space,
   Spin,
   Tag,
   Typography,
 } from 'antd';
 import { feedbackMessage as message, copyWithFeedback } from './feedback';
+import FilterActions from './FilterActions';
+import ConfirmFilterSelect from './ConfirmFilterSelect';
+import type { TextAreaRef } from 'antd/es/input/TextArea';
 import {
   CheckCircleOutlined,
   CloudUploadOutlined,
@@ -47,13 +49,14 @@ const emptyMetrics: BatchMonitorMetrics = {
   pending_artwork_batches: 0,
   pending_shipment_skus: 0,
   pending_arrival_skus: 0,
+
 };
 
 function integer(value: number) {
   return new Intl.NumberFormat('zh-CN', { maximumFractionDigits: 0 }).format(value || 0);
 }
 
-function price(value: number | null) {
+function price(value: number | null | undefined) {
   return value == null ? '未维护' : value.toFixed(2);
 }
 
@@ -62,13 +65,16 @@ function progressPercent(current: number, total: number) {
 }
 
 function completeState(row: BatchMonitorRow): BatchMonitorRow {
+  const naturalComplete = Boolean(
+    row.artwork_completed_date
+    && row.shipped_count === row.sku_count
+    && row.arrived_count === row.sku_count
+  );
+  const manualComplete = Boolean(row.manual_completed_at);
   return {
     ...row,
-    is_complete: Boolean(
-      row.artwork_completed_date
-      && row.shipped_count === row.sku_count
-      && row.arrived_count === row.sku_count
-    ),
+    completion_mode: manualComplete ? 'manual' : naturalComplete ? 'automatic' : 'in_progress',
+    is_complete: manualComplete || naturalComplete,
   };
 }
 
@@ -79,10 +85,22 @@ function rowVisible(row: BatchMonitorRow, view: BatchView) {
 }
 
 function MetricCard({ label, value, tone }: { label: string; value: number; tone: string }) {
-  return <Card className={`batch-monitor-metric ${tone}`}>
+  return <Card className={'batch-monitor-metric ' + tone}>
     <Typography.Text>{label}</Typography.Text>
     <strong>{integer(value)}</strong>
   </Card>;
+}
+
+function metricContribution(row: BatchMonitorRow) {
+  if (row.manual_completed_at) {
+    return { incomplete_batches: 0, pending_artwork_batches: 0, pending_shipment_skus: 0, pending_arrival_skus: 0 };
+  }
+  return {
+    incomplete_batches: row.is_complete ? 0 : 1,
+    pending_artwork_batches: row.artwork_completed_date ? 0 : 1,
+    pending_shipment_skus: Math.max(0, row.sku_count - row.shipped_count),
+    pending_arrival_skus: Math.max(0, row.shipped_count - row.arrived_count),
+  };
 }
 
 function BatchProgress({
@@ -118,6 +136,8 @@ export default function BatchMonitorPage({
   refreshVersion?: number;
 }) {
   const [payload, setPayload] = useState<BatchMonitorPayload>();
+  const [completionBusy, setCompletionBusy] = useState<Set<string>>(new Set());
+  const [busyBatches, setBusyBatches] = useState<Set<string>>(new Set());
   const [view, setView] = useState<BatchView>('incomplete');
   const [searchDraft, setSearchDraft] = useState('');
   const [search, setSearch] = useState('');
@@ -140,6 +160,8 @@ export default function BatchMonitorPage({
   const [orphanLoading, setOrphanLoading] = useState(false);
   const [copyLists, setCopyLists] = useState<BatchCopyLists>();
   const [copyListsLoading, setCopyListsLoading] = useState(false);
+  const [copyingTargets, setCopyingTargets] = useState<Record<'unbound' | 'pending', boolean>>({ unbound: false, pending: false });
+  const [copiedTargets, setCopiedTargets] = useState<Record<'unbound' | 'pending', boolean>>({ unbound: false, pending: false });
   const [arrivalTarget, setArrivalTarget] = useState<{ batchNo: string; sku: BatchMonitorSku }>();
   const [arrivalDate, setArrivalDate] = useState<Dayjs | null>(dayjs());
   const [arrivalSaving, setArrivalSaving] = useState(false);
@@ -149,95 +171,156 @@ export default function BatchMonitorPage({
   const [shipmentArrivalSaving, setShipmentArrivalSaving] = useState(false);
   const loaded = useRef(false);
   const requestId = useRef(0);
+  const listRequests = useRef(new Map<string, Promise<boolean | undefined>>());
+  const copyListsInFlight = useRef<Promise<boolean> | null>(null);
+  const detailRequestIds = useRef(new Map<string, number>());
+  const latestBatchSummaryRef = useRef(new Map<string, BatchMonitorRow>());
+  const busyBatchesRef = useRef(new Set<string>());
   const copyListsRequestId = useRef(0);
+  const copyTextRefs = useRef<Record<'unbound' | 'pending', TextAreaRef | null>>({ unbound: null, pending: null });
 
-  const load = useCallback(async (
+  const load = useCallback((
     nextView: BatchView,
     nextSearch: string,
     nextPage: number,
     showInitial = false,
-  ) => {
+    force = false,
+  ): Promise<boolean | undefined> => {
+    const key = JSON.stringify([nextView, nextSearch, nextPage]);
+    const existing = listRequests.current.get(key);
+    if (existing && !force) return existing;
     const currentRequest = ++requestId.current;
     if (showInitial) setInitialLoading(true); else setSoftLoading(true);
     setError('');
-    try {
-      const result = await api.batchMonitor({
-        view: nextView,
-        search: nextSearch,
-        page: nextPage,
-        page_size: 20,
-      });
-      if (currentRequest !== requestId.current) return;
-      setPayload(result);
-      setPage(result.page);
-      loaded.current = true;
-      return true;
-    } catch (loadError) {
-      if (currentRequest !== requestId.current) return;
-      setError(loadError instanceof Error ? loadError.message : '批次监控读取失败');
-      return false;
-    } finally {
-      if (currentRequest === requestId.current) {
-        setInitialLoading(false);
-        setSoftLoading(false);
+    const request = (async () => {
+      try {
+        const result = await api.batchMonitor({
+          view: nextView,
+          search: nextSearch,
+          page: nextPage,
+          page_size: 20,
+        });
+        if (currentRequest !== requestId.current) return;
+        setPayload(result);
+        for (const row of result.rows) latestBatchSummaryRef.current.set(row.batch_no, row);
+        setPage(result.page);
+        loaded.current = true;
+        return true;
+      } catch (loadError) {
+        if (currentRequest !== requestId.current) return;
+        setError(loadError instanceof Error ? loadError.message : '批次监控读取失败');
+        return false;
+      } finally {
+        if (currentRequest === requestId.current) {
+          setInitialLoading(false);
+          setSoftLoading(false);
+        }
       }
-    }
+    })();
+    listRequests.current.set(key, request);
+    const clear = () => {
+      if (listRequests.current.get(key) === request) listRequests.current.delete(key);
+    };
+    void request.then(clear, clear);
+    return request;
   }, []);
 
-  const loadCopyLists = useCallback(async () => {
+  const loadCopyLists = useCallback((force = false): Promise<boolean> => {
+    if (copyListsInFlight.current && !force) return copyListsInFlight.current;
     const currentRequest = ++copyListsRequestId.current;
     setCopyListsLoading(true);
-    try {
-      const result = await api.batchCopyLists();
-      if (currentRequest === copyListsRequestId.current) setCopyLists(result);
-      return true;
-    } catch (loadError) {
-      if (currentRequest === copyListsRequestId.current) {
-        setError(loadError instanceof Error ? loadError.message : '可复制清单读取失败');
+    const request = (async () => {
+      try {
+        const result = await api.batchCopyLists();
+        if (currentRequest === copyListsRequestId.current) setCopyLists(result);
+        return true;
+      } catch (loadError) {
+        if (currentRequest === copyListsRequestId.current) {
+          setError(loadError instanceof Error ? loadError.message : '可复制清单读取失败');
+        }
+        return false;
+      } finally {
+        if (currentRequest === copyListsRequestId.current) setCopyListsLoading(false);
       }
-      return false;
-    } finally {
-      if (currentRequest === copyListsRequestId.current) setCopyListsLoading(false);
-    }
+    })();
+    copyListsInFlight.current = request;
+    const clear = () => {
+      if (copyListsInFlight.current === request) copyListsInFlight.current = null;
+    };
+    void request.then(clear, clear);
+    return request;
   }, []);
+
 
   useEffect(() => {
     if (!active) return;
     void load(view, search, page, !loaded.current);
-    void loadCopyLists();
-    // View/search/page changes are submitted explicitly by the handlers below.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [active, routeVersion, refreshVersion, load, loadCopyLists]);
+  }, [active, routeVersion, refreshVersion, view, search, page, load]);
 
-  const changeView = (value: string | number) => {
-    const next = String(value) as BatchView;
-    setView(next);
-    setPage(1);
-    void load(next, search, 1);
+  useEffect(() => {
+    if (!active) return;
+    void loadCopyLists(true);
+  }, [active, routeVersion, refreshVersion, loadCopyLists]);
+
+  const refreshAfterMutation = useCallback((operationKey: string, savedMessage: string, nextPage = page) => {
+    void Promise.all([load(view, search, nextPage, false, true), loadCopyLists(true)]).then(results => {
+      if (results.some(result => result === false)) {
+        message.warning({ key: operationKey, content: `${savedMessage}，但页面刷新失败`, duration: 6 });
+      }
+    });
+  }, [load, loadCopyLists, page, search, view]);
+
+  const beginBatchOperation = (batch: string) => {
+    if (busyBatchesRef.current.has(batch)) return false;
+    busyBatchesRef.current.add(batch);
+    setBusyBatches(new Set(busyBatchesRef.current));
+    return true;
   };
 
-  const submitSearch = (value = searchDraft) => {
-    const next = value.trim();
-    setSearch(next);
+  const endBatchOperation = (batch: string) => {
+    busyBatchesRef.current.delete(batch);
+    setBusyBatches(new Set(busyBatchesRef.current));
+  };
+
+  const applySearch = (value: string) => {
+    setSearchDraft(value);
+    const nextSearch = value.trim();
+    if (nextSearch === search) return;
+    setSearch(nextSearch);
     setPage(1);
-    void load(view, next, 1);
+  };
+  const resetFilters = () => {
+    setSearchDraft('');
+    setView('incomplete');
+    setSearch('');
+    setPage(1);
   };
 
   const changePage = (next: number) => {
     setPage(next);
-    void load(view, search, next);
   };
 
   const loadDetails = useCallback(async (batch: string, force = false) => {
     if (!force && details[batch]) return;
+    const requestVersion = (detailRequestIds.current.get(batch) || 0) + 1;
+    detailRequestIds.current.set(batch, requestVersion);
     setDetailLoading(current => new Set(current).add(batch));
     setError('');
     try {
       const result = await api.batchDetails(batch);
-      setDetails(current => ({ ...current, [batch]: result }));
+      if (detailRequestIds.current.get(batch) === requestVersion) {
+        const latestBatch = latestBatchSummaryRef.current.get(batch);
+        setDetails(current => ({
+          ...current,
+          [batch]: { ...result, batch: latestBatch || current[batch]?.batch || result.batch },
+        }));
+      }
     } catch (detailError) {
-      setError(detailError instanceof Error ? detailError.message : '批次SKU明细读取失败');
+      if (detailRequestIds.current.get(batch) === requestVersion) {
+        setError(detailError instanceof Error ? detailError.message : '批次SKU明细读取失败');
+      }
     } finally {
+      if (detailRequestIds.current.get(batch) !== requestVersion) return;
       setDetailLoading(current => {
         const next = new Set(current);
         next.delete(batch);
@@ -279,51 +362,100 @@ export default function BatchMonitorPage({
     });
   };
 
+  const replaceBatchSummaries = (summaries: Array<Partial<BatchMonitorRow> & { batch_no: string }>) => {
+    if (!summaries.length) return;
+    const byBatch = new Map(summaries.map(summary => [summary.batch_no, summary]));
+    setPayload(current => {
+      if (!current) return current;
+      let totalDelta = 0;
+      let metrics = { ...current.metrics };
+      const rows = current.rows.map(oldRow => {
+        const summary = byBatch.get(oldRow.batch_no);
+        if (!summary) return oldRow;
+        const newRow = completeState({ ...oldRow, ...summary } as BatchMonitorRow);
+        latestBatchSummaryRef.current.set(newRow.batch_no, newRow);
+        const oldVisible = rowVisible(oldRow, current.view);
+        const newVisible = rowVisible(newRow, current.view);
+        totalDelta += Number(newVisible) - Number(oldVisible);
+        const before = metricContribution(oldRow);
+        const after = metricContribution(newRow);
+        metrics = {
+          ...metrics,
+          incomplete_batches: Math.max(0, metrics.incomplete_batches + after.incomplete_batches - before.incomplete_batches),
+          pending_artwork_batches: Math.max(0, metrics.pending_artwork_batches + after.pending_artwork_batches - before.pending_artwork_batches),
+          pending_shipment_skus: Math.max(0, metrics.pending_shipment_skus + after.pending_shipment_skus - before.pending_shipment_skus),
+          pending_arrival_skus: Math.max(0, metrics.pending_arrival_skus + after.pending_arrival_skus - before.pending_arrival_skus),
+        };
+        return newRow;
+      }).filter(row => rowVisible(row, current.view));
+      return { ...current, rows, total: Math.max(0, current.total + totalDelta), metrics };
+    });
+  };
+
+  const replaceLoadedDetailBatch = (batch: BatchMonitorRow) => {
+    latestBatchSummaryRef.current.set(batch.batch_no, batch);
+    setDetails(current => current[batch.batch_no]
+      ? { ...current, [batch.batch_no]: { ...current[batch.batch_no], batch } }
+      : current);
+  };
+
   const updateArtwork = async (row: BatchMonitorRow, completed: boolean) => {
+    if (!beginBatchOperation(row.batch_no)) return;
     const key = `artwork-${row.batch_no}`;
-    setActionKey(key);
     setError('');
     message.loading({ key, content: `${completed ? '正在标记' : '正在撤销'}${row.batch_no}美工图…`, duration: 0 });
     try {
       const result = await api.updateBatchArtwork(row.batch_no, completed);
-      patchBatch(
-        row.batch_no,
-        current => ({ ...current, artwork_completed_date: result.artwork_completed_date }),
-        (metrics, oldRow, newRow) => ({
-          ...metrics,
-          pending_artwork_batches: Math.max(
-            0,
-            metrics.pending_artwork_batches
+      if (result.batch) {
+        replaceBatchSummaries([result.batch]);
+        replaceLoadedDetailBatch(result.batch);
+      } else {
+        patchBatch(
+          row.batch_no,
+          current => ({ ...current, artwork_completed_date: result.artwork_completed_date }),
+          (metrics, oldRow, newRow) => ({
+            ...metrics,
+            pending_artwork_batches: Math.max(0, metrics.pending_artwork_batches
               + (oldRow.artwork_completed_date ? 0 : -1)
-              + (newRow.artwork_completed_date ? 0 : 1),
-          ),
-          incomplete_batches: Math.max(
-            0,
-            metrics.incomplete_batches
-              + (newRow.is_complete ? 0 : 1)
-              - (oldRow.is_complete ? 0 : 1),
-          ),
-        }),
-      );
-      setDetails(current => current[row.batch_no]
-        ? {
-          ...current,
-          [row.batch_no]: {
-            ...current[row.batch_no],
-            batch: completeState({
-              ...current[row.batch_no].batch,
-              artwork_completed_date: result.artwork_completed_date,
-            }),
-          },
-        }
-        : current);
+              + (newRow.artwork_completed_date ? 0 : 1)),
+            incomplete_batches: Math.max(0, metrics.incomplete_batches
+              + (newRow.is_complete ? 0 : 1) - (oldRow.is_complete ? 0 : 1)),
+          }),
+        );
+      }
       message.success({ key, content: completed ? `${row.batch_no}美工图已完成` : `${row.batch_no}已撤销美工图完成` });
     } catch (artworkError) {
       const detail = artworkError instanceof Error ? artworkError.message : '美工图状态保存失败';
       setError(detail);
       message.error({ key, content: `${row.batch_no}美工图状态保存失败：${detail}`, duration: 6 });
     } finally {
-      setActionKey('');
+      endBatchOperation(row.batch_no);
+    }
+  };
+
+  const updateBatchCompletion = async (row: BatchMonitorRow, completed: boolean) => {
+    if (!beginBatchOperation(row.batch_no)) return;
+    setCompletionBusy(current => new Set(current).add(row.batch_no));
+    const key = `completion-${row.batch_no}`;
+    const savedMessage = completed ? `${row.batch_no}已手动完成` : `${row.batch_no}已撤销手动完成`;
+    message.loading({ key, content: `${completed ? '正在完成' : '正在撤销'}${row.batch_no}监控…`, duration: 0 });
+    try {
+      const result = await api.updateBatchCompletion(row.batch_no, completed);
+      replaceBatchSummaries([result.batch]);
+      replaceLoadedDetailBatch(result.batch);
+      message.success({ key, content: savedMessage });
+      refreshAfterMutation(key, savedMessage);
+    } catch (completionError) {
+      const detail = completionError instanceof Error ? completionError.message : '批次完成状态保存失败';
+      setError(detail);
+      message.error({ key, content: `${row.batch_no}完成状态保存失败：${detail}`, duration: 6 });
+    } finally {
+      endBatchOperation(row.batch_no);
+      setCompletionBusy(current => {
+        const next = new Set(current);
+        next.delete(row.batch_no);
+        return next;
+      });
     }
   };
 
@@ -382,52 +514,18 @@ export default function BatchMonitorPage({
           },
         ]),
       ));
-      setPayload(current => {
-        if (!current) return current;
-        const affected = new Map(
-          result.affected_batches.map(item => [item.batch_no, item]),
-        );
-        const completedNow = result.affected_batches.filter(item => item.is_complete).length;
-        const monitoredUpdated = result.affected_batches.reduce(
-          (sum, item) => sum + item.updated_skus,
-          0,
-        );
-        const rows = current.rows
-          .map(row => {
-            const update = affected.get(row.batch_no);
-            return update
-              ? { ...row, arrived_count: update.arrived_count, is_complete: update.is_complete }
-              : row;
-          })
-          .filter(row => rowVisible(row, current.view));
-        const totalDelta = current.view === 'incomplete'
-          ? -completedNow
-          : current.view === 'completed'
-            ? completedNow
-            : 0;
-        return {
-          ...current,
-          rows,
-          total: Math.max(0, current.total + totalDelta),
-          metrics: {
-            ...current.metrics,
-            pending_arrival_skus: Math.max(
-              0,
-              current.metrics.pending_arrival_skus - monitoredUpdated,
-            ),
-            incomplete_batches: Math.max(
-              0,
-              current.metrics.incomplete_batches - completedNow,
-            ),
-          },
-        };
-      });
+      replaceBatchSummaries(result.affected_batches);
+      for (const item of result.affected_batches) {
+        const currentDetail = details[item.batch_no];
+        if (currentDetail) replaceLoadedDetailBatch({ ...currentDetail.batch, ...item } as BatchMonitorRow);
+      }
       setShipmentArrivalOpen(false);
       setShipmentArrivalNo('');
       setShipmentArrivalDate(dayjs());
-      message.success({ key: operationKey, content: `${shipmentNo}新增${result.updated}个已到货SKU` });
-      const refreshed = await Promise.all([load(view, search, page), loadCopyLists()]);
-      if (refreshed.some(value => value === false)) message.warning({ key: operationKey, content: `${shipmentNo}已登记到货，但页面刷新失败`, duration: 6 });
+      setShipmentArrivalSaving(false);
+      const savedMessage = `${shipmentNo}新增${result.updated}个已到货SKU`;
+      message.success({ key: operationKey, content: savedMessage });
+      refreshAfterMutation(operationKey, savedMessage);
     } catch (arrivalError) {
       const detail = arrivalError instanceof Error ? arrivalError.message : '货件到货状态保存失败';
       setError(detail);
@@ -443,7 +541,7 @@ export default function BatchMonitorPage({
   };
 
   const saveSkuArrival = async () => {
-    if (!arrivalTarget || !arrivalDate) return;
+    if (!arrivalTarget || !arrivalDate || !beginBatchOperation(arrivalTarget.batchNo)) return;
     const operationKey = `sku-arrival-${arrivalTarget.sku.sku}`;
     setArrivalSaving(true);
     setError('');
@@ -466,27 +564,32 @@ export default function BatchMonitorPage({
           )),
         },
       }));
-      if (wasPending) patchArrivalCount(arrivalTarget.batchNo, 1);
+      if (result.batch) replaceBatchSummaries([result.batch]);
+      else if (wasPending) patchArrivalCount(arrivalTarget.batchNo, 1);
+      if (result.batch) replaceLoadedDetailBatch(result.batch);
       setArrivalTarget(undefined);
+      setArrivalSaving(false);
       const skuLabel = arrivalTarget.sku.sku;
-      message.success({ key: operationKey, content: `${skuLabel}到货日期已保存` });
-      if (await loadCopyLists() === false) message.warning({ key: operationKey, content: `${skuLabel}到货日期已保存，但复制清单刷新失败`, duration: 6 });
+      const savedMessage = `${skuLabel}到货日期已保存`;
+      message.success({ key: operationKey, content: savedMessage });
+      void loadCopyLists(true);
     } catch (arrivalError) {
       const detail = arrivalError instanceof Error ? arrivalError.message : 'SKU到货日期保存失败';
       setError(detail);
       message.error({ key: operationKey, content: `${arrivalTarget?.sku.sku || 'SKU'}到货日期保存失败：${detail}`, duration: 6 });
     } finally {
+      endBatchOperation(arrivalTarget?.batchNo || '');
       setArrivalSaving(false);
     }
   };
 
   const clearSkuArrival = async (batch: string, sku: BatchMonitorSku) => {
+    if (!beginBatchOperation(batch)) return;
     const key = `sku-clear-${sku.sku}`;
-    setActionKey(key);
     setError('');
     message.loading({ key, content: `正在撤销${sku.sku}到货…`, duration: 0 });
     try {
-      await api.updateSkuArrival(sku.sku, false);
+      const result = await api.updateSkuArrival(sku.sku, false);
       setDetails(current => ({
         ...current,
         [batch]: {
@@ -496,15 +599,18 @@ export default function BatchMonitorPage({
           )),
         },
       }));
-      if (sku.arrival_date) patchArrivalCount(batch, -1);
-      message.success({ key, content: `${sku.sku}已撤销到货` });
-      if (await loadCopyLists() === false) message.warning({ key, content: `${sku.sku}已撤销到货，但复制清单刷新失败`, duration: 6 });
+      if (result.batch) replaceBatchSummaries([result.batch]);
+      else if (sku.arrival_date) patchArrivalCount(batch, -1);
+      if (result.batch) replaceLoadedDetailBatch(result.batch);
+      const savedMessage = `${sku.sku}已撤销到货`;
+      message.success({ key, content: savedMessage });
+      void loadCopyLists(true);
     } catch (arrivalError) {
       const detail = arrivalError instanceof Error ? arrivalError.message : 'SKU到货状态撤销失败';
       setError(detail);
       message.error({ key, content: `${sku.sku}撤销到货失败：${detail}`, duration: 6 });
     } finally {
-      setActionKey('');
+      endBatchOperation(batch);
     }
   };
 
@@ -526,11 +632,8 @@ export default function BatchMonitorPage({
       setBatchNo('');
       setBatchFile(undefined);
       setPage(1);
-      const refreshed = await Promise.all([load(view, search, 1), loadCopyLists()]);
-      if (refreshed.some(result => result === false)) {
-        setError('批次已创建，但页面刷新失败');
-        message.warning({ key: operationKey, content: '批次已创建，但页面刷新失败', duration: 6 });
-      }
+      setCreating(false);
+      refreshAfterMutation(operationKey, `${result.batch_no}已创建`, 1);
     } catch (createError) {
       const detail = createError instanceof Error ? createError.message : '新建批次失败';
       setError(detail);
@@ -551,12 +654,10 @@ export default function BatchMonitorPage({
       const hasWarnings = result.ignored > 0 || result.unassigned > 0 || Boolean(result.conflicts);
       const content = `货件上传${hasWarnings ? '完成但有部分结果需要注意' : '完成'}：新增${result.inserted}，忽略${result.ignored}，未归属${result.unassigned}${preserved}`;
       (hasWarnings ? message.warning : message.success)({ key: 'upload-shipments', content, duration: 6 });
+      replaceBatchSummaries(result.affected_batches || []);
       setDetails({});
-      const refreshed = await Promise.all([load(view, search, page), loadCopyLists()]);
-      if (refreshed.some(result => result === false)) {
-        setError('货件上传已成功，但页面刷新失败');
-        message.warning({ key: 'upload-shipments', content: '货件上传已成功，但页面刷新失败', duration: 6 });
-      }
+      setActionKey('');
+      refreshAfterMutation('upload-shipments', '货件上传已成功');
     } catch (uploadError) {
       const detail = uploadError instanceof Error ? uploadError.message : '货件列表上传失败';
       setError(detail);
@@ -588,8 +689,20 @@ export default function BatchMonitorPage({
     void loadOrphans('', 1);
   };
 
-  const copyLines = async (items: string[], label: string) => {
-    await copyWithFeedback(items.join('\n'), label, items.length);
+  const copyLines = async (items: string[], label: string, target: 'unbound' | 'pending') => {
+    if (copyingTargets[target]) return;
+    setCopyingTargets(current => ({ ...current, [target]: true }));
+    try {
+      const copied = await copyWithFeedback(items.join('\n'), label, items.length);
+      if (copied) {
+        setCopiedTargets(current => ({ ...current, [target]: true }));
+        window.setTimeout(() => setCopiedTargets(current => ({ ...current, [target]: false })), 2000);
+      } else {
+        copyTextRefs.current[target]?.resizableTextArea?.textArea.select();
+      }
+    } finally {
+      setCopyingTargets(current => ({ ...current, [target]: false }));
+    }
   };
 
   const renderDetails = (row: BatchMonitorRow) => {
@@ -617,14 +730,18 @@ export default function BatchMonitorPage({
         </Button>)}
       </div>}
       <div className="batch-sku-grid batch-sku-grid-header" role="row">
-        <span>SKU</span><span>四站开售价</span><span>ASIN</span><span>首次货件</span><span>到货</span>
+        <span>SKU</span><span>四站开售价 / Listing现价</span><span>ASIN</span><span>首次货件</span><span>到货</span>
       </div>
       <div className="batch-sku-grid-body">
         {detail.skus.map(sku => <div className="batch-sku-grid" role="row" key={sku.sku}>
           <strong data-label="SKU">{sku.sku}</strong>
-          <span className="batch-price-grid" data-label="四站开售价">
-            <i>DE {price(sku.de_price)}</i><i>FR {price(sku.fr_price)}</i>
-            <i>ES {price(sku.es_price)}</i><i>IT {price(sku.it_price)}</i>
+          <span className="batch-price-grid" data-label="四站开售价 / Listing现价">
+            {(['DE', 'FR', 'ES', 'IT'] as const).map(code => {
+              const launch = sku[code === 'DE' ? 'de_price' : code === 'FR' ? 'fr_price' : code === 'ES' ? 'es_price' : 'it_price'];
+              const current = sku.listing_current?.[code];
+              const change = sku.listing_change?.[code];
+              return <i key={code}>{code} {price(launch)} / {price(current)}{change == null ? '' : ' (' + (Number(change) * 100).toFixed(1) + '%)'}</i>;
+            })}
           </span>
           <span data-label="ASIN">{sku.asin || '—'}</span>
           <span data-label="首次货件">{sku.shipment_no || <Tag>未发货</Tag>}</span>
@@ -637,7 +754,7 @@ export default function BatchMonitorPage({
                   title={`撤销${sku.sku}的到货状态？`}
                   onConfirm={() => void clearSkuArrival(row.batch_no, sku)}
                 >
-                  <Button size="small" danger loading={actionKey === `sku-clear-${sku.sku}`}>撤销</Button>
+                  <Button size="small" danger loading={busyBatches.has(row.batch_no)} disabled={busyBatches.has(row.batch_no)}>撤销</Button>
                 </Popconfirm>
               </>
               : sku.shipment_no
@@ -691,7 +808,7 @@ export default function BatchMonitorPage({
           icon={<ReloadOutlined />}
           loading={softLoading || copyListsLoading}
           onClick={() => void (async () => {
-            const refreshed = await Promise.all([load(view, search, page), loadCopyLists()]);
+            const refreshed = await Promise.all([load(view, search, page, false, true), loadCopyLists(true)]);
             if (refreshed.every(result => result !== false)) message.success('批次监控数据已刷新');
             else message.error('批次监控刷新失败');
           })()}
@@ -726,16 +843,17 @@ export default function BatchMonitorPage({
           size="small"
           icon={<CopyOutlined />}
           aria-label="复制全部未绑定货件单号的SKU"
-          disabled={!copyLists?.unbound_shipment_skus.length}
-          onClick={() => void copyLines(copyLists?.unbound_shipment_skus || [], '未绑定货件SKU')}
+          disabled={copyListsLoading || copyingTargets.unbound || !copyLists?.unbound_shipment_skus.length}
+          onClick={() => void copyLines(copyLists?.unbound_shipment_skus || [], '未绑定货件SKU', 'unbound')}
         >
-          复制全部
+          {copiedTargets.unbound ? '✓ 已复制' : copyingTargets.unbound ? '复制中…' : '复制全部'}
         </Button>}
       >
         <Typography.Text type="secondary">仅显示已属于监控批次、但尚未绑定首次货件单号的SKU</Typography.Text>
         <Spin spinning={copyListsLoading}>
           <Input.TextArea
             className="batch-copy-textarea"
+            ref={node => { copyTextRefs.current.unbound = node; }}
             aria-label="未绑定货件单号的SKU清单"
             readOnly
             rows={8}
@@ -751,16 +869,17 @@ export default function BatchMonitorPage({
           size="small"
           icon={<CopyOutlined />}
           aria-label="复制全部未到货的货件单号"
-          disabled={!copyLists?.pending_shipment_nos.length}
-          onClick={() => void copyLines(copyLists?.pending_shipment_nos || [], '未到货货件单号')}
+          disabled={copyListsLoading || copyingTargets.pending || !copyLists?.pending_shipment_nos.length}
+          onClick={() => void copyLines(copyLists?.pending_shipment_nos || [], '未到货货件单号', 'pending')}
         >
-          复制全部
+          {copiedTargets.pending ? '✓ 已复制' : copyingTargets.pending ? '复制中…' : '复制全部'}
         </Button>}
       >
         <Typography.Text type="secondary">仅显示已绑定批次且仍有SKU未到货的货件，货件号自动去重</Typography.Text>
         <Spin spinning={copyListsLoading}>
           <Input.TextArea
             className="batch-copy-textarea"
+            ref={node => { copyTextRefs.current.pending = node; }}
             aria-label="未到货货件单号清单"
             readOnly
             rows={8}
@@ -773,23 +892,29 @@ export default function BatchMonitorPage({
 
     <Card className="batch-monitor-board" title="批次进度矩阵" extra={softLoading && <Spin size="small" />}>
       <div className="batch-monitor-toolbar">
-        <Segmented
+        <ConfirmFilterSelect
+          mode="single"
+          ariaLabel="批次状态"
           value={view}
-          onChange={changeView}
+          normalizeValue={value => value || 'incomplete'}
           options={[
             { label: '未完成', value: 'incomplete' },
             { label: '全部', value: 'all' },
             { label: '已完成', value: 'completed' },
           ]}
+          onConfirm={value => { setView((value ? String(value) : 'incomplete') as BatchView); setPage(1); }}
+          placeholder="未完成"
+          style={{ width: 140 }}
         />
         <Input.Search
           allowClear
           value={searchDraft}
           placeholder="搜索批次、SKU、ASIN、货件号"
           onChange={event => setSearchDraft(event.target.value)}
-          onSearch={submitSearch}
+          onSearch={applySearch}
           className="batch-monitor-search"
         />
+        <FilterActions onReset={resetFilters} />
       </div>
 
       {!payload?.rows.length
@@ -809,7 +934,32 @@ export default function BatchMonitorPage({
                 <div className="batch-identity">
                   <div>
                     <strong>{row.batch_no}</strong>
-                    {row.is_complete ? <Tag color="success">全部完成</Tag> : <Tag color="processing">进行中</Tag>}
+                    {row.completion_mode === 'manual'
+                      ? <Tag color="success" title={row.manual_completed_at || undefined}>
+                        手动完成{row.manual_completed_at ? ` · ${dayjs(row.manual_completed_at).format('YYYY-MM-DD HH:mm')}` : ''}
+                      </Tag>
+                      : row.completion_mode === 'automatic' || row.is_complete
+                        ? <Tag color="success">自动完成</Tag>
+                        : <Tag color="processing">进行中</Tag>}
+                    {row.completion_mode === 'manual'
+                      ? <Popconfirm
+                        title={`撤销${row.batch_no}的手动完成？`}
+                        description="将按当前美工图、发货和到货进度重新计算状态。"
+                        okText="撤销完成"
+                        cancelText="取消"
+                        onConfirm={() => void updateBatchCompletion(row, false)}
+                      >
+                        <Button size="small" loading={completionBusy.has(row.batch_no)} disabled={busyBatches.has(row.batch_no) && !completionBusy.has(row.batch_no)}>撤销完成</Button>
+                      </Popconfirm>
+                      : !row.is_complete && <Popconfirm
+                        title={`结束${row.batch_no}的监控？`}
+                        description="结束监控并保留实际进度，批次将退出待办统计和复制清单。"
+                        okText="确认完成"
+                        cancelText="取消"
+                        onConfirm={() => void updateBatchCompletion(row, true)}
+                      >
+                        <Button size="small" type="primary" ghost loading={completionBusy.has(row.batch_no)} disabled={busyBatches.has(row.batch_no)}>一键完成</Button>
+                      </Popconfirm>}
                   </div>
                   <span>{row.sku_count}个SKU · {row.shipment_count}个首次货件</span>
                 </div>
@@ -822,13 +972,14 @@ export default function BatchMonitorPage({
                         title={`撤销${row.batch_no}的美工图完成状态？`}
                         onConfirm={() => void updateArtwork(row, false)}
                       >
-                        <Button size="small" danger loading={actionKey === `artwork-${row.batch_no}`}>撤销</Button>
+                        <Button size="small" danger loading={busyBatches.has(row.batch_no)} disabled={busyBatches.has(row.batch_no)}>撤销</Button>
                       </Popconfirm>
                     </>
                     : <Button
                       size="small"
                       type="primary"
-                      loading={actionKey === `artwork-${row.batch_no}`}
+                      loading={busyBatches.has(row.batch_no)}
+                      disabled={busyBatches.has(row.batch_no)}
                       onClick={() => void updateArtwork(row, true)}
                     >
                       完成美工图

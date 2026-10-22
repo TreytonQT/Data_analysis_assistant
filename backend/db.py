@@ -76,6 +76,7 @@ def initialize_database() -> None:
             CREATE TABLE IF NOT EXISTS batch_monitor_batches (
                 batch_no TEXT PRIMARY KEY,
                 artwork_completed_date TEXT,
+                manual_completed_at TEXT,
                 source_file_name TEXT NOT NULL DEFAULT '',
                 source_file_hash TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL,
@@ -148,12 +149,16 @@ def initialize_database() -> None:
         conn.commit()
         _ensure_batch_monitor_schema(conn)
         conn.commit()
+        _ensure_batch_manual_completion_schema(conn)
+        conn.commit()
         _migrate_promotion_discount_constraint(conn)
         _ensure_promotion_name_column(conn)
         conn.commit()
         _reset_active_promotions_once(conn)
         conn.commit()
         _backfill_last_promotion_snapshots_once(conn)
+        from backend.pricing import ensure_schema
+        ensure_schema(conn)
         conn.commit()
 
 
@@ -289,6 +294,16 @@ def _ensure_batch_monitor_schema(conn: sqlite3.Connection) -> None:
     except Exception:
         conn.rollback()
         raise
+
+
+def _ensure_batch_manual_completion_schema(conn: sqlite3.Connection) -> None:
+    columns = {
+        row["name"] for row in conn.execute("PRAGMA table_info(batch_monitor_batches)")
+    }
+    if "manual_completed_at" not in columns:
+        conn.execute(
+            "ALTER TABLE batch_monitor_batches ADD COLUMN manual_completed_at TEXT"
+        )
 
 
 def _migrate_promotion_discount_constraint(conn: sqlite3.Connection) -> None:

@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: Release tag, for example v2.1.0
+        description: Release tag, for example v2.2.0
         required: true
-        default: v2.1.0
+        default: v2.2.0
 
 permissions:
   contents: write
@@ -20,7 +20,8 @@ jobs:
     timeout-minutes: 20
     env:
       APP_NAME: DataAnalysisAssistant
-      DEFAULT_RELEASE_TAG: v2.1.0
+      DEFAULT_RELEASE_TAG: v2.2.0
+      RELEASE_SUBTITLE: 新品与价格监控
 
     steps:
       - name: Check out source
@@ -41,33 +42,43 @@ jobs:
           cache-dependency-path: |
             requirements.txt
             requirements-build.txt
-
+            requirements-dev.txt
       - name: Build frontend
         shell: pwsh
         run: |
           Push-Location frontend
-          npm ci
-          npm run build
+          python ../scripts/run_bounded.py --timeout 85 -- cmd.exe /d /c npm.cmd ci --no-audit --no-fund
+          if ($LASTEXITCODE -ne 0) { throw "Frontend dependency installation failed" }
+          python ../scripts/run_bounded.py --timeout 85 -- cmd.exe /d /c npm.cmd run build
+          if ($LASTEXITCODE -ne 0) { throw "Frontend build failed" }
           Pop-Location
 
       - name: Install Python dependencies
         shell: pwsh
         run: |
-          python -m pip install --disable-pip-version-check -r requirements.txt
-          python -m pip install --disable-pip-version-check -r requirements-build.txt
-
+          python scripts/run_bounded.py --timeout 85 -- python -m pip install --disable-pip-version-check -r requirements.txt
+          if ($LASTEXITCODE -ne 0) { throw "Runtime dependency installation failed" }
+          python scripts/run_bounded.py --timeout 85 -- python -m pip install --disable-pip-version-check -r requirements-build.txt
+          if ($LASTEXITCODE -ne 0) { throw "Build dependency installation failed" }
+          python scripts/run_bounded.py --timeout 85 -- python -m pip install --disable-pip-version-check -r requirements-dev.txt
+          if ($LASTEXITCODE -ne 0) { throw "Test dependency installation failed" }
       - name: Run regression tests
         shell: pwsh
         run: |
-          python -m unittest discover -s tests
+          Get-ChildItem tests/test_*.py | Sort-Object Name | ForEach-Object {
+            python scripts/run_bounded.py --timeout 85 -- python -m pytest -q $_.FullName
+            if ($LASTEXITCODE -ne 0) { throw "Backend regression failed: $($_.Name)" }
+          }
           Push-Location frontend
-          npm test -- --testTimeout=10000
+          python ../scripts/run_bounded.py --timeout 85 -- cmd.exe /d /c npm.cmd test -- --testTimeout=10000
+          if ($LASTEXITCODE -ne 0) { throw "Frontend regression failed" }
           Pop-Location
 
       - name: Build portable application
         shell: pwsh
         run: |
-          python -m PyInstaller --noconfirm --clean packaging/DataAnalysisAssistant.spec
+          python scripts/run_bounded.py --timeout 85 -- python -m PyInstaller --noconfirm --clean packaging/DataAnalysisAssistant.spec
+          if ($LASTEXITCODE -ne 0) { throw "Portable application build failed" }
           Copy-Item configs "dist/$env:APP_NAME/configs" -Recurse
           Copy-Item "packaging/README-WINDOWS.txt" "dist/$env:APP_NAME/README-WINDOWS.txt"
 
@@ -131,20 +142,18 @@ jobs:
 
           迁移已有数据时，请在程序关闭后手动复制旧电脑的 data 和 configs 目录。
 
-          ## 本版本主要更新
-
-          - 新增多级导航、最近访问标签页和浏览器历史恢复
-          - 新增页面内重启/退出、独立桌面启动器与源码桌面快捷方式
-          - 新增部门考核监控，以及产品、滞销、补货矩阵的 SKU 图片预览
-          - 产品和滞销矩阵关联当前/最近促销信息，补货筛选与关闭流程进一步完善
-          - 统一上传、配置、促销、待办、复制和下载操作反馈，并强化报表数据安全校验
-
-          完整更新记录见仓库中的 CHANGELOG.md。
+          ## 本版本更新
           "@
+          $changelog = Get-Content CHANGELOG.md -Raw -Encoding utf8
+          $escapedTag = [regex]::Escape($env:RELEASE_TAG)
+          $entry = [regex]::Match($changelog, "(?ms)^## $escapedTag\b[^\r\n]*\r?\n(.*?)(?=^## |\z)")
+          if (-not $entry.Success) { throw "CHANGELOG does not contain $env:RELEASE_TAG" }
+          $notes += "`n`n" + $entry.Groups[1].Value.Trim() + "`n"
           $notes | Set-Content release-notes.md -Encoding utf8
 
           if (gh release view $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY 2>$null) {
             gh release upload $env:RELEASE_TAG $env:RELEASE_ARCHIVE "$env:RELEASE_ARCHIVE.sha256.txt" --clobber --repo $env:GITHUB_REPOSITORY
           } else {
-            gh release create $env:RELEASE_TAG $env:RELEASE_ARCHIVE "$env:RELEASE_ARCHIVE.sha256.txt" --target $env:GITHUB_SHA --title "销售数据分析助手 $env:RELEASE_TAG" --notes-file release-notes.md --repo $env:GITHUB_REPOSITORY
+            gh release create $env:RELEASE_TAG $env:RELEASE_ARCHIVE "$env:RELEASE_ARCHIVE.sha256.txt" --target $env:GITHUB_SHA --title "销售数据分析助手 $env:RELEASE_TAG · $env:RELEASE_SUBTITLE" --notes-file release-notes.md --repo $env:GITHUB_REPOSITORY --latest
           }
+          if ($LASTEXITCODE -ne 0) { throw "Release publication failed" }

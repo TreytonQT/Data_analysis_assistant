@@ -1,4 +1,4 @@
-import { cleanup, render, screen, waitFor } from '@testing-library/react';
+import { cleanup, render, screen, waitFor, within } from '@testing-library/react';
 import dayjs from 'dayjs';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -63,7 +63,7 @@ const overview: PromotionOverview = {
   average_30d_total: 1,
   daily_lift_total: 1,
   daily_lift_average: 1,
-  by_promotion: [{ promotion_name: '夏季清仓', discount_percents: [10], start_date: '2026-07-01', end_date: '2026-07-31', status: 'active', sku_count: 1, average_7d: 2, average_30d: 1, daily_lift: 1 }],
+  by_promotion: [{ activity_id: 'activity-1', promotion_name: '夏季清仓', discount_percents: [10], start_date: '2026-07-01', end_date: '2026-07-31', status: 'active', sku_count: 1, average_7d: 2, average_30d: 1, daily_lift: 1 }],
   developers: ['开发员甲', '开发员乙'],
   updated_at: '2026-07-17T10:00:00Z',
 };
@@ -135,8 +135,8 @@ describe('PromotionBoard component', () => {
       .find(button => button.textContent?.trim() === '标记促销');
     expect(markButton).toBeDefined();
     await user.click(markButton!);
-    expect(await screen.findByRole('dialog', { name: '标记正在促销' })).toBeInTheDocument();
-    expect(screen.getByPlaceholderText('例如：8月会员日促销')).toBeInTheDocument();
+    expect(await screen.findByRole('dialog', { name: '登记调价或限时促销' })).toBeInTheDocument();
+    expect(screen.getByLabelText('活动名称')).toBeInTheDocument();
   });
 
   it('loads all currently filtered candidate SKUs before opening the bulk promotion dialog', async () => {
@@ -152,8 +152,8 @@ describe('PromotionBoard component', () => {
     await user.click(screen.getByRole('button', { name: /筛选结果创建促销/ }));
 
     expect(api.promotionCandidateSkus).toHaveBeenCalledWith(10, expect.objectContaining({ search: 'SKU' }));
-    expect(await screen.findByRole('dialog', { name: '标记正在促销' })).toBeInTheDocument();
-    expect(screen.getByText('将标记 2 个 SKU')).toBeInTheDocument();
+    expect(await screen.findByRole('dialog', { name: '登记调价或限时促销' })).toBeInTheDocument();
+    expect(screen.getByLabelText('SKU（一行一个）')).toHaveValue('SKU-CANDIDATE\nSKU-CANDIDATE-2');
   });
 
   it('disables filtered-result creation when the candidate result is empty', async () => {
@@ -173,12 +173,12 @@ describe('PromotionBoard component', () => {
 
     await screen.findByText('SKU-ACTIVE');
     await user.click(screen.getByRole('button', { name: /手动添加促销 SKU/ }));
-    expect(await screen.findByRole('dialog', { name: '手动添加促销 SKU' })).toBeInTheDocument();
+    expect(await screen.findByRole('dialog', { name: '登记调价或限时促销' })).toBeInTheDocument();
     expect(screen.getByLabelText('SKU（一行一个）')).toBeInTheDocument();
-    expect(screen.getByPlaceholderText('例如：8月会员日促销')).toBeInTheDocument();
-    expect(screen.getByRole('spinbutton', { name: '促销力度' })).toBeInTheDocument();
-    expect(screen.getByPlaceholderText('开始日期')).toHaveValue(dayjs().format('YYYY-MM-DD'));
-    expect(screen.getByPlaceholderText('结束日期（可留空）')).toHaveValue('');
+    expect(screen.getByLabelText('活动名称')).toBeInTheDocument();
+    expect(screen.getByRole('spinbutton', { name: '限时额外优惠（%）' })).toBeInTheDocument();
+    expect(within(screen.getByRole('dialog', { name: '登记调价或限时促销' })).getByLabelText('开始日期')).toHaveValue(dayjs().format('YYYY-MM-DD'));
+    expect(screen.getByLabelText('结束日期（含当天）')).toHaveValue('');
   });
 
   it('keeps promotion subviews as internal tabs without changing the sidebar route', async () => {
@@ -194,7 +194,7 @@ describe('PromotionBoard component', () => {
     render(<PromotionBoard />);
 
     expect(await screen.findByText('7/1~7/31 夏季清仓 -10%')).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: /导出 CSV/ })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /导出筛选结果/ })).toBeInTheDocument();
     expect(api.lastPromotions).toHaveBeenCalledTimes(1);
     expect(api.promotionRecords).not.toHaveBeenCalled();
     expect(api.promotionCandidates).not.toHaveBeenCalled();

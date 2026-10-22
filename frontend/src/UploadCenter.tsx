@@ -177,6 +177,30 @@ export default function UploadCenter({ active = true, routeVersion = 0, refreshV
     { title: '操作', render: (_, row) => { const month = String(row['月份']); return <Button size="small" icon={<DownloadOutlined />} href={`/api/reports/sales-history/${encodeURIComponent(month)}/download`} onClick={event => { event.preventDefault(); void downloadWithFeedback(`/api/reports/sales-history/${encodeURIComponent(month)}/download`, `${month}.csv`, `${month}销量原始表`); }}>下载</Button>; } },
   ];
 
+  const listingRecords = [...(data.sources.listing_prices?.records || [])].sort((left, right) => String(right['日期'] || '').localeCompare(String(left['日期'] || '')));
+  const listingColumns: TableProps<SourceRecord>['columns'] = [
+    { title: '日期', dataIndex: '日期' },
+    { title: '原始文件名', dataIndex: '原始文件名', ellipsis: true },
+    { title: '有效售价', dataIndex: '有效售价数' },
+    { title: '促销', dataIndex: '促销数' },
+    { title: '无可售价', dataIndex: '无可售价数' },
+    { title: '异常', dataIndex: '异常数' },
+    { title: '上传时间', dataIndex: '上传时间' },
+    { title: '操作', render: (_, row) => {
+      const day = String(row['日期'] || '');
+      return <Space><Button size="small" icon={<EyeOutlined />} onClick={async () => { try { setPreview(await api.previewListingPrices(day)); } catch (error) { message.error(error instanceof Error ? error.message : '预览失败'); } }}>预览</Button><Button size="small" icon={<DownloadOutlined />} href={'/api/reports/listing-prices/' + encodeURIComponent(day) + '/download'} onClick={event => { event.preventDefault(); void downloadWithFeedback('/api/reports/listing-prices/' + encodeURIComponent(day) + '/download', String(row['保存文件名'] || ('Listing-' + day + '.xlsx')), 'Listing价格'); }}>下载</Button></Space>;
+    } },
+  ];
+  const listingCard = <Card title="Listing价格（每日）" data-testid="listing-prices">
+    <Typography.Paragraph type="secondary">文件名需包含 ListingYYYYMMDD；系统保留滚动31天。同日同内容幂等，同日不同内容替换；无可观测售价不会回退为原价。</Typography.Paragraph>
+    <Spin spinning={isPending('upload-listing-prices')} tip="正在校验并保存…">
+      <Dragger {...uploader('listing-prices', '/api/reports/listing-prices', false, '.xlsx,.xls')} disabled={isPending('upload-listing-prices')} className="source-dragger">
+        <p className="ant-upload-drag-icon"><InboxOutlined /></p><p className="ant-upload-text">拖拽 Listing 文件到这里，或点击选择</p><p className="ant-upload-hint">支持 .xlsx/.xls；按文件名日期建立历史快照</p>
+      </Dragger>
+    </Spin>
+    <Table rowKey={row => String(row['日期'])} columns={listingColumns} dataSource={listingRecords} pagination={{ pageSize: 8 }} scroll={{ x: 980 }} locale={{ emptyText: '暂无 Listing 价格历史' }} />
+  </Card>;
+
   const sourceCard = (definition: typeof sourceDefinitions[number]) => {
     const record = data.sources[definition.key]?.records?.[0];
     const uploading = isPending(`upload-${definition.key}`); const previewing = isPending(`preview-${definition.key}`); const deleting = isPending(`delete-${definition.key}`);
@@ -197,13 +221,13 @@ export default function UploadCenter({ active = true, routeVersion = 0, refreshV
     <div className="page-heading"><div><Typography.Title level={2}>上传中心</Typography.Title><Typography.Text type="secondary">所有文件会先执行字段与格式校验，通过后才会覆盖现有数据。{lastUpdated && ` · 数据更新时间 ${lastUpdated}`}</Typography.Text></div><Button loading={initialLoading} disabled={Object.keys(pending).length > 0} icon={<ReloadOutlined />} onClick={() => void manualRefresh()}>刷新记录</Button></div>
     {error && <Alert className="persistent-page-error" type="error" showIcon message="上传中心操作失败" description={error} action={<Button size="small" onClick={() => void manualRefresh()}>重新加载</Button>} />}
     <Spin spinning={initialLoading} tip="正在读取上传记录…"><div className="page-loading-min-height">
-      {tab === 'daily' && <div className="upload-grid">{sourceDefinitions.filter(definition => definition.frequency === 'daily').map(sourceCard)}</div>}
+      {tab === 'daily' && <><div className="upload-grid">{listingCard}{sourceDefinitions.filter(definition => definition.frequency === 'daily').map(sourceCard)}</div></>}
       {tab === 'weekly' && <>
         <div className="upload-grid">
           <Card title="业绩报表 CSV" data-testid="performance-reports"><Typography.Paragraph type="secondary">支持一次拖入或选择多个文件；相同月份会替换原记录。</Typography.Paragraph><Spin spinning={isPending('upload-performance')} tip="正在逐个校验并保存…"><Dragger {...uploader('performance', '/api/reports/performance', true, '.csv')} disabled={isPending('upload-performance')} className="source-dragger"><p className="ant-upload-drag-icon"><InboxOutlined /></p><p className="ant-upload-text">拖拽一个或多个 CSV 到这里，或点击选择</p><p className="ant-upload-hint">每个文件都会先校验，再保存为对应月份的业绩报表</p></Dragger></Spin></Card>
           {sourceDefinitions.filter(definition => definition.frequency === 'weekly').map(sourceCard)}
         </div>
-        <Card title="已上传业绩报表" className="section-card"><Table rowKey={row => String(row['月份'])} columns={reportColumns} dataSource={data.reports} pagination={{ pageSize: 8 }} scroll={{ x: 760 }} locale={{ emptyText: '暂无业绩报表' }} /></Card>
+        <Card title="已上传业绩报表" className="section-card"><Table rowKey={row => String(row['月份'])} columns={reportColumns} dataSource={[...data.reports].sort((a, b) => String(b['月份']).localeCompare(String(a['月份'])))} pagination={{ pageSize: 8 }} scroll={{ x: 760 }} locale={{ emptyText: '暂无业绩报表' }} /></Card>
       </>}
       {tab === 'monthly' && <>
         <div className="upload-grid">{sourceDefinitions.filter(definition => definition.frequency === 'monthly').map(sourceCard)}</div>
