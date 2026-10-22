@@ -217,23 +217,31 @@ class DashboardApiTests(unittest.TestCase):
         self.assertTrue(pd.isna(result.loc[3, "开售天数"]))
 
     def test_page_revision_includes_promotions_for_products_and_slow_moving(self):
-        with (
-            patch("backend.dashboard_api.dashboard_revision", return_value="dashboard-v1"),
-            patch("backend.dashboard_api.batch_monitor_revision", return_value="batch-v2"),
-            patch("backend.promotions.promotion_revision", return_value="promotions-v1"),
-        ):
-            self.assertEqual(
-                dashboard_api._page_revision("products"),
-                "dashboard-v1:batch-v2:promotions-v1",
-            )
-            self.assertEqual(
-                dashboard_api._page_revision("slow-moving"),
-                "dashboard-v1:promotions-v1",
-            )
-            self.assertEqual(
-                dashboard_api._page_revision("sales"),
-                "dashboard-v1",
-            )
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "source.csv"
+            source.write_text("sku,quantity\nA,1\n", encoding="utf-8")
+            pages = ("products", "slow-moving", "replenishment", "sales")
+            with (
+                patch("backend.dashboard_api._page_dependency_paths", return_value=[source]),
+                patch("backend.dashboard_api.batch_monitor_revision", return_value="batch-v1") as batch,
+                patch("backend.promotions.promotion_revision", return_value="promotions-v1") as promotion,
+            ):
+                baseline = {page: dashboard_api._page_revision(page) for page in pages}
+                promotion.return_value = "promotions-v2"
+                for page in pages[:-1]:
+                    self.assertNotEqual(dashboard_api._page_revision(page), baseline[page])
+                self.assertEqual(dashboard_api._page_revision("sales"), baseline["sales"])
+
+                promotion.return_value = "promotions-v1"
+                batch.return_value = "batch-v2"
+                self.assertNotEqual(dashboard_api._page_revision("products"), baseline["products"])
+                for page in pages[1:]:
+                    self.assertEqual(dashboard_api._page_revision(page), baseline[page])
+
+                batch.return_value = "batch-v1"
+                source.write_text("sku,quantity\nA,12345\n", encoding="utf-8")
+                for page in pages:
+                    self.assertNotEqual(dashboard_api._page_revision(page), baseline[page])
 
     def test_product_promotion_merge_preserves_rows_and_uses_normalized_sku(self):
         detail = pd.DataFrame({"SKU": ["SKU-A", "SKU-B", "SKU-C"], "ASIN": ["A", "B", "C"]})
@@ -436,8 +444,8 @@ class DashboardApiTests(unittest.TestCase):
 
     def test_department_assessment_endpoint_returns_developer_and_store_rollups(self):
         report = pd.DataFrame([
-            {"销售专员": "运营二十部-甲", "月份": "2026-08", "店铺": "7-YIP 本土法国", "销售额--FBA销售额": 100, "费用": 20, "COD": 30},
-            {"销售专员": "运营二十部-甲", "月份": "2026-08", "店铺": "20-TIS 德国", "销售额--FBA销售额": 10, "费用": 0, "COD": 0},
+            {"销售专员": "运营二十部-甲", "月份": "2026-08", "店铺": "7-YIP 本土法国", "销售额--FBA销售额": 100, "费用": 20, "COD": 30, "毛利润": 26},
+            {"销售专员": "运营二十部-甲", "月份": "2026-08", "店铺": "20-TIS 德国", "销售额--FBA销售额": 10, "费用": 0, "COD": 0, "毛利润": -5},
         ])
         with patch("backend.dashboard_api.load_performance_reports", return_value=report):
             response = self.client.get("/api/dashboard/department/assessment", params={"month": "2026-08"})
@@ -447,7 +455,11 @@ class DashboardApiTests(unittest.TestCase):
         self.assertEqual(payload["rows"][0]["开发员"], "甲")
         self.assertEqual(payload["rows"][0]["销售额"], 160)
         self.assertEqual(payload["rows"][0]["本土销售额"], 150)
+        self.assertEqual(payload["rows"][0]["毛利润"], 21)
+        self.assertAlmostEqual(payload["rows"][0]["毛利率"], 21 / 160)
         self.assertEqual([store["店铺"] for store in payload["rows"][0]["店铺明细"]], ["YIP", "TIS"])
+        self.assertEqual(payload["rows"][0]["店铺明细"][0]["毛利润"], 26)
+        self.assertAlmostEqual(payload["rows"][0]["店铺明细"][0]["毛利率"], 26 / 150)
 
     def test_current_workspace_dashboard_pages_return_business_sections(self):
         required_sources = ["operational_sales", "gross_profit", "rating", "sales_volume_detail", "sales_amount_detail"]

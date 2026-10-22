@@ -49,7 +49,7 @@ class DatabaseMigrationTests(unittest.TestCase):
             self.assertEqual(migrated.execute("SELECT discount_percent FROM sku_promotions WHERE id = 'legacy'").fetchone()[0], 10)
             self.assertEqual(migrated.execute("SELECT promotion_name FROM sku_promotions WHERE id = 'legacy'").fetchone()[0], db.HISTORY_PROMOTION_NAME)
             migrated.execute(
-                """INSERT INTO sku_promotions VALUES
+                """INSERT INTO sku_promotions (id, sku, promotion_name, asin_snapshot, developer_snapshot, discount_percent, rule_key, start_date, end_date, created_at, updated_at) VALUES
                 ('manual', 'SKU-B', '手动活动', '', '', 12, 'manual',
                  '2026-07-22', NULL, '2026-07-22T00:00:00Z', '2026-07-22T00:00:00Z')"""
             )
@@ -61,7 +61,7 @@ class DatabaseMigrationTests(unittest.TestCase):
             with self.subTest(invalid=invalid), self.assertRaises(sqlite3.IntegrityError):
                 with db.connect() as migrated:
                     migrated.execute(
-                        """INSERT INTO sku_promotions VALUES
+                        """INSERT INTO sku_promotions (id, sku, promotion_name, asin_snapshot, developer_snapshot, discount_percent, rule_key, start_date, end_date, created_at, updated_at) VALUES
                         (?, ?, '测试活动', '', '', ?, 'manual', '2026-07-22', NULL,
                          '2026-07-22T00:00:00Z', '2026-07-22T00:00:00Z')""",
                         (f"invalid-{invalid}", f"SKU-{invalid}", invalid),

@@ -27,7 +27,7 @@ const LOW_MARGIN_GROUPS = {
 
 const SLOW_MOVING_GROUPS = {
   identity: ['SKU', 'ASIN', '开发员', '最近促销开始日期', '最近促销截止日期', '最近促销折扣'],
-  overview: ['日均销量', '90天以上库存数合计', '90天以上占用资金合计', '库存计提', '弃置费'],
+  overview: ['日均销量', '可售天数', '90天以上库存数合计', '90天以上占用资金合计', '库存计提', '弃置费'],
   stock: ['91-180天库存数', '181-330天库存数', '331-365天库存数', '366-455天库存数', '456天以上库存数'],
   capital: ['91-180天占用资金', '181-330天占用资金', '331-365天占用资金', '366-455天占用资金', '456天占用资金'],
 } as const;
@@ -74,6 +74,16 @@ function launchPrice(value: unknown) {
   return number === null
     ? '-'
     : number.toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+function listingPriceSummary(row: DashboardRow) {
+  const parts = [
+    ['DE', row['德国Listing当前实际总价'], row['德国较开售价变化']],
+    ['FR', row['法国Listing当前实际总价'], row['法国较开售价变化']],
+    ['ES', row['西班牙Listing当前实际总价'], row['西班牙较开售价变化']],
+    ['IT', row['意大利Listing当前实际总价'], row['意大利较开售价变化']],
+  ].filter(([, current]) => numeric(current) !== null).map(([code, current, change]) => String(code) + ' ' + launchPrice(current) + (numeric(change) === null ? '' : ' (' + (Number(change) * 100).toFixed(1) + '%)'));
+  return parts.join(' · ') || 'Listing暂无当前价';
 }
 
 function createFormatter(columns: DashboardColumn[]) {
@@ -134,23 +144,30 @@ function CompactText({ value, className = '' }: { value: unknown; className?: st
   return <Tooltip title={text}><span className={`dashboard-matrix-ellipsis ${className}`}>{text}</span></Tooltip>;
 }
 
+function PriceAdjustment({ row }: { row: DashboardRow }) {
+  const discount = numeric(row['累计调价降幅']);
+  return <span className="dashboard-matrix-last-promotion" title="累计调价 = 1 − 各次剩余价格比例之积；仅计已生效、未作废事件。基准为最早已知调价前价格。">
+    长期调价：{discount === null ? '暂无记录' : String(row['调价生效日期'] || '') + ' · 累计 -' + discount.toLocaleString('zh-CN', { maximumFractionDigits: 2 }) + '%'}
+  </span>;
+}
+
 function LastPromotion({ row }: { row: DashboardRow }) {
   const hasPromotionFields = ['最近促销开始日期', '最近促销截止日期', '最近促销折扣']
     .some(key => Object.prototype.hasOwnProperty.call(row, key));
   if (!hasPromotionFields) {
-    return <span className="dashboard-matrix-last-promotion dashboard-matrix-last-promotion-unavailable">最近促销：信息未加载</span>;
+    return <span className="dashboard-matrix-last-promotion dashboard-matrix-last-promotion-unavailable">最近限时：信息未加载</span>;
   }
   const start = hasValue(row['最近促销开始日期']) ? String(row['最近促销开始日期']) : '';
   const end = hasValue(row['最近促销截止日期']) ? String(row['最近促销截止日期']) : '';
   const discount = numeric(row['最近促销折扣']);
   if (!start && !end && discount === null) {
-    return <span className="dashboard-matrix-last-promotion dashboard-matrix-last-promotion-empty">最近促销：暂无记录</span>;
+    return <span className="dashboard-matrix-last-promotion dashboard-matrix-last-promotion-empty">最近限时：暂无记录</span>;
   }
   const period = start && end ? `${start} 至 ${end}` : start ? `${start} 起` : '日期未知';
   const discountText = discount === null
     ? ''
     : ` · -${discount.toLocaleString('zh-CN', { maximumFractionDigits: 2 })}%`;
-  return <span className="dashboard-matrix-last-promotion">最近促销：{period}{discountText}</span>;
+  return <span className="dashboard-matrix-last-promotion">最近限时：{hasValue(row["最近限时活动名称"]) ? String(row["最近限时活动名称"]) + " · " : ""}{period}{discountText}</span>;
 }
 
 function Metric({
@@ -206,6 +223,7 @@ function ProductRow({
           <span className={`dashboard-matrix-rating ${ratingTone(row.Rating)}`}>{rating.text}</span>
           {promotionDiscount !== null && <span className="dashboard-matrix-promotion">促销 -{promotionDiscount.toLocaleString('zh-CN', { maximumFractionDigits: 2 })}%</span>}
           <CompactText value={row['开发员']} className="dashboard-matrix-developer" />
+        <PriceAdjustment row={row} />
         </div>
       </div>
     </div>
@@ -230,6 +248,8 @@ function ProductRow({
       const adKey = `${country.name}广告费占比`;
       return <div className="dashboard-matrix-cell dashboard-country-matrix" role="gridcell" data-section={country.code} key={country.code}>
         <Metric label="开售价" value={launchPrice(row[priceKey])} />
+        <Metric label="Listing现价" value={launchPrice(row[`${country.name}Listing当前实际总价`])} />
+        <Metric label="较开售" value={format(`${country.name}较开售价变化`, row[`${country.name}较开售价变化`])} />
         <Metric label="销量" value={format(salesKey, row[salesKey])} />
         <Metric label="毛利率" value={format(marginKey, row[marginKey])} className={marginTone(row[marginKey])} />
         <Metric label="广告占比" value={format(adKey, row[adKey])} className={adRatioTone(row[adKey])} />
@@ -261,6 +281,7 @@ function LowMarginRow({
         <CompactText value={row.SKU} className="dashboard-matrix-sku" />
         <CompactText value={row.ASIN} />
         <CompactText value={row['开发员']} />
+        <span className="dashboard-matrix-price-summary">{listingPriceSummary(row)}</span>
       </div>
     </div>
     <div className="dashboard-matrix-cell dashboard-matrix-lines" role="gridcell" data-section="站点销量">
@@ -317,11 +338,17 @@ function SlowMovingRow({
         <CompactText value={row.SKU} className="dashboard-matrix-sku" />
         <CompactText value={row.ASIN} />
         <CompactText value={row['开发员']} />
+        <PriceAdjustment row={row} />
         <LastPromotion row={row} />
       </div>
     </div>
     <div className="dashboard-matrix-cell dashboard-matrix-mini-grid slow-overview-grid" role="gridcell" data-section="风险总览">
       <Metric label="日均销量（件/天）" value={format('日均销量', row['日均销量'])} className="slow-overview-daily" />
+      <Tooltip title="可售天数 = 总库存数 ÷ 日均销量。总库存数包含：可售、待调仓、调仓中、待入库、采购在途、本地库存、在途、计划入库。日均销量非正数或数据缺失时显示 -。">
+        <span className="slow-overview-coverage">
+          <Metric label="可售天数（天）" value={format('可售天数', row['可售天数'])} />
+        </span>
+      </Tooltip>
       <Metric label="90+库存" value={format('90天以上库存数合计', row['90天以上库存数合计'])} />
       <Metric label="占用资金" value={format('90天以上占用资金合计', row['90天以上占用资金合计'])} />
       <Metric label="库存计提" value={format('库存计提', row['库存计提'])} />

@@ -21,6 +21,8 @@ class PromotionsApiTests(unittest.TestCase):
         db.DB_PATH = Path(self.temp.name) / "app.db"
         db.initialize_database()
         self.client = TestClient(app)
+        self.warmup = patch("backend.dashboard_api.schedule_replenishment_warmup")
+        self.warmup.start()
         self.current = date.today()
         self.metrics = pd.DataFrame(
             [
@@ -45,6 +47,7 @@ class PromotionsApiTests(unittest.TestCase):
 
     def tearDown(self):
         self.frames.stop()
+        self.warmup.stop()
         db.DB_PATH = self.original_db
         self.temp.cleanup()
 
@@ -66,7 +69,7 @@ class PromotionsApiTests(unittest.TestCase):
         return {
             "promotion_name": promotion_name,
             "start_date": (self.current + timedelta(days=start_offset)).isoformat(),
-            "end_date": None if end_offset is None else (self.current + timedelta(days=end_offset)).isoformat(),
+            "end_date": (self.current + timedelta(days=30 if end_offset is None else end_offset)).isoformat(),
         }
 
     def create(self, skus, start_offset=0, end_offset=None):
@@ -111,7 +114,7 @@ class PromotionsApiTests(unittest.TestCase):
         exported = self.client.get("/api/promotions/candidates/10/export.csv")
         self.assertEqual(exported.status_code, 200)
         self.assertIn("SKU-A", exported.text)
-        self.assertIn("日均提升", exported.text)
+        self.assertIn("近7天与近30天日均差", exported.text)
 
         invalid_sort = self.client.get("/api/promotions/candidates/10", params={"sort_by": "unknown"})
         self.assertEqual(invalid_sort.status_code, 422)
@@ -155,28 +158,18 @@ class PromotionsApiTests(unittest.TestCase):
         records = self.client.get("/api/promotions/records", params={"status": "all"}).json()
         self.assertEqual(records["total"], 2)
 
-    def test_manual_create_validates_discount_and_replaces_current_record(self):
-        for discount in [0, 100, 12.5]:
-            with self.subTest(discount=discount):
-                self.assertEqual(self.create_manual(["SKU-A"], discount=discount).status_code, 422)
-
-        original = self.create_manual(["SKU-A"], discount=1, start_offset=0, end_offset=2)
-        self.assertEqual(original.status_code, 201)
-        original_id = original.json()["created"][0]["id"]
-
-        replaced = self.create_manual(["SKU-B", "SKU-A"], discount=99, start_offset=1, end_offset=7)
-        self.assertEqual(replaced.status_code, 201, replaced.text)
-        self.assertEqual(replaced.json()["replaced"], 1)
-        rows = {row["sku"]: row for row in replaced.json()["created"]}
-        self.assertEqual(rows["SKU-A"]["id"], original_id)
-        self.assertEqual(rows["SKU-A"]["discount_percent"], 99)
-        self.assertEqual(rows["SKU-A"]["start_date"], self.dates(1, 7)["start_date"])
-        self.assertEqual(rows["SKU-A"]["end_date"], self.dates(1, 7)["end_date"])
-        self.assertEqual(rows["SKU-A"]["status"], "pending")
-        self.assertEqual(rows["SKU-A"]["rule_key"], "manual")
+    def test_manual_create_validates_discount_and_rejects_overlap_without_overwrite(self):
+        for discount in [0,100,12.5]:
+            self.assertEqual(self.create_manual(["SKU-A"],discount=discount).status_code,422)
+        original=self.create_manual(["SKU-A"],discount=1,start_offset=0,end_offset=2).json()["created"][0]
+        conflict=self.create_manual(["SKU-A","SKU-B"],discount=99,start_offset=1,end_offset=7)
+        self.assertEqual(conflict.status_code,409)
+        future=self.create_manual(["SKU-A"],discount=99,start_offset=3,end_offset=7)
+        self.assertEqual(future.status_code,201)
+        self.assertNotEqual(future.json()["created"][0]["id"],original["id"])
         with db.connect() as conn:
-            self.assertEqual(conn.execute("SELECT COUNT(*) FROM sku_promotions").fetchone()[0], 2)
-            self.assertEqual(conn.execute("SELECT COUNT(*) FROM sku_promotions WHERE sku = 'SKU-A'").fetchone()[0], 1)
+            self.assertEqual(conn.execute("SELECT discount_percent FROM sku_promotions WHERE id=?",(original["id"],)).fetchone()[0],1)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM sku_promotions WHERE sku='SKU-B'").fetchone()[0],0)
 
     def test_manual_replace_still_rejects_historical_overlap_atomically(self):
         historical = self.create_manual(["SKU-A"], discount=10, start_offset=-10, end_offset=-5)
@@ -285,7 +278,7 @@ class PromotionsApiTests(unittest.TestCase):
             )
 
         overview = self.client.get("/api/promotions/overview").json()
-        self.assertEqual(overview["active_sku_count"], 2)
+        self.assertEqual(overview["active_sku_count"], 3)
         self.assertEqual(overview["source_missing_count"], 1)
         self.assertEqual(overview["average_7d_total"], 6)
         self.assertEqual(overview["average_30d_total"], 5)
@@ -332,7 +325,7 @@ class PromotionsApiTests(unittest.TestCase):
         self.assertEqual(review["daily_lift"], 1)
         self.assertEqual(overview["active_sku_count"], 1)
 
-        deleted = self.client.request("DELETE", "/api/promotions/activities", json={"promotion_name": "Review campaign"})
+        deleted = self.client.request("DELETE", "/api/promotions/activities", json={"activity_id": review["activity_id"]})
         self.assertEqual(deleted.status_code, 200)
         self.assertEqual(deleted.json()["deleted"], 2)
         remaining = self.client.get("/api/promotions/overview").json()["by_promotion"]
@@ -342,7 +335,7 @@ class PromotionsApiTests(unittest.TestCase):
         self.assertEqual(self.client.get("/api/promotions/candidates/10").json()["total"], 1)
         self.assertEqual(self.client.get("/api/promotions/candidates/8").json()["total"], 1)
 
-        missing = self.client.request("DELETE", "/api/promotions/activities", json={"promotion_name": "Review campaign"})
+        missing = self.client.request("DELETE", "/api/promotions/activities", json={"activity_id": review["activity_id"]})
         self.assertEqual(missing.status_code, 404)
         blank = self.client.request("DELETE", "/api/promotions/activities", json={"promotion_name": "  "})
         self.assertEqual(blank.status_code, 422)

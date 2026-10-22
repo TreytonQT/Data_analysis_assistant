@@ -227,9 +227,10 @@ def _atomic_write_config(name: str, frame: pd.DataFrame) -> Path:
 
 
 def _invalidate_dashboard_cache() -> None:
-    from backend.dashboard_api import clear_dashboard_caches
+    from backend.dashboard_api import clear_dashboard_caches, schedule_replenishment_warmup
 
     clear_dashboard_caches()
+    schedule_replenishment_warmup()
 
 
 def _invalidate_replenishment_view_cache() -> None:

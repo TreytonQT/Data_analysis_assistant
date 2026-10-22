@@ -9,11 +9,15 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pandas as pd
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 import backend.batch_monitor as batch_monitor
 import backend.db as db
-from backend.main import app
+import dashboard.parquet_cache as parquet_cache
+
+app = FastAPI()
+app.include_router(batch_monitor.router)
 
 
 def workbook_bytes(rows: list[dict]) -> bytes:
@@ -51,10 +55,14 @@ class BatchMonitorTests(unittest.TestCase):
             return_value=(eligible, eligible),
         )
         self.scope_mock = self.scope_patch.start()
+
         self.client = TestClient(app)
+        self.warmup = patch("backend.dashboard_api.schedule_replenishment_warmup")
+        self.warmup.start()
 
     def tearDown(self):
         self.scope_patch.stop()
+        self.warmup.stop()
         db.DB_PATH = self.original_db
         batch_monitor.BATCH_UPLOAD_DIR = self.original_upload_dir
         self.temp.cleanup()
@@ -102,6 +110,52 @@ class BatchMonitorTests(unittest.TestCase):
             files={"file": ("shipments.csv", csv_bytes(rows), "text/csv")},
         )
 
+    def test_list_reads_real_operational_sources_and_invalidates_scope_cache(self):
+        self.assertEqual(self.create_batch("ABC260701", "SKU-A01").status_code, 200)
+        self.assertEqual(self.upload_shipments([
+            {"货件单号": "FBA-ORPHAN", "MSKU": "SKU-ORPHAN", "ASIN": "B0ABC00001"}
+        ]).status_code, 200)
+        self.scope_patch.stop()
+        cache_root = Path(self.temp.name) / "cache"
+        rows = [
+            {"MSKU": "SKU-A01", "开发员": "运营二十部-陈千潼"},
+            {"MSKU": "SKU-ORPHAN", "开发员": "运营二十部-陈千潼"},
+        ]
+        try:
+            for suffix in (".csv", ".xlsx"):
+                with self.subTest(suffix=suffix):
+                    source = Path(self.temp.name) / f"operational{suffix}"
+                    write_source = csv_bytes if suffix == ".csv" else workbook_bytes
+                    source.write_bytes(write_source(rows))
+                    batch_monitor._cached_operational_developer_maps.cache_clear()
+                    with patch.object(parquet_cache, "CACHE_DIR", cache_root), patch.object(
+                        batch_monitor, "get_latest_source_path", return_value=source
+                    ), patch.object(
+                        batch_monitor, "read_local_table", wraps=batch_monitor.read_local_table
+                    ) as reader:
+                        for view, total in (("incomplete", 1), ("all", 1), ("completed", 0)):
+                            response = self.client.get(f"/api/batch-monitor/batches?view={view}")
+                            self.assertEqual(response.status_code, 200, response.text)
+                            result = response.json()
+                            self.assertEqual(result["total"], total)
+                            self.assertEqual(result["orphan_count"], 1)
+                            self.assertTrue(result["orphan_scope_available"])
+                            self.assertEqual(result["metrics"]["incomplete_batches"], 1)
+                        reader.assert_called_once_with(source)
+                        source.write_bytes(write_source([
+                            rows[0], {"MSKU": "SKU-ORPHAN", "开发员": "其他开发员"}
+                        ]))
+                        response = self.client.get("/api/batch-monitor/batches?view=all")
+                        self.assertEqual(response.status_code, 200, response.text)
+                        self.assertEqual(response.json()["orphan_count"], 0)
+                        self.assertEqual(reader.call_count, 2)
+                        orphans = self.client.get("/api/batch-monitor/orphans")
+                        self.assertEqual(orphans.status_code, 200, orphans.text)
+                        self.assertEqual(orphans.json()["total"], 0)
+        finally:
+            batch_monitor._cached_operational_developer_maps.cache_clear()
+            parquet_cache.clear_parquet_memory_cache()
+
     def test_batch_upload_skips_template_row_and_rejects_batch_or_sku_conflicts(self):
         created = self.create_batch("ABC260701", "SKU-A01", "SKU-A02")
         self.assertEqual(created.status_code, 200, created.text)
@@ -129,6 +183,8 @@ class BatchMonitorTests(unittest.TestCase):
         self.assertEqual(first.status_code, 200, first.text)
         self.assertEqual(first.json()["inserted"], 1)
         self.assertEqual(first.json()["unassigned"], 0)
+        self.assertEqual(first.json()["affected_batches"][0]["batch_no"], "ABC260701")
+        self.assertIn("updated_at", first.json())
 
         second = self.upload_shipments(
             [
@@ -225,6 +281,8 @@ class BatchMonitorTests(unittest.TestCase):
                 "arrived_count": 2,
                 "sku_count": 2,
                 "is_complete": True,
+                "manual_completed_at": None,
+                "completion_mode": "automatic",
             }],
         )
         details = self.client.get("/api/batch-monitor/batches/ABC260701").json()
@@ -332,6 +390,8 @@ class BatchMonitorTests(unittest.TestCase):
             json={"arrival_date": (date.today() + timedelta(days=1)).isoformat()},
         )
         self.assertEqual(future.status_code, 422)
+        sku_future = self.client.put("/api/batch-monitor/skus/SKU-A01/arrival", json={"arrived": True, "arrival_date": (date.today() + timedelta(days=1)).isoformat()})
+        self.assertEqual(sku_future.status_code, 422)
         with db.connect() as conn:
             columns = {
                 row["name"]
@@ -391,11 +451,91 @@ class BatchMonitorTests(unittest.TestCase):
                 row["name"]
                 for row in migrated.execute("PRAGMA table_info(batch_monitor_skus)")
             }
+            completion_columns = {
+                row["name"]
+                for row in migrated.execute("PRAGMA table_info(batch_monitor_batches)")
+            }
+        db.initialize_database()
         self.assertNotIn("first_seen_at", columns)
         self.assertEqual(shipment["shipment_no"], "FBA-ONE")
         self.assertEqual(shipment["arrival_date"], "2026-07-20")
         self.assertIn("developer_snapshot", batch_columns)
         self.assertIn("monitor_basis", batch_columns)
+        self.assertIn("manual_completed_at", completion_columns)
+
+    def test_manual_completion_is_idempotent_preserves_progress_and_can_be_undone(self):
+        self.create_batch("ABC260701", "SKU-A01", "SKU-A02")
+        self.upload_shipments([
+            {"货件单号": "FBA-ONE", "MSKU": "SKU-A01", "ASIN": "B0ABC12345"},
+        ])
+        self.client.put(
+            "/api/batch-monitor/skus/SKU-A01/arrival",
+            json={"arrived": True, "arrival_date": "2026-09-01"},
+        )
+        before = self.client.get("/api/batch-monitor/batches/ABC260701").json()
+        completed = self.client.put(
+            "/api/batch-monitor/batches/ABC260701/completion",
+            json={"completed": True},
+        )
+        self.assertEqual(completed.status_code, 200, completed.text)
+        row = completed.json()["batch"]
+        self.assertTrue(row["is_complete"])
+        self.assertEqual(row["completion_mode"], "manual")
+        self.assertTrue(row["manual_completed_at"])
+        self.assertIsNone(row["artwork_completed_date"])
+        self.assertEqual((row["shipped_count"], row["arrived_count"]), (1, 1))
+
+        repeated = self.client.put(
+            "/api/batch-monitor/batches/ABC260701/completion",
+            json={"completed": True},
+        ).json()["batch"]
+        self.assertEqual(repeated["manual_completed_at"], row["manual_completed_at"])
+        after = self.client.get("/api/batch-monitor/batches/ABC260701").json()
+        self.assertEqual(after["skus"], before["skus"])
+        self.assertEqual(after["batch"]["artwork_completed_date"], before["batch"]["artwork_completed_date"])
+
+        incomplete = self.client.get("/api/batch-monitor/batches?view=incomplete").json()
+        completed_view = self.client.get("/api/batch-monitor/batches?view=completed").json()
+        self.assertEqual(incomplete["total"], 0)
+        self.assertEqual(completed_view["rows"][0]["completion_mode"], "manual")
+        self.assertEqual(incomplete["metrics"]["incomplete_batches"], 0)
+        copy_lists = self.client.get("/api/batch-monitor/copy-lists").json()
+        self.assertEqual(copy_lists["unbound_shipment_skus"], [])
+        self.assertEqual(copy_lists["pending_shipment_nos"], [])
+
+        undone = self.client.put(
+            "/api/batch-monitor/batches/ABC260701/completion",
+            json={"completed": False},
+        )
+        self.assertEqual(undone.status_code, 200, undone.text)
+        self.assertIsNone(undone.json()["batch"]["manual_completed_at"])
+        self.assertEqual(undone.json()["batch"]["completion_mode"], "in_progress")
+        self.assertFalse(undone.json()["batch"]["is_complete"])
+        self.assertEqual(self.client.get("/api/batch-monitor/batches?view=incomplete").json()["total"], 1)
+        self.assertEqual(self.client.get("/api/batch-monitor/copy-lists").json()["unbound_shipment_skus"], ["SKU-A02"])
+
+        self.client.put("/api/batch-monitor/batches/ABC260701/artwork", json={"completed": True})
+        self.upload_shipments([
+            {"货件单号": "FBA-TWO", "MSKU": "SKU-A02", "ASIN": "B0ABC54321"},
+        ])
+        self.client.put(
+            "/api/batch-monitor/skus/SKU-A02/arrival",
+            json={"arrived": True, "arrival_date": "2026-09-02"},
+        )
+        natural = self.client.get("/api/batch-monitor/batches?view=completed").json()["rows"][0]
+        self.assertEqual(natural["completion_mode"], "automatic")
+        self.assertTrue(natural["is_complete"])
+
+    def test_batch_monitor_list_excludes_price_metrics(self):
+        response = self.client.get("/api/batch-monitor/batches?include_price_metrics=true")
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(set(response.json()["metrics"]), {
+            "incomplete_batches",
+            "pending_artwork_batches",
+            "pending_shipment_skus",
+            "pending_arrival_skus",
+        })
+        self.assertEqual(self.client.get("/api/batch-monitor/price-metrics").status_code, 404)
 
     def test_launch_price_import_is_validated_and_idempotent(self):
         path = Path(self.temp.name) / "开售价.xlsx"

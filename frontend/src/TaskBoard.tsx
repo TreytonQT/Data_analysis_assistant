@@ -26,7 +26,7 @@ function taskFormValues(task?: Task): TaskFormValues {
     status: task.status,
     remind_at: reminder ? dayjs(reminder) : null,
     recurrence_type: task.recurrence_type,
-    recurrence_days: [...task.recurrence_days],
+    recurrence_days: task.recurrence_type === 'monthly' ? (task.recurrence_days.length ? [Math.min(...task.recurrence_days)] : []) : task.recurrence_type === 'daily' ? [] : [...task.recurrence_days],
   };
 }
 
@@ -70,7 +70,7 @@ function TaskModal({ task, open, onClose, onSaved }: { task?: Task; open: boolea
         ...values,
         notes: values.notes ?? '',
         status: task ? task.status : values.status,
-        recurrence_days: values.recurrence_type === 'none' ? [] : values.recurrence_days ?? [],
+        recurrence_days: values.recurrence_type === 'weekly' || values.recurrence_type === 'monthly' ? values.recurrence_days ?? [] : [],
         due_at: reminder,
         remind_at: reminder,
       };
@@ -92,7 +92,25 @@ function TaskModal({ task, open, onClose, onSaved }: { task?: Task; open: boolea
   };
 
   return <Modal title={task ? '编辑任务' : '新建任务'} open={open} onCancel={cancel} onOk={submit} confirmLoading={saving} okText="保存" closable={!saving} maskClosable={!saving} keyboard={!saving} cancelButtonProps={{ disabled: saving }} destroyOnHidden>
-    <Form form={form} layout="vertical"><Form.Item name="title" label="任务标题" rules={[{ required: true, message: '请输入任务标题' }]}><Input autoFocus placeholder="例如：检查补货建议" /></Form.Item><Form.Item name="notes" label="备注"><Input.TextArea rows={4} placeholder="补充任务说明、链接或清单" /></Form.Item><Space size="large" wrap><Form.Item name="status" label="状态"><Select options={(Object.keys(statusMeta) as Status[]).map(value => ({ value, label: statusMeta[value].label }))} /></Form.Item><Form.Item name="remind_at" label="提醒时间"><DatePicker showTime /></Form.Item></Space><Space size="large" wrap><Form.Item name="recurrence_type" label="重复"><Select options={[['none', '不重复'], ['daily', '每天'], ['weekly', '每周'], ['monthly', '每月']].map(([value, label]) => ({ value, label }))} /></Form.Item><Form.Item noStyle shouldUpdate={(prev, next) => prev.recurrence_type !== next.recurrence_type}>{({ getFieldValue }) => getFieldValue('recurrence_type') !== 'none' ? <Form.Item name="recurrence_days" label={getFieldValue('recurrence_type') === 'weekly' ? '星期（0 为周一）' : '日期'}><Select mode="multiple" style={{ minWidth: 180 }} options={(getFieldValue('recurrence_type') === 'weekly' ? ['周一','周二','周三','周四','周五','周六','周日'] : Array.from({length:31}, (_,i) => `${i+1} 日`)).map((label, value) => ({ value: getFieldValue('recurrence_type') === 'weekly' ? value : value + 1, label }))} /></Form.Item> : null}</Form.Item></Space></Form>
+    <Form form={form} layout="vertical"><Form.Item name="title" label="任务标题" rules={[{ required: true, message: '请输入任务标题' }]}><Input autoFocus placeholder="例如：检查补货建议" /></Form.Item><Form.Item name="notes" label="备注"><Input.TextArea rows={4} placeholder="补充任务说明、链接或清单" /></Form.Item><Space size="large" wrap><Form.Item name="status" label="状态"><Select options={(Object.keys(statusMeta) as Status[]).map(value => ({ value, label: statusMeta[value].label }))} /></Form.Item><Form.Item name="remind_at" label="提醒时间"><DatePicker showTime /></Form.Item></Space><Space size="large" wrap>
+  <Form.Item name="recurrence_type" label="重复">
+    <Select options={[['none', '不重复'], ['daily', '每天'], ['weekly', '每周'], ['monthly', '每月']].map(([value, label]) => ({ value, label }))} />
+  </Form.Item>
+  <Form.Item noStyle shouldUpdate={(prev, next) => prev.recurrence_type !== next.recurrence_type}>
+    {({ getFieldValue }) => {
+      const recurrenceType = getFieldValue('recurrence_type');
+      if (recurrenceType === 'none' || recurrenceType === 'daily') return null;
+      const weekly = recurrenceType === 'weekly';
+      return <Form.Item name="recurrence_days" label={weekly ? '星期（0 为周一）' : '日期'}>
+        <Select
+          mode={weekly ? 'multiple' : undefined}
+          style={{ minWidth: 180 }}
+          options={(weekly ? ['周一', '周二', '周三', '周四', '周五', '周六', '周日'] : Array.from({ length: 31 }, (_, index) => `${index + 1} 日`)).map((label, value) => ({ value: weekly ? value : value + 1, label }))}
+        />
+      </Form.Item>;
+    }}
+  </Form.Item>
+</Space></Form>
   </Modal>;
 }
 

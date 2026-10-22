@@ -1,7 +1,7 @@
 import { lazy, Suspense, useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
 import ReactDOM from 'react-dom/client';
-import { App as AntApp, Badge, Button, ConfigProvider, Drawer, Layout, Menu, Space, Spin, Switch, Tabs, Typography, theme, type MenuProps } from 'antd';
-import { BellOutlined, DashboardOutlined, DeploymentUnitOutlined, FileAddOutlined, FundOutlined, InboxOutlined, MoonOutlined, SettingOutlined, SunOutlined, UnorderedListOutlined } from '@ant-design/icons';
+import { App as AntApp, Badge, Button, ConfigProvider, Drawer, Dropdown, Layout, Menu, Space, Spin, Switch, Tabs, Typography, theme, type MenuProps } from 'antd';
+import { BellOutlined, DashboardOutlined, DeploymentUnitOutlined, FileAddOutlined, FundOutlined, InboxOutlined, MoreOutlined, MoonOutlined, SettingOutlined, SunOutlined, UnorderedListOutlined } from '@ant-design/icons';
 import { api, type AppRevisions } from './api';
 import './styles.css';
 import { configureFeedback } from './feedback';
@@ -20,19 +20,25 @@ import {
   type QuickTabState,
   type RouteKey,
 } from './navigation';
-configureFeedback();
 
 const UploadCenter = lazy(() => import('./UploadCenter'));
 const ConfigCenter = lazy(() => import('./ConfigCenter'));
 const DashboardPage = lazy(() => import('./DashboardPage'));
+const NewProductMonitorPage = lazy(() => import('./NewProductMonitorPage'));
 const ReplenishmentPage = lazy(() => import('./ReplenishmentPage'));
 const BatchMonitorPage = lazy(() => import('./BatchMonitorPage'));
 const SlowMovingPage = lazy(() => import('./SlowMovingPage'));
 const TaskBoard = lazy(() => import('./TaskBoard'));
 
+function FeedbackBridge() {
+  const { message } = AntApp.useApp();
+  useEffect(() => { configureFeedback(message); }, [message]);
+  return null;
+}
+
 const { Header, Content, Sider } = Layout;
 type RevisionDomain = keyof AppRevisions;
-const pageKeys: PageKey[] = ['overview', 'sales', 'slow-moving', 'products', 'department', 'replenishment', 'batch-monitor', 'uploads', 'config'];
+const pageKeys: PageKey[] = ['overview', 'sales', 'slow-moving', 'products', 'new-products', 'department', 'replenishment', 'batch-monitor', 'uploads', 'config'];
 const routeChangeEvent = 'sales-dashboard-route-change';
 const quickTabsStorageKey = 'sales-dashboard-quick-tabs-v1';
 const iconByKey: Record<string, ReactNode> = {
@@ -41,14 +47,14 @@ const iconByKey: Record<string, ReactNode> = {
 };
 
 const pageRevisionDomains: Record<PageKey, RevisionDomain[]> = {
-  overview: ['dashboard'], sales: ['dashboard'], products: ['dashboard', 'batch_monitor', 'promotions'], department: ['dashboard'], replenishment: ['dashboard'],
-  'slow-moving': ['dashboard', 'promotions'], 'batch-monitor': ['batch_monitor'], uploads: ['reports'], config: ['configs'],
+  overview: ['dashboard'], sales: ['dashboard'], products: ['dashboard', 'batch_monitor', 'promotions'], 'new-products': ['dashboard', 'batch_monitor'], department: ['dashboard'], replenishment: ['dashboard', 'promotions'],
+  'slow-moving': ['dashboard', 'promotions'], 'batch-monitor': ['batch_monitor', 'dashboard'], uploads: ['reports'], config: ['configs'],
 };
 
 function menuItems(nodes: NavigationNode[]): NonNullable<MenuProps['items']> {
   return nodes.map(node => node.kind === 'group'
     ? { key: node.key, icon: iconByKey[node.key], label: node.label, children: menuItems(node.children) }
-    : { key: node.key, icon: node.parentKeys.length ? undefined : iconByKey[node.page], label: node.label });
+    : { key: node.key, className: node.page === 'department' ? 'department-navigation-item' : undefined, icon: node.parentKeys.length ? undefined : iconByKey[node.page], label: node.label });
 }
 
 const sidebarItems = menuItems(navigationTree);
@@ -141,10 +147,8 @@ function App() {
     }
   }, []);
 
-  const activateRoute = useCallback(async (target: { key: RouteKey; page: PageKey; parentKeys: string[] }, targetSearch: string, historyMode: 'push' | 'none') => {
+  const activateRoute = useCallback((target: { key: RouteKey; page: PageKey; parentKeys: string[] }, targetSearch: string, historyMode: 'push' | 'none') => {
     const requestId = ++activationRequest.current;
-    const changedDomains = await comparePageRevision(target.page);
-    if (requestId !== activationRequest.current) return;
     if (historyMode === 'push') window.history.pushState({}, '', targetSearch);
     routeSearches.current[target.key] = targetSearch;
     setMountedPages(current => current.has(target.page) ? current : new Set([...current, target.page]));
@@ -155,10 +159,13 @@ function App() {
       const next = current.map(tab => tab.key === target.key ? { ...tab, search: targetSearch } : tab);
       return next.some(tab => tab.key === target.key) ? next : [...next, quickTabForRoute(target.key, targetSearch)];
     });
-    if (changedDomains.length) setDomainRefreshVersions(current => {
-      const next = { ...current };
-      changedDomains.forEach(domain => { next[domain] += 1; });
-      return next;
+    void comparePageRevision(target.page).then(changedDomains => {
+      if (requestId !== activationRequest.current || !changedDomains.length) return;
+      setDomainRefreshVersions(current => {
+        const next = { ...current };
+        changedDomains.forEach(domain => { next[domain] += 1; });
+        return next;
+      });
     });
   }, [comparePageRevision]);
 
@@ -203,11 +210,27 @@ function App() {
     if (activeRouteRef.current.key === key && fallback) navigateToRoute(fallback.key);
   };
 
+  const closeOtherQuickTabs = () => {
+    const active = activeRouteRef.current.key;
+    setQuickTabs(current => current.filter(tab => tab.key === 'overview' || tab.key === active));
+  };
+
+  const closeRightQuickTabs = () => {
+    const active = activeRouteRef.current.key;
+    setQuickTabs(current => {
+      const index = current.findIndex(tab => tab.key === active);
+      return index < 0 ? current : current.slice(0, index + 1);
+    });
+  };
+
+
   const renderPage = (key: PageKey) => {
     const active = pageForRoute(activeRouteKey) === key;
     const dashboardRefreshVersion = domainRefreshVersions.dashboard;
-    const productRefreshVersion = dashboardRefreshVersion + domainRefreshVersions.batch_monitor;
-    const content = key === 'uploads'
+    const productRefreshVersion = dashboardRefreshVersion + domainRefreshVersions.batch_monitor + domainRefreshVersions.promotions;
+    const content = key === 'new-products'
+      ? <NewProductMonitorPage active={active} routeVersion={pageRouteVersions[key]} refreshVersion={dashboardRefreshVersion + domainRefreshVersions.batch_monitor} />
+      : key === 'uploads'
       ? <UploadCenter active={active} routeVersion={pageRouteVersions[key]} refreshVersion={domainRefreshVersions.reports} />
       : key === 'config'
         ? <ConfigCenter active={active} routeVersion={pageRouteVersions[key]} refreshVersion={domainRefreshVersions.configs} />
@@ -216,9 +239,9 @@ function App() {
           : key === 'products'
             ? <DashboardPage page={key} active={active} routeVersion={pageRouteVersions[key]} refreshVersion={productRefreshVersion} />
           : key === 'replenishment'
-            ? <ReplenishmentPage active={active} routeVersion={pageRouteVersions[key]} refreshVersion={dashboardRefreshVersion} />
+            ? <ReplenishmentPage active={active} routeVersion={pageRouteVersions[key]} refreshVersion={dashboardRefreshVersion + domainRefreshVersions.promotions} />
             : key === 'batch-monitor'
-              ? <BatchMonitorPage active={active} routeVersion={pageRouteVersions[key]} refreshVersion={domainRefreshVersions.batch_monitor} />
+              ? <BatchMonitorPage active={active} routeVersion={pageRouteVersions[key]} refreshVersion={domainRefreshVersions.batch_monitor + domainRefreshVersions.dashboard} />
           : <DashboardPage page={key} active={active} routeVersion={pageRouteVersions[key]} refreshVersion={dashboardRefreshVersion} />;
     return <section key={key} className={`route-pane${active ? ' route-pane-active' : ''}`} aria-hidden={!active}>
       <div className="content"><Suspense fallback={<RouteLoading />}>{content}</Suspense></div>
@@ -230,14 +253,15 @@ function App() {
 
   return <ConfigProvider theme={{ algorithm: dark ? theme.darkAlgorithm : theme.defaultAlgorithm, token: { colorPrimary: '#3b82f6', borderRadius: 10, fontFamily: 'Inter, Microsoft YaHei, sans-serif', colorBgBase: dark ? '#08111f' : '#ffffff', colorBgContainer: dark ? '#142238' : '#ffffff', colorBgElevated: dark ? '#16263d' : '#ffffff', colorText: dark ? '#edf4ff' : '#172033', colorTextSecondary: dark ? '#a9b9cf' : '#667085', colorBorder: dark ? '#2d4059' : '#e0e7f0' } }}>
     <AntApp message={{ top: 24, maxCount: 3, duration: 2.5 }}>
+      <FeedbackBridge />
       <Layout className={`app-shell ${dark ? 'dark-mode' : ''}`}>
         <Sider width={240} collapsible collapsed={sidebarCollapsed} onCollapse={setSidebarCollapsed} breakpoint="lg" collapsedWidth={0} className="side-nav">
           <div className="brand"><div className="brand-mark">数</div><div><strong>销售数据看板</strong><span>经营分析工作台</span></div></div>
           <Menu theme={dark ? 'dark' : 'light'} mode="inline" selectedKeys={[activeRouteKey]} openKeys={openKeys} items={sidebarItems} onOpenChange={setOpenKeys} onClick={onMenuClick} />
         </Sider>
         <Layout className="main-layout">
-          <Header className="topbar"><Typography.Text strong>{topLevelLabelForRoute(activeRouteKey)}</Typography.Text><Space><SystemControls /><Switch checked={dark} onChange={value => { setDark(value); localStorage.setItem('dashboard-theme', value ? 'dark' : 'light'); }} checkedChildren={<MoonOutlined />} unCheckedChildren={<SunOutlined />} /><Badge count={notices} size="small"><Button icon={<BellOutlined />} onClick={() => setDrawer(true)}>提醒</Button></Badge></Space></Header>
-          <div className="quick-tabbar" aria-label="最近访问页面"><Tabs type="editable-card" hideAdd activeKey={activeRouteKey} items={quickTabs.map(tab => ({ key: tab.key, label: tab.label, closable: tab.closable, children: null }))} onChange={key => { if (validRouteKey(key)) navigateToRoute(key); }} onEdit={onQuickTabEdit} /></div>
+          <Header className="topbar"><Typography.Text strong>{topLevelLabelForRoute(activeRouteKey)}</Typography.Text><Space><SystemControls compact /><Switch checked={dark} onChange={value => { setDark(value); localStorage.setItem('dashboard-theme', value ? 'dark' : 'light'); }} checkedChildren={<MoonOutlined />} unCheckedChildren={<SunOutlined />} /><Badge count={notices} size="small"><Button icon={<BellOutlined />} onClick={() => setDrawer(true)}>提醒</Button></Badge></Space></Header>
+          <div className="quick-tabbar" aria-label="最近访问页面"><Tabs type="editable-card" hideAdd activeKey={activeRouteKey} tabBarExtraContent={<Dropdown menu={{ items: [{ key: 'close-others', label: '关闭其他', disabled: activeRouteKey === 'overview' || quickTabs.length <= 2 }, { key: 'close-right', label: '关闭右侧', disabled: quickTabs.findIndex(tab => tab.key === activeRouteKey) >= quickTabs.length - 1 }], onClick: ({ key }) => key === 'close-others' ? closeOtherQuickTabs() : closeRightQuickTabs() }}><Button type="text" icon={<MoreOutlined />} aria-label="标签操作" /></Dropdown>} items={quickTabs.map(tab => ({ key: tab.key, label: <span title={tab.label} className="quick-tab-label">{tab.label}</span>, closable: tab.closable, children: null }))} onChange={key => { if (validRouteKey(key)) navigateToRoute(key); }} onEdit={onQuickTabEdit} /></div>
           <Content className="content-viewport">{Array.from(mountedPages).map(renderPage)}</Content>
         </Layout>
       </Layout>

@@ -10,10 +10,10 @@ from threading import RLock
 from typing import Callable, Iterable
 
 import pandas as pd
-from app_paths import APP_ROOT
+from app_paths import APP_ROOT, DATA_DIR
 
 ROOT = APP_ROOT
-CACHE_DIR = ROOT / "data" / "cache"
+CACHE_DIR = DATA_DIR / "cache"
 CACHE_SCHEMA_VERSION = "6"
 _CACHE_LOCK = RLock()
 
@@ -24,7 +24,7 @@ def _safe_namespace(value: str) -> str:
 
 
 def _cache_directory() -> Path:
-    data_root = (ROOT / "data").resolve(strict=False)
+    data_root = CACHE_DIR.parent.resolve(strict=False)
     cache_root = CACHE_DIR.resolve(strict=False)
     try:
         cache_root.relative_to(data_root)

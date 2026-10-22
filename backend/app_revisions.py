@@ -10,6 +10,7 @@ from backend.batch_monitor import batch_monitor_revision
 from dashboard.data_processing import CONFIG_DIR
 from dashboard.parquet_cache import revision_digest
 from dashboard.report_store import DATA_DIR, get_sales_history_paths, sales_history_index_path
+from backend.listing_prices import listing_index_path, listing_root
 
 
 router = APIRouter(prefix="/api", tags=["app-revisions"])
@@ -32,6 +33,9 @@ def reports_revision() -> str:
     if history_index.exists():
         paths.append(history_index)
     paths.extend(get_sales_history_paths())
+    listing_index = listing_index_path()
+    if listing_index.exists(): paths.append(listing_index)
+    paths.extend(path for path in listing_root().glob('*') if path.is_file())
     return revision_digest("app-reports", _existing_paths(paths))
 
 

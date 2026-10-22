@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Literal
 
 from fastapi import APIRouter, HTTPException, Query, Response
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from backend.db import connect
 
@@ -35,6 +35,22 @@ class TaskInput(BaseModel):
     recurrence_type: RecurrenceType = "none"
     recurrence_days: list[int] = Field(default_factory=list)
 
+    @model_validator(mode="after")
+    def validate_recurrence_days(self):
+        days = sorted(set(self.recurrence_days))
+        if self.recurrence_type in {"none", "daily"}:
+            self.recurrence_days = []
+        elif self.recurrence_type == "weekly":
+            if any(day < 0 or day > 6 for day in days):
+                raise ValueError("每周重复日期必须在 0 到 6 之间")
+            self.recurrence_days = days
+        elif self.recurrence_type == "monthly":
+            if len(days) > 1:
+                raise ValueError("每月重复只能选择一个日期")
+            if any(day < 1 or day > 31 for day in days):
+                raise ValueError("每月重复日期必须在 1 到 31 之间")
+            self.recurrence_days = days
+        return self
     @field_validator("recurrence_days")
     @classmethod
     def valid_days(cls, value: list[int]) -> list[int]:
@@ -89,11 +105,12 @@ def next_occurrence(task: dict, base: datetime) -> datetime | None:
                 return candidate
     if kind == "monthly":
         days = task["recurrence_days"] or [base.day]
+        target_day = min(days)
         year, month = base.year, base.month + 1
         if month == 13:
             year, month = year + 1, 1
         import calendar
-        return base.replace(year=year, month=month, day=min(days[0], calendar.monthrange(year, month)[1]))
+        return base.replace(year=year, month=month, day=min(target_day, calendar.monthrange(year, month)[1]))
     return None
 
 
@@ -117,15 +134,10 @@ def apply_task_lifecycle() -> None:
     A task stays in ``todo`` until its reminder time (or due time when no
     reminder is set), then automatically becomes ``current``.  Completed
     recurring tasks from legacy imports are reopened at ``next_reminder_at``.
-    Non-recurring completed tasks are retained for one week after their set
-    task time and then removed.
+    Completed tasks remain visible until the user deletes them.
     """
     timestamp = as_iso(now())
-    cleanup_before = as_iso(now() - timedelta(days=7))
     with connect() as conn:
-        conn.execute("""DELETE FROM tasks WHERE status = 'completed' AND recurrence_type = 'none'
-            AND COALESCE(remind_at, due_at, completed_at) IS NOT NULL
-            AND COALESCE(remind_at, due_at, completed_at) <= ?""", (cleanup_before,))
         due_todos = conn.execute("""SELECT id FROM tasks
             WHERE status = 'todo' AND COALESCE(remind_at, due_at) IS NOT NULL
               AND COALESCE(remind_at, due_at) <= ? ORDER BY sort_order DESC""", (timestamp,)).fetchall()

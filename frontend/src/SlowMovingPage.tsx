@@ -11,7 +11,7 @@ export function slowMovingTabFromSearch(search: string): SlowMovingTab {
 }
 
 function PromotionLoading() {
-  return <div className="route-loading"><Spin size="large" tip="正在加载促销提醒…" /></div>;
+  return <div className="route-loading"><Spin size="large" tip="正在加载调价与促销…" /></div>;
 }
 
 export default function SlowMovingPage({ active = true, routeVersion = 0, dashboardRefreshVersion = 0, promotionsRefreshVersion = 0 }: { active?: boolean; routeVersion?: number; dashboardRefreshVersion?: number; promotionsRefreshVersion?: number }) {

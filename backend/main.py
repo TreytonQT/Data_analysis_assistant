@@ -9,6 +9,8 @@ from backend.db import initialize_database
 from backend.config_api import router as config_router
 from backend.dashboard_api import router as dashboard_router
 from backend.promotions import router as promotions_router
+from backend.pricing import router as pricing_router
+from backend.listing_prices import router as listing_prices_router
 from backend.batch_monitor import router as batch_monitor_router
 from backend.app_revisions import router as app_revisions_router
 from backend.reports_api import router as reports_router
@@ -16,13 +18,15 @@ from backend.system_api import router as system_router
 from backend.tasks import router as tasks_router
 from app_paths import FRONTEND_DIST
 
-app = FastAPI(title="销售数据看板 API", version="2.1.0")
+app = FastAPI(title="销售数据看板 API", version="2.2.0")
 app.add_middleware(GZipMiddleware, minimum_size=500, compresslevel=6)
 app.include_router(tasks_router)
 app.include_router(reports_router)
 app.include_router(config_router)
 app.include_router(dashboard_router)
 app.include_router(promotions_router)
+app.include_router(pricing_router)
+app.include_router(listing_prices_router)
 app.include_router(batch_monitor_router)
 app.include_router(app_revisions_router)
 app.include_router(system_router)
@@ -31,7 +35,11 @@ initialize_database()
 
 
 @app.on_event("startup")
-def startup(): initialize_database()
+def startup():
+    initialize_database()
+    from backend.dashboard_api import schedule_replenishment_warmup
+
+    schedule_replenishment_warmup()
 
 
 @app.get("/api/health")

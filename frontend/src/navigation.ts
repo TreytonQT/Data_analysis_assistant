@@ -3,6 +3,7 @@ export type PageKey =
   | 'sales'
   | 'slow-moving'
   | 'products'
+  | 'new-products'
   | 'department'
   | 'replenishment'
   | 'batch-monitor'
@@ -14,8 +15,10 @@ export type RouteKey =
   | 'sales'
   | 'slow-moving:details'
   | 'slow-moving:promotion'
+  | 'slow-moving:actual-prices'
   | 'products:detail'
   | 'products:low-margin'
+  | 'products:new-products'
   | 'department:performance'
   | 'department:commission'
   | 'department:assessment'
@@ -27,8 +30,6 @@ export type RouteKey =
   | 'config:metrics_config'
   | 'config:store_config'
   | 'config:monthly_targets'
-  | 'config:department_fee_config'
-  | 'config:commission_config'
   | 'config:replenishment_coverage_rules'
   | 'config:replenishment_switches'
   | 'config:replenishment_product_tags';
@@ -77,16 +78,18 @@ export const navigationTree: NavigationNode[] = [
   leaf('sales', '销量看板', 'sales'),
   group('slow-moving', '滞销提醒', [
     leaf('slow-moving:details', '滞销明细', 'slow-moving', ['slow-moving'], { tab: 'details' }),
-    leaf('slow-moving:promotion', '促销提醒', 'slow-moving', ['slow-moving'], { tab: 'promotion' }),
+    leaf('slow-moving:promotion', '调价与促销', 'slow-moving', ['slow-moving'], { tab: 'promotion' }),
+    leaf('slow-moving:actual-prices', '实际价格', 'slow-moving', ['slow-moving'], { tab: 'promotion', promotion_view: 'actual-prices' }),
   ]),
   group('products', '产品管理', [
     leaf('products:detail', '产品管理明细', 'products', ['products'], { tab: 'detail' }),
     leaf('products:low-margin', '低毛利率 SKU', 'products', ['products'], { tab: 'low-margin' }),
+    leaf('products:new-products', '新品监控', 'new-products', ['products']),
   ]),
   group('department', '部门监控', [
-    leaf('department:performance', '业绩监控', 'department', ['department'], { tab: 'performance' }),
-    leaf('department:commission', '提成监控', 'department', ['department'], { tab: 'commission' }),
-    leaf('department:assessment', '考核监控', 'department', ['department'], { tab: 'assessment' }),
+    leaf('department:performance', '业绩监控（统计报表）', 'department', ['department'], { tab: 'performance' }),
+    leaf('department:commission', '提成监控（业绩报表）', 'department', ['department'], { tab: 'commission' }),
+    leaf('department:assessment', '考核监控（业绩报表）', 'department', ['department'], { tab: 'assessment' }),
   ]),
   leaf('replenishment', '补货管理', 'replenishment'),
   leaf('batch-monitor', '批次监控', 'batch-monitor'),
@@ -99,8 +102,6 @@ export const navigationTree: NavigationNode[] = [
     leaf('config:metrics_config', '指标公式配置', 'config', ['config'], { config_tab: 'metrics_config' }),
     leaf('config:store_config', '店铺配置', 'config', ['config'], { config_tab: 'store_config' }),
     leaf('config:monthly_targets', '目标配置', 'config', ['config'], { config_tab: 'monthly_targets' }),
-    leaf('config:department_fee_config', '部门费用率', 'config', ['config'], { config_tab: 'department_fee_config' }),
-    leaf('config:commission_config', '提成配置', 'config', ['config'], { config_tab: 'commission_config' }),
     leaf('config:replenishment_coverage_rules', '库存覆盖规则', 'config', ['config'], { config_tab: 'replenishment_coverage_rules' }),
     leaf('config:replenishment_switches', '补货开关', 'config', ['config'], { config_tab: 'replenishment_switches' }),
     leaf('config:replenishment_product_tags', 'ASIN产品标签', 'config', ['config'], { config_tab: 'replenishment_product_tags' }),
@@ -127,7 +128,9 @@ export function routeLeafForSearch(search: string): NavigationLeaf {
   const params = new URLSearchParams(search);
   const page = params.get('page') as PageKey | null;
   if (page === 'slow-moving' && params.get('tab') === 'promotion') {
-    return navigationLeafByKey.get('slow-moving:promotion')!;
+    return params.get('promotion_view') === 'actual-prices'
+      ? navigationLeafByKey.get('slow-moving:actual-prices')!
+      : navigationLeafByKey.get('slow-moving:promotion')!;
   }
   if (page === 'config') {
     const configTab = params.get('config_tab');
@@ -145,11 +148,11 @@ export function routeLeafForSearch(search: string): NavigationLeaf {
 export function searchForRoute(key: RouteKey, currentSearch = '') {
   const route = navigationLeafByKey.get(key) || navigationLeafByKey.get('overview')!;
   const params = new URLSearchParams(currentSearch);
-  const promotionView = route.key === 'slow-moving:promotion' && params.get('tab') === 'promotion' ? params.get('promotion_view') : null;
+  const promotionView = (route.key === 'slow-moving:promotion' || route.key === 'slow-moving:actual-prices') && params.get('tab') === 'promotion' ? params.get('promotion_view') : null;
   params.set('page', route.page);
   ['tab', 'promotion_view', 'config_tab'].forEach(name => params.delete(name));
   Object.entries(route.params).forEach(([name, value]) => params.set(name, value));
-  if (route.key === 'slow-moving:promotion' && promotionView) params.set('promotion_view', promotionView);
+  if ((route.key === 'slow-moving:promotion' || route.key === 'slow-moving:actual-prices') && promotionView) params.set('promotion_view', promotionView);
   return `?${params.toString()}`;
 }
 

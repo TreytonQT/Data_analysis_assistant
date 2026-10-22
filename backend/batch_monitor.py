@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from functools import lru_cache
 import hashlib
 import io
 import json
@@ -13,18 +14,20 @@ from typing import Annotated, Any
 
 import pandas as pd
 from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
+from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
 
-from backend.db import LOCAL_TIMEZONE, ROOT, connect, initialize_database
+from backend.db import LOCAL_TIMEZONE, connect, initialize_database
+from app_paths import DATA_DIR
 from backend.upload_safety import read_upload_limited
 from dashboard.data_processing import read_csv_bytes, read_local_table
-from dashboard.parquet_cache import load_or_build_parquet, revision_digest
+from dashboard.parquet_cache import load_or_build_parquet
 from dashboard.report_store import get_latest_source_path
 
 
 router = APIRouter(prefix="/api/batch-monitor", tags=["batch-monitor"])
 
-BATCH_UPLOAD_DIR = ROOT / "data" / "batch_monitor" / "uploads"
+BATCH_UPLOAD_DIR = DATA_DIR / "batch_monitor" / "uploads"
 MAX_BATCH_FILE_BYTES = 20 * 1024 * 1024
 REQUIRED_BATCH_COLUMNS = ("SKU", "DE_PRICE", "FR_PRICE", "ES_PRICE", "IT_PRICE")
 REQUIRED_SHIPMENT_COLUMNS = ("货件单号", "MSKU", "ASIN")
@@ -53,6 +56,10 @@ class ShipmentArrivalUpdate(BaseModel):
     arrival_date: date
 
 
+class CompletionUpdate(BaseModel):
+    completed: bool
+
+
 def _now() -> datetime:
     return datetime.now(LOCAL_TIMEZONE).replace(microsecond=0)
 
@@ -71,12 +78,12 @@ def _normalize_text(value: Any) -> str:
     return str(value).strip().upper()
 
 
-def _operational_developer_maps() -> tuple[dict[str, str], dict[str, str]]:
-    """Return all current SKU developers and the creation-eligible Chen subset."""
-
-    path = get_latest_source_path("operational_sales")
-    if not path:
-        raise ValueError("请先到上传中心上传运营原始表，再新建批次")
+@lru_cache(maxsize=4)
+def _cached_operational_developer_maps(
+    source_revision: str, path_text: str
+) -> tuple[dict[str, str], dict[str, str]]:
+    del source_revision
+    path = Path(path_text)
     frame = load_or_build_parquet(
         "batch-monitor-operational-scope",
         [path],
@@ -106,6 +113,24 @@ def _operational_developer_maps() -> tuple[dict[str, str], dict[str, str]]:
         if any("陈千潼" in developer for developer in developer_sets[sku])
     }
     return all_developers, eligible
+
+
+def _operational_source_revision(path: Path, scope: str) -> str:
+    try:
+        stat = path.stat()
+        value = f"{path.resolve()}:{stat.st_size}:{stat.st_mtime_ns}"
+    except OSError:
+        value = f"{path}:missing"
+    return hashlib.sha256(f"{scope}:{value}".encode("utf-8")).hexdigest()
+
+
+def _operational_developer_maps() -> tuple[dict[str, str], dict[str, str]]:
+    """Return all current SKU developers and the creation-eligible Chen subset."""
+    path = get_latest_source_path("operational_sales")
+    if not path:
+        raise ValueError("请先到上传中心上传运营原始表，再新建批次")
+    revision = _operational_source_revision(Path(path), "batch-monitor-operational-developers-v2")
+    return _cached_operational_developer_maps(revision, str(path))
 
 
 def _file_hash(data: bytes) -> str:
@@ -142,7 +167,7 @@ def batch_monitor_revision() -> str:
         database_revision = str(row["value"]) if row else "empty"
         operational_path = get_latest_source_path("operational_sales")
         orphan_scope_revision = (
-            revision_digest("batch-monitor-orphan-scope", [operational_path])
+            _operational_source_revision(Path(operational_path), "batch-monitor-orphan-scope-v2")
             if operational_path
             else "missing-operational-source"
         )
@@ -382,8 +407,8 @@ def create_batch_from_upload(
             raise ValueError(f"SKU已属于其他批次：{examples}")
         conn.execute(
             """INSERT INTO batch_monitor_batches
-            (batch_no, artwork_completed_date, source_file_name, source_file_hash, created_at, updated_at)
-            VALUES (?, NULL, ?, ?, ?, ?)""",
+            (batch_no, artwork_completed_date, manual_completed_at, source_file_name, source_file_hash, created_at, updated_at)
+            VALUES (?, NULL, NULL, ?, ?, ?, ?)""",
             (normalized_batch, file_name, digest, timestamp, timestamp),
         )
         conn.executemany(
@@ -423,6 +448,9 @@ def create_batch_from_upload(
         )
         _touch_revision(conn)
     _archive_file("batch", file_name, data, digest)
+    with connect() as conn:
+        stats["batch"] = _all_batch_rows(conn, {normalized_batch})[0]
+    stats["updated_at"] = batch_monitor_revision()
     return stats
 
 
@@ -434,6 +462,7 @@ def import_shipment_upload(file_name: str, data: bytes) -> dict[str, Any]:
     ignored = 0
     preserved_conflicts: list[dict[str, str]] = []
     unassigned = 0
+    affected_batch_numbers: set[str] = set()
     with connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
         for row in rows:
@@ -468,10 +497,13 @@ def import_shipment_upload(file_name: str, data: bytes) -> dict[str, Any]:
                 ),
             )
             inserted += 1
-            if not conn.execute(
-                "SELECT 1 FROM batch_monitor_skus WHERE sku = ?",
+            membership = conn.execute(
+                "SELECT batch_no FROM batch_monitor_skus WHERE sku = ?",
                 (row["sku"],),
-            ).fetchone():
+            ).fetchone()
+            if membership:
+                affected_batch_numbers.add(str(membership["batch_no"]))
+            else:
                 unassigned += 1
         stats = {
             "rows": len(rows),
@@ -491,7 +523,10 @@ def import_shipment_upload(file_name: str, data: bytes) -> dict[str, Any]:
         )
         if inserted:
             _touch_revision(conn)
+        summaries = _batch_rows_for_numbers(conn, affected_batch_numbers)
     _archive_file("shipments", file_name, data, digest)
+    stats["affected_batches"] = list(summaries.values())
+    stats["updated_at"] = batch_monitor_revision()
     return stats
 
 
@@ -862,11 +897,38 @@ def _batch_period_key(batch_no: str) -> tuple[int, int, str]:
     return (int(digits[:4]), int(digits[4:]), batch_no)
 
 
-def _all_batch_rows(conn) -> list[dict[str, Any]]:
+def _complete_batch_summary(item: dict[str, Any]) -> dict[str, Any]:
+    item["sku_count"] = int(item["sku_count"] or 0)
+    item["shipped_count"] = int(item["shipped_count"] or 0)
+    item["arrived_count"] = int(item["arrived_count"] or 0)
+    item["shipment_count"] = int(item["shipment_count"] or 0)
+    natural_complete = bool(
+        item["artwork_completed_date"]
+        and item["shipped_count"] == item["sku_count"]
+        and item["arrived_count"] == item["sku_count"]
+    )
+    manual_complete = bool(item.get("manual_completed_at"))
+    item["is_complete"] = manual_complete or natural_complete
+    item["completion_mode"] = (
+        "manual" if manual_complete else "automatic" if natural_complete else "in_progress"
+    )
+    return item
+
+
+def _all_batch_rows(conn, batch_numbers: set[str] | None = None) -> list[dict[str, Any]]:
+    params: list[str] = []
+    where = ""
+    if batch_numbers is not None:
+        normalized = sorted({str(value) for value in batch_numbers if value})
+        if not normalized:
+            return []
+        where = "WHERE b.batch_no IN (" + ",".join("?" for _ in normalized) + ")"
+        params.extend(normalized)
     rows = conn.execute(
-        """SELECT
+        f"""SELECT
             b.batch_no,
             b.artwork_completed_date,
+            b.manual_completed_at,
             b.source_file_name,
             b.created_at,
             b.updated_at,
@@ -877,23 +939,20 @@ def _all_batch_rows(conn) -> list[dict[str, Any]]:
         FROM batch_monitor_batches b
         JOIN batch_monitor_skus s ON s.batch_no = b.batch_no
         LEFT JOIN sku_first_shipments f ON f.sku = s.sku
+        {where}
         GROUP BY b.batch_no
-        ORDER BY b.batch_no"""
+        ORDER BY b.batch_no""",
+        params,
     ).fetchall()
-    result = []
-    for row in rows:
-        item = dict(row)
-        item["sku_count"] = int(item["sku_count"] or 0)
-        item["shipped_count"] = int(item["shipped_count"] or 0)
-        item["arrived_count"] = int(item["arrived_count"] or 0)
-        item["shipment_count"] = int(item["shipment_count"] or 0)
-        item["is_complete"] = bool(
-            item["artwork_completed_date"]
-            and item["shipped_count"] == item["sku_count"]
-            and item["arrived_count"] == item["sku_count"]
-        )
-        result.append(item)
-    return result
+    return [_complete_batch_summary(dict(row)) for row in rows]
+
+
+def _batch_rows_for_numbers(conn, batch_numbers: set[str]) -> dict[str, dict[str, Any]]:
+    """Build summaries only for batches touched by a shipment update."""
+    return {
+        str(row["batch_no"]): row
+        for row in _all_batch_rows(conn, batch_numbers)
+    }
 
 
 def _matching_batch_numbers(conn, search: str) -> set[str]:
@@ -912,6 +971,16 @@ def _matching_batch_numbers(conn, search: str) -> set[str]:
         (like, like, like, like),
     ).fetchall()
     return {str(row["batch_no"]) for row in rows}
+
+
+def _base_batch_metrics(all_rows: list[dict[str, Any]]) -> dict[str, int]:
+    active_rows = [row for row in all_rows if not row.get("manual_completed_at")]
+    return {
+        "incomplete_batches": sum(1 for row in active_rows if not row["is_complete"]),
+        "pending_artwork_batches": sum(1 for row in active_rows if not row["artwork_completed_date"]),
+        "pending_shipment_skus": sum(row["sku_count"] - row["shipped_count"] for row in active_rows),
+        "pending_arrival_skus": sum(row["shipped_count"] - row["arrived_count"] for row in active_rows),
+    }
 
 
 @router.get("/batches")
@@ -941,18 +1010,7 @@ def list_batches(
         orphan_count = 0
         orphan_scope_available = False
         orphan_scope_message = str(exc)
-    metrics = {
-        "incomplete_batches": sum(1 for row in all_rows if not row["is_complete"]),
-        "pending_artwork_batches": sum(
-            1 for row in all_rows if not row["artwork_completed_date"]
-        ),
-        "pending_shipment_skus": sum(
-            row["sku_count"] - row["shipped_count"] for row in all_rows
-        ),
-        "pending_arrival_skus": sum(
-            row["shipped_count"] - row["arrived_count"] for row in all_rows
-        ),
-    }
+    metrics: dict[str, Any] = _base_batch_metrics(all_rows)
     visible = [
         row
         for row in all_rows
@@ -965,6 +1023,7 @@ def list_batches(
     ]
     visible.sort(key=lambda row: _batch_period_key(str(row["batch_no"])), reverse=True)
     total = len(visible)
+    page = min(page, max(1, math.ceil(total / page_size)))
     start = (page - 1) * page_size
     return {
         "metrics": metrics,
@@ -983,7 +1042,7 @@ def list_batches(
 def _batch_detail(conn, batch_no: str) -> dict[str, Any]:
     normalized = _validate_batch_no(batch_no)
     summary = next(
-        (row for row in _all_batch_rows(conn) if row["batch_no"] == normalized),
+        (row for row in _all_batch_rows(conn, {normalized}) if row["batch_no"] == normalized),
         None,
     )
     if not summary:
@@ -1007,6 +1066,24 @@ def _batch_detail(conn, batch_no: str) -> dict[str, Any]:
             (normalized,),
         ).fetchall()
     ]
+    try:
+        from backend.listing_prices import cached_listing_bundle
+        listing, _, _ = cached_listing_bundle()
+        listing = listing.set_index("MSKU") if not listing.empty else None
+        for row in sku_rows:
+            if listing is None or row["sku"] not in listing.index:
+                row["listing_current"] = {}
+                row["listing_change"] = {}
+                continue
+            values = listing.loc[row["sku"]]
+            def number(value):
+                return None if pd.isna(value) else float(value)
+            row["listing_current"] = {code: number(values.get(f"{code}_当前实际总价")) for code in ("DE", "FR", "ES", "IT")}
+            row["listing_change"] = {code: number(values.get(f"{code}_较开售价变化")) for code in ("DE", "FR", "ES", "IT")}
+    except Exception:
+        for row in sku_rows:
+            row["listing_current"] = {}
+            row["listing_change"] = {}
     return {"batch": summary, "skus": sku_rows}
 
 
@@ -1068,8 +1145,9 @@ def batch_monitor_copy_lists():
             for row in conn.execute(
                 """SELECT s.sku
                 FROM batch_monitor_skus s
+                JOIN batch_monitor_batches b ON b.batch_no = s.batch_no
                 LEFT JOIN sku_first_shipments f ON f.sku = s.sku
-                WHERE f.sku IS NULL
+                WHERE b.manual_completed_at IS NULL AND f.sku IS NULL
                 ORDER BY s.sku"""
             ).fetchall()
         ]
@@ -1078,8 +1156,9 @@ def batch_monitor_copy_lists():
             for row in conn.execute(
                 """SELECT DISTINCT f.shipment_no
                 FROM batch_monitor_skus s
+                JOIN batch_monitor_batches b ON b.batch_no = s.batch_no
                 JOIN sku_first_shipments f ON f.sku = s.sku
-                WHERE f.arrival_date IS NULL
+                WHERE b.manual_completed_at IS NULL AND f.arrival_date IS NULL
                   AND TRIM(f.shipment_no) <> ''
                 ORDER BY f.shipment_no"""
             ).fetchall()
@@ -1106,7 +1185,7 @@ async def create_batch(
         allowed={".xlsx"},
     )
     try:
-        return create_batch_from_upload(batch_no, name, data)
+        return await run_in_threadpool(create_batch_from_upload, batch_no, name, data)
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
 
@@ -1120,7 +1199,7 @@ async def upload_shipments(file: Annotated[UploadFile, File(...)]):
         allowed={".csv"},
     )
     try:
-        return import_shipment_upload(name, data)
+        return await run_in_threadpool(import_shipment_upload, name, data)
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
 
@@ -1139,18 +1218,45 @@ def update_artwork(batch_no: str, payload: ArtworkUpdate):
             raise HTTPException(404, "批次不存在")
         current = row["artwork_completed_date"]
         completed_date = (current or _today_iso()) if payload.completed else None
-        conn.execute(
-            """UPDATE batch_monitor_batches
-            SET artwork_completed_date = ?, updated_at = ?
-            WHERE batch_no = ?""",
-            (completed_date, _now_iso(), normalized),
-        )
-        _touch_revision(conn)
+        if current != completed_date:
+            conn.execute(
+                """UPDATE batch_monitor_batches
+                SET artwork_completed_date = ?, updated_at = ?
+                WHERE batch_no = ?""",
+                (completed_date, _now_iso(), normalized),
+            )
+            _touch_revision(conn)
+        summary = _all_batch_rows(conn, {normalized})[0]
     return {
         "batch_no": normalized,
         "completed": bool(completed_date),
         "artwork_completed_date": completed_date,
+        "batch": summary,
+        "updated_at": batch_monitor_revision(),
     }
+
+
+@router.put("/batches/{batch_no}/completion")
+def update_batch_completion(batch_no: str, payload: CompletionUpdate):
+    normalized = _validate_batch_no(batch_no)
+    with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT manual_completed_at FROM batch_monitor_batches WHERE batch_no = ?",
+            (normalized,),
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "批次不存在")
+        current = row["manual_completed_at"]
+        next_value = (current or _now_iso()) if payload.completed else None
+        if current != next_value:
+            conn.execute(
+                "UPDATE batch_monitor_batches SET manual_completed_at = ?, updated_at = ? WHERE batch_no = ?",
+                (next_value, _now_iso(), normalized),
+            )
+            _touch_revision(conn)
+        summary = _all_batch_rows(conn, {normalized})[0]
+    return {"batch": summary, "updated_at": batch_monitor_revision()}
 
 
 @router.put("/shipments/{shipment_no}/arrival")
@@ -1193,11 +1299,7 @@ def update_shipment_arrival(shipment_no: str, payload: ShipmentArrivalUpdate):
         updated = int(cursor.rowcount)
         if updated:
             _touch_revision(conn)
-        affected_summaries = {
-            row["batch_no"]: row
-            for row in _all_batch_rows(conn)
-            if row["batch_no"] in affected_counts
-        }
+        affected_summaries = _batch_rows_for_numbers(conn, set(affected_counts))
     return {
         "shipment_no": normalized,
         "arrival_date": arrival_date,
@@ -1211,9 +1313,12 @@ def update_shipment_arrival(shipment_no: str, payload: ShipmentArrivalUpdate):
                 "arrived_count": affected_summaries[batch_no]["arrived_count"],
                 "sku_count": affected_summaries[batch_no]["sku_count"],
                 "is_complete": affected_summaries[batch_no]["is_complete"],
+                "manual_completed_at": affected_summaries[batch_no]["manual_completed_at"],
+                "completion_mode": affected_summaries[batch_no]["completion_mode"],
             }
             for batch_no, count in sorted(affected_counts.items())
         ],
+        "updated_at": batch_monitor_revision(),
     }
 
 
@@ -1222,6 +1327,8 @@ def update_sku_arrival(sku: str, payload: ArrivalUpdate):
     normalized = _normalize_text(sku)
     if not normalized:
         raise HTTPException(422, "SKU不能为空")
+    if payload.arrival_date and payload.arrival_date > _now().date():
+        raise HTTPException(422, '到货日期不能晚于今天')
     arrival_date = (
         (payload.arrival_date.isoformat() if payload.arrival_date else _today_iso())
         if payload.arrived
@@ -1230,22 +1337,31 @@ def update_sku_arrival(sku: str, payload: ArrivalUpdate):
     with connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
-            "SELECT arrival_date FROM sku_first_shipments WHERE sku = ?",
+            """SELECT f.arrival_date, s.batch_no
+            FROM sku_first_shipments f
+            LEFT JOIN batch_monitor_skus s ON s.sku = f.sku
+            WHERE f.sku = ?""",
             (normalized,),
         ).fetchone()
         if not row:
             raise HTTPException(404, "SKU尚未绑定首次货件")
-        conn.execute(
-            """UPDATE sku_first_shipments
-            SET arrival_date = ?, updated_at = ?
-            WHERE sku = ?""",
-            (arrival_date, _now_iso(), normalized),
-        )
-        _touch_revision(conn)
+        if row["arrival_date"] != arrival_date:
+            conn.execute(
+                """UPDATE sku_first_shipments
+                SET arrival_date = ?, updated_at = ?
+                WHERE sku = ?""",
+                (arrival_date, _now_iso(), normalized),
+            )
+            _touch_revision(conn)
+        batch_no = str(row["batch_no"]) if row["batch_no"] else None
+        summary_rows = _all_batch_rows(conn, {batch_no}) if batch_no else []
+        summary = summary_rows[0] if summary_rows else None
     return {
         "sku": normalized,
         "arrived": bool(arrival_date),
         "arrival_date": arrival_date,
+        "batch": summary,
+        "updated_at": batch_monitor_revision(),
     }
 
 

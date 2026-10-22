@@ -38,5 +38,8 @@ describe('navigation registry', () => {
     expect(searchForRoute('config:store_config')).toBe('?page=config&config_tab=store_config');
     expect(ancestorKeysForRoute('slow-moving:promotion')).toEqual(['slow-moving']);
     expect(topLevelLabelForRoute('department:commission')).toBe('部门监控');
+    expect(routeLeafForSearch('?page=department').label).toBe('业绩监控（统计报表）');
+    expect(routeLeafForSearch('?page=department&tab=commission').label).toBe('提成监控（业绩报表）');
+    expect(routeLeafForSearch('?page=department&tab=assessment').label).toBe('考核监控（业绩报表）');
   });
 });

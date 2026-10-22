@@ -1,10 +1,13 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
-import { Alert, Button, Card, Input, InputNumber, Pagination, Select, Skeleton, Space, Statistic, Table, Tabs, Typography } from 'antd';
-import { DownloadOutlined, FilterOutlined, ReloadOutlined } from '@ant-design/icons';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { FORECAST_ASSESSMENT_COLUMN, useDepartmentRatio, withForecastAssessment } from './departmentRatio';
+import { Alert, Button, Card, Input, InputNumber, Pagination, Skeleton, Space, Statistic, Table, Typography } from 'antd';
+import { DownloadOutlined, ReloadOutlined } from '@ant-design/icons';
 import type { TableProps } from 'antd';
-import { api, type DepartmentAssessmentPayload, type DashboardChartSeries, type DashboardPayload, type DashboardSection } from './api';
+import { api, type DepartmentAssessmentPayload, type DepartmentCommissionConfigDetails, type DepartmentCommissionConfigPayload, type DashboardChartSeries, type DashboardPayload, type DashboardSection } from './api';
 import { feedbackMessage as message, downloadBlobWithFeedback, downloadWithFeedback } from './feedback';
 import { DashboardDecisionMatrix, dashboardMatrixKind } from './DashboardDecisionMatrices';
+import FilterActions from './FilterActions';
+import ConfirmFilterSelect from './ConfirmFilterSelect';
 
 const pageDescriptions: Record<string, string> = {
   overview: '销售、利润、提成与经营指标总览', sales: '按店铺、产品等级和日期对比分析销量与库存',
@@ -65,7 +68,7 @@ function columnKeys(section: DashboardSection) {
   return section.columns.map(column => column.key);
 }
 
-function exportSection(section: DashboardSection) {
+export function exportSection(section: DashboardSection) {
   const escape = (value: unknown) => `"${String(value ?? '').replaceAll('"', '""')}"`;
   const csv = `\ufeff${section.columns.map(column => escape(column.label)).join(',')}\n${section.rows.map(row => section.columns.map(column => escape(row[column.key])).join(',')).join('\n')}`;
   downloadBlobWithFeedback(new Blob([csv], { type: 'text/csv;charset=utf-8' }), `${section.title}.csv`, section.title);
@@ -102,6 +105,7 @@ function StoreSalesCharts({ rows, xKey, yesterday, average }: { rows: Record<str
 }
 
 function performanceValue(column: string, value: unknown) {
+  if (value === null || value === undefined) return '';
   const numeric = Number(value);
   if (!Number.isFinite(numeric)) return '';
   if (column === '销售额贡献占比') return `${(numeric * 100).toLocaleString('zh-CN', { maximumFractionDigits: 2 })}%`;
@@ -117,8 +121,13 @@ function PerformanceOverviewImage({ section }: { section: DashboardSection }) {
   const keys = columnKeys(section);
   const labelColumn = keys.includes('店铺') ? '店铺' : keys.includes('部门') ? '部门' : '开发员';
   const fixedColumns = [labelColumn, '在售SKU数量', '库存总数', '占用资金', '销售额贡献占比', '近7天日均订单', '近7天日均销售额（元）', '预估本月销售额（元）'];
-  const fixedLabels = [[labelColumn], ['在售SKU数量'], ['库存总数'], ['占用资金', '（万）'], ['营业额', '贡献占比'], ['近7天', '日均订单'], ['近7天日均销售额', '（万）'], ['预估月度销售额', '（万）']];
-  const fixedWidths = [90, 105, 100, 110, 110, 110, 130, 135];
+  const fixedLabels = [[labelColumn], ['在售SKU数量'], ['库存总数'], ['占用资金'], ['营业额', '贡献占比'], ['近7天', '日均订单'], ['近7天日均', '销售额'], ['预估月度销售额', '（前移7天）']];
+  const fixedWidths = [85, 95, 95, 100, 95, 90, 105, 120];
+  if (labelColumn === '开发员' && keys.includes(FORECAST_ASSESSMENT_COLUMN)) {
+    fixedColumns.push(FORECAST_ASSESSMENT_COLUMN);
+    fixedLabels.push(['预估月度', '考核销售额', '（前移7天）']);
+    fixedWidths.push(125);
+  }
   const fixedPositions = fixedWidths.reduce<number[]>((values, value) => [...values, values[values.length - 1] + value], [0]).slice(0, -1);
   const fixedWidth = fixedWidths.reduce((sum, value) => sum + value, 0);
   const dateLabels = keys.filter(column => /^\d+月\d+日销量$/.test(column)).map(column => column.replace('销量', ''));
@@ -129,9 +138,9 @@ function PerformanceOverviewImage({ section }: { section: DashboardSection }) {
     <rect className="performance-image-bg" width={width} height={height} />
     <rect className="performance-image-title" width={width} height={titleHeight} /><text className="performance-image-title-text" x={width / 2} y="29" textAnchor="middle">{boardTitle}</text>
     <rect className="performance-image-header" y={titleHeight} width={width} height={dateHeaderHeight + subHeaderHeight} />
-    {fixedColumns.map((column, index) => <g key={column}><line className="performance-image-line" x1={fixedPositions[index]} x2={fixedPositions[index]} y1={titleHeight} y2={height} />{fixedLabels[index].map((line, lineIndex) => <text className="performance-compact-header-text" key={line} x={fixedPositions[index] + fixedWidths[index] / 2} y={fixedLabels[index].length === 1 ? titleHeight + 38 : titleHeight + 27 + lineIndex * 18} textAnchor="middle">{line}</text>)}</g>)}
-    {dateLabels.map((date, dateIndex) => { const x = fixedWidth + dateIndex * dailyWidth * 2; return <g key={date}><line className="performance-image-line" x1={x} x2={x} y1={titleHeight} y2={height} /><text className="performance-date-header-text" x={x + dailyWidth} y={titleHeight + 21} textAnchor="middle">{date}</text><line className="performance-image-line" x1={x} x2={x + dailyWidth * 2} y1={titleHeight + dateHeaderHeight} y2={titleHeight + dateHeaderHeight} /><line className="performance-image-line" x1={x + dailyWidth} x2={x + dailyWidth} y1={titleHeight + dateHeaderHeight} y2={height} /><text className="performance-sub-header-text" x={x + dailyWidth / 2} y={titleHeight + dateHeaderHeight + 21} textAnchor="middle">销量</text><text className="performance-sub-header-text" x={x + dailyWidth * 1.5} y={titleHeight + dateHeaderHeight + 16} textAnchor="middle">销售额</text><text className="performance-sub-header-unit" x={x + dailyWidth * 1.5} y={titleHeight + dateHeaderHeight + 28} textAnchor="middle">（万）</text></g>; })}
-    {section.rows.map((row, rowIndex) => { const y = headerHeight + rowIndex * rowHeight; const isTotal = String(row[labelColumn]) === '合计'; return <g key={rowIndex}><rect className={isTotal ? 'performance-image-row-highlight' : 'performance-image-row'} x="0" y={y} width={width} height={rowHeight} />{!isTotal && <><rect className="performance-image-share-cell" x={fixedPositions[4]} y={y} width={fixedWidths[4]} height={rowHeight} /><rect className="performance-image-key-cell" x={fixedPositions[5]} y={y} width={fixedWidths[5] + fixedWidths[6] + fixedWidths[7]} height={rowHeight} /></>}{fixedColumns.map((column, index) => <text className={isTotal ? 'performance-image-total-cell' : 'performance-compact-cell'} key={column} x={fixedPositions[index] + fixedWidths[index] / 2} y={y + 24} textAnchor="middle">{column === labelColumn ? String(row[column] ?? '') : performanceValue(column, row[column])}</text>)}{dateLabels.map((date, dateIndex) => { const x = fixedWidth + dateIndex * dailyWidth * 2; return <g key={date}><text className={isTotal ? 'performance-image-total-cell' : 'performance-compact-cell'} x={x + dailyWidth / 2} y={y + 24} textAnchor="middle">{performanceValue(`${date}销量`, row[`${date}销量`])}</text><text className={isTotal ? 'performance-image-total-cell' : 'performance-compact-cell'} x={x + dailyWidth * 1.5} y={y + 24} textAnchor="middle">{performanceValue(`${date}销售额（元）`, row[`${date}销售额（元）`])}</text></g>; })}<line className="performance-image-line" x1="0" x2={width} y1={y + rowHeight} y2={y + rowHeight} /></g>; })}
+    {fixedColumns.map((column, index) => <g key={column}><line className="performance-image-line" x1={fixedPositions[index]} x2={fixedPositions[index]} y1={titleHeight} y2={height} />{fixedLabels[index].map((line, lineIndex) => <text className="performance-compact-header-text" key={line} x={fixedPositions[index] + fixedWidths[index] / 2} y={titleHeight + 38 - (fixedLabels[index].length - 1) * 9 + lineIndex * 18} textAnchor="middle">{line}</text>)}</g>)}
+    {dateLabels.map((date, dateIndex) => { const x = fixedWidth + dateIndex * dailyWidth * 2; return <g key={date}><line className="performance-image-line" x1={x} x2={x} y1={titleHeight} y2={height} /><text className="performance-date-header-text" x={x + dailyWidth} y={titleHeight + 21} textAnchor="middle">{date}</text><line className="performance-image-line" x1={x} x2={x + dailyWidth * 2} y1={titleHeight + dateHeaderHeight} y2={titleHeight + dateHeaderHeight} /><line className="performance-image-line" x1={x + dailyWidth} x2={x + dailyWidth} y1={titleHeight + dateHeaderHeight} y2={height} /><text className="performance-sub-header-text" x={x + dailyWidth / 2} y={titleHeight + dateHeaderHeight + 21} textAnchor="middle">销量</text><text className="performance-sub-header-text" x={x + dailyWidth * 1.5} y={titleHeight + dateHeaderHeight + 21} textAnchor="middle">销售额</text></g>; })}
+    {section.rows.map((row, rowIndex) => { const y = headerHeight + rowIndex * rowHeight; const isTotal = String(row[labelColumn]) === '合计'; return <g key={rowIndex}><rect className={isTotal ? 'performance-image-row-highlight' : 'performance-image-row'} x="0" y={y} width={width} height={rowHeight} />{!isTotal && <><rect className="performance-image-share-cell" x={fixedPositions[4]} y={y} width={fixedWidths[4]} height={rowHeight} /><rect className="performance-image-key-cell" x={fixedPositions[5]} y={y} width={fixedWidths.slice(5).reduce((sum, value) => sum + value, 0)} height={rowHeight} /></>}{fixedColumns.map((column, index) => <text className={isTotal ? 'performance-image-total-cell' : 'performance-compact-cell'} key={column} x={fixedPositions[index] + fixedWidths[index] / 2} y={y + 24} textAnchor="middle">{column === labelColumn ? String(row[column] ?? '') : performanceValue(column, row[column])}</text>)}{dateLabels.map((date, dateIndex) => { const x = fixedWidth + dateIndex * dailyWidth * 2; return <g key={date}><text className={isTotal ? 'performance-image-total-cell' : 'performance-compact-cell'} x={x + dailyWidth / 2} y={y + 24} textAnchor="middle">{performanceValue(`${date}销量`, row[`${date}销量`])}</text><text className={isTotal ? 'performance-image-total-cell' : 'performance-compact-cell'} x={x + dailyWidth * 1.5} y={y + 24} textAnchor="middle">{performanceValue(`${date}销售额（元）`, row[`${date}销售额（元）`])}</text></g>; })}<line className="performance-image-line" x1="0" x2={width} y1={y + rowHeight} y2={y + rowHeight} /></g>; })}
     <line className="performance-image-line" x1="0" x2={width} y1={titleHeight} y2={titleHeight} /><line className="performance-image-line" x1="0" x2={width} y1={headerHeight} y2={headerHeight} /><rect className="performance-image-border" width={width} height={height} />
   </svg></div>;
 }
@@ -166,7 +175,7 @@ function sectionExportUrl(page: string, section: string, filters: Record<string,
   return `/api/dashboard/${encodeURIComponent(page)}/sections/${encodeURIComponent(section)}/export.csv${suffix ? `?${suffix}` : ''}`;
 }
 
-export function DashboardSectionCard({ initialSection, dashboardPage, filters, compactSales }: { initialSection: DashboardSection; dashboardPage: string; filters: Record<string, string>; compactSales: boolean }) {
+export function DashboardSectionCard({ initialSection, dashboardPage, filters, compactSales, commissionConfig, onCommissionSaved }: { initialSection: DashboardSection; dashboardPage: string; filters: Record<string, string>; compactSales: boolean; commissionConfig?: DepartmentCommissionConfigPayload; onCommissionSaved?: () => void }) {
   const performance = initialSection.title === '开发员业绩排行' || initialSection.title === '部门业绩' || initialSection.title === '店铺业绩排行';
   const remote = Boolean(initialSection.server_managed) && !performance;
   const matrixKind = dashboardMatrixKind(dashboardPage, initialSection.key);
@@ -175,6 +184,10 @@ export function DashboardSectionCard({ initialSection, dashboardPage, filters, c
   const [searchDraft, setSearchDraft] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+  const [expandedConfigRows, setExpandedConfigRows] = useState<string[]>([]);
+  const [commissionDrafts, setCommissionDrafts] = useState<Record<string, DepartmentCommissionConfigDetails>>({});
+  const [commissionSaving, setCommissionSaving] = useState(false);
+  const [commissionSaveError, setCommissionSaveError] = useState('');
   const abortRef = useRef<AbortController | undefined>(undefined);
   const requestRef = useRef(0);
 
@@ -183,6 +196,7 @@ export function DashboardSectionCard({ initialSection, dashboardPage, filters, c
     setSection(initialSection);
     setQuery({ page: initialSection.page || 1, pageSize: initialSection.page_size || 50, search: '' });
     setSearchDraft(''); setLoading(false); setError('');
+    setExpandedConfigRows([]); setCommissionDrafts({}); setCommissionSaveError('');
   }, [initialSection]);
   useEffect(() => () => abortRef.current?.abort(), []);
 
@@ -207,6 +221,83 @@ export function DashboardSectionCard({ initialSection, dashboardPage, filters, c
     }
   };
 
+
+  const isCommission = dashboardPage === 'department' && section.key === 'commission';
+  const commissionDetailFor = (row: Record<string, unknown>) => {
+    const person = String(row.人员 || '');
+    return person && person !== '合计' ? commissionConfig?.details[person] : undefined;
+  };
+  const cloneCommissionDetail = (detail: DepartmentCommissionConfigDetails) =>
+    JSON.parse(JSON.stringify(detail)) as DepartmentCommissionConfigDetails;
+  const handleCommissionExpand = (expanded: boolean, row: Record<string, unknown>) => {
+    const person = String(row.人员 || '');
+    const detail = commissionDetailFor(row);
+    if (!person || !detail) return;
+    setExpandedConfigRows(current => expanded ? [...current.filter(key => key !== person), person] : current.filter(key => key !== person));
+    if (expanded) setCommissionDrafts(current => current[person] ? current : { ...current, [person]: cloneCommissionDetail(detail) });
+  };
+  const updateCommissionDraft = (person: string, updater: (detail: DepartmentCommissionConfigDetails) => DepartmentCommissionConfigDetails) => {
+    setCommissionDrafts(current => {
+      const detail = current[person] || commissionConfig?.details[person];
+      return detail ? { ...current, [person]: updater(cloneCommissionDetail(detail)) } : current;
+    });
+  };
+  const saveCommissionDraft = async (person: string) => {
+    const detail = commissionDrafts[person];
+    if (!detail || !commissionConfig?.month) return;
+    setCommissionSaving(true); setCommissionSaveError('');
+    try {
+      await api.saveDepartmentCommissionConfig({
+        month: commissionConfig.month,
+        commission_rows: detail.开发员配置.map(row => ({
+          月份: row.月份, 开发员: row.开发员, 库存计提: row.库存计提 ?? '', 弃置: row.弃置 ?? '', 职位提点: row.职位提点 ?? '',
+        })),
+        department_fee_rows: detail.部门费用率.map(row => ({
+          月份: row.月份, 部门: row.部门, 费用率: row.费用率 ?? '',
+        })),
+      });
+      message.success('提成配置已保存'); onCommissionSaved?.();
+    } catch (saveError) {
+      const text = saveError instanceof Error ? saveError.message : '提成配置保存失败';
+      setCommissionSaveError(text); message.error(text);
+    } finally {
+      setCommissionSaving(false);
+    }
+  };
+  const renderCommissionConfig = (row: Record<string, unknown>) => {
+    const person = String(row.人员 || '');
+    const originalDetail = commissionDetailFor(row);
+    const detail = commissionDrafts[person] || originalDetail;
+    if (!detail || !originalDetail) return null;
+    const numericInput = (
+      value: number | string | null,
+      onChange: (value: number | null) => void,
+      rate = false,
+    ) => <InputNumber size="small" value={value === null || value === '' ? undefined : Number(value)} min={rate ? 0 : undefined} max={rate ? 1 : undefined} step={rate ? 0.01 : 1} precision={rate ? 4 : 2} onChange={onChange} style={{ width: 112 }} />;
+    return <div className="commission-config-editor">
+      <div className="commission-config-editor-title">配置明细 · {person}</div>
+      <div className="commission-config-grid commission-config-grid-header"><span>原始开发员</span><span>库存计提</span><span>弃置</span><span>职位提点</span><span>缺失项</span></div>
+      {detail.开发员配置.map((item, index) => <div className="commission-config-grid" key={`developer-${item.月份}-${item.开发员}`}>
+        <span title={item.开发员}>{item.开发员 || '未分配开发员'}</span>
+        {(['库存计提', '弃置', '职位提点'] as const).map(field => <span key={field}>{numericInput(item[field], value => updateCommissionDraft(person, next => ({ ...next, 开发员配置: next.开发员配置.map((entry, entryIndex) => entryIndex === index ? { ...entry, [field]: value } : entry) })), field === '职位提点')}</span>)}
+        <span className={item.缺失字段.length ? 'commission-config-missing' : ''}>{item.无需配置 ? '无需配置' : item.缺失字段.length ? item.缺失字段.join('、') : '已配置'}</span>
+      </div>)}
+      <div className="commission-config-grid commission-config-grid-header"><span>部门</span><span>费用率</span><span>缺失项</span><span /><span /></div>
+      {detail.部门费用率.map((item, index) => <div className="commission-config-grid commission-config-fee-grid" key={`fee-${item.月份}-${item.部门}`}>
+        <span>{item.部门}</span>
+        <span>{numericInput(item.费用率, value => updateCommissionDraft(person, next => ({ ...next, 部门费用率: next.部门费用率.map((entry, entryIndex) => entryIndex === index ? { ...entry, 费用率: value } : entry) })), true)}</span>
+        <span className={item.缺失字段.length ? 'commission-config-missing' : ''}>{item.无需配置 ? '无需配置' : item.缺失字段.length ? item.缺失字段.join('、') : '已配置'}</span><span /><span />
+      </div>)}
+      <div className="commission-config-editor-actions"><Button size="small" onClick={() => setCommissionDrafts(current => ({ ...current, [person]: cloneCommissionDetail(originalDetail) }))}>取消修改</Button><Button size="small" type="primary" loading={commissionSaving} onClick={() => void saveCommissionDraft(person)}>保存配置</Button>{commissionSaveError && <Typography.Text type="danger">{commissionSaveError}</Typography.Text>}</div>
+    </div>;
+  };
+  const commissionExpandable = isCommission && commissionConfig ? {
+    expandedRowKeys: expandedConfigRows,
+    onExpand: handleCommissionExpand,
+    expandedRowRender: renderCommissionConfig,
+    rowExpandable: (row: Record<string, unknown>) => String(row.人员 || '') !== '合计' && Boolean(commissionDetailFor(row)),
+  } : undefined;
+
   const tableColumns: TableProps<Record<string, unknown>>['columns'] = section.columns.map(column => ({
     title: displayLabel(column.label, column),
     dataIndex: column.key,
@@ -230,7 +321,7 @@ export function DashboardSectionCard({ initialSection, dashboardPage, filters, c
   } : { pageSize: compactSales ? 8 : 20, showSizeChanger: true, pageSizeOptions: [10, 20, 50, 100], showTotal: (total: number) => `共 ${total} 行` };
   const exportButton = remote
     ? <Button size="small" icon={<DownloadOutlined />} disabled={(section.total || 0) === 0} href={sectionExportUrl(dashboardPage, section.key, filters, query)} onClick={event => { event.preventDefault(); void downloadWithFeedback(sectionExportUrl(dashboardPage, section.key, filters, query), `${section.title}.csv`, section.title); }}>导出全部 CSV</Button>
-    : <Button size="small" icon={<DownloadOutlined />} disabled={!section.rows.length} onClick={() => exportSection(section)}>导出 CSV</Button>;
+    : <Button size="small" icon={<DownloadOutlined />} disabled={!section.rows.length} onClick={() => exportSection(section)}>导出筛选结果</Button>;
   const tableSummary = section.summary ? () => <Table.Summary.Row className="dashboard-summary-row">
     {section.columns.map((column, index) => <Table.Summary.Cell key={column.key} index={index}>
       <strong>{formattedValue(section.summary?.[column.key], column, column.label)}</strong>
@@ -271,20 +362,20 @@ export function DashboardSectionCard({ initialSection, dashboardPage, filters, c
     className={`dashboard-section dashboard-section-${section.key}`}
     title={section.title}
     extra={<Space wrap className="dashboard-section-actions">
-      {matrixKind && remote && <Select
-        aria-label={`${section.title}排序字段`}
-        size="small"
-        showSearch
+      {matrixKind && remote && <ConfirmFilterSelect
+        ariaLabel={`${section.title}排序字段`}
+        mode="single"
         value={query.sortBy || ''}
-        optionFilterProp="label"
-        onChange={value => changeMatrixSort(value || undefined)}
+        normalizeValue={value => value || undefined}
+        onConfirm={value => changeMatrixSort(value ? String(value) : undefined)}
         options={[
           { value: '', label: '默认排序' },
           ...section.columns
             .filter(column => column.sortable !== false)
             .map(column => ({ value: column.key, label: displayLabel(column.label, column) })),
         ]}
-        style={{ width: 180 }}
+        placeholder="默认排序"
+        style={{ width: 180, minWidth: 180 }}
       />}
       {matrixKind && remote && <Button
         size="small"
@@ -312,8 +403,11 @@ export function DashboardSectionCard({ initialSection, dashboardPage, filters, c
         : !loading && !section.rows.length ? <Typography.Text type="secondary">暂无数据</Typography.Text> : <>
         <MiniChart section={section} />
         <Table
-          rowKey={(row, index) => String(row._rowId || row.id || `${section.page || 1}-${index}-${Object.values(row).slice(0, 2).join('-')}`)}
+          rowKey={(row, index) => isCommission
+            ? String(row.人员 || `commission-${index}`)
+            : String(row._rowId || row.id || `${section.page || 1}-${index}-${Object.values(row).slice(0, 2).join('-')}`)}
           size="small" sticky loading={loading} columns={tableColumns} dataSource={section.rows}
+          expandable={commissionExpandable}
           pagination={pagination} onChange={handleTableChange}
           summary={tableSummary}
           scroll={{ x: 'max-content', y: section.key === 'stores' ? undefined : compactSales ? 250 : section.rows.length > 20 ? 520 : undefined }}
@@ -345,8 +439,10 @@ function filtersFromUrl() {
   return params;
 }
 
-function assessmentDeveloperFromSearch(search: string) {
-  return new URLSearchParams(search).get('developer')?.trim() || '';
+function assessmentDevelopersFromSearch(search: string) {
+  const params = new URLSearchParams(search);
+  const selected = params.get('developers') ?? params.get('developer') ?? '';
+  return Array.from(new Set(selected.split(',').map(value => value.trim()).filter(Boolean)));
 }
 
 function updateDashboardUrl(page: string, params: Record<string, string>) {
@@ -355,7 +451,6 @@ function updateDashboardUrl(page: string, params: Record<string, string>) {
   url.searchParams.set('page', page);
   Object.entries(params).forEach(([key, value]) => { if (value) url.searchParams.set(key, value); });
   window.history.pushState({}, '', url);
-  window.dispatchEvent(new Event('sales-dashboard-route-change'));
 }
 
 function updatedAtLabel(value: DashboardPayload['updated_at'] | null) {
@@ -364,23 +459,14 @@ function updatedAtLabel(value: DashboardPayload['updated_at'] | null) {
   return Number.isNaN(parsed.getTime()) ? String(value) : parsed.toLocaleString('zh-CN', { hour12: false });
 }
 
-const ASSESSMENT_RATIO_STORAGE_KEY = 'department-assessment-local-ratio';
-
-function readAssessmentRatio() {
-  try {
-    const stored = window.localStorage.getItem(ASSESSMENT_RATIO_STORAGE_KEY);
-    if (stored === null || stored.trim() === '') return 1;
-    const value = Number(stored);
-    return Number.isFinite(value) && value >= 0 && value <= 1 ? value : 1;
-  } catch {
-    return 1;
-  }
-}
-
 function assessmentAmount(value: unknown) {
   const numeric = Number(value);
   const amount = Number.isFinite(numeric) ? numeric : 0;
   return `${(amount / 10000).toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} 万`;
+}
+
+function assessmentMargin(grossProfit: number, sales: number) {
+  return !Number.isFinite(grossProfit) || !Number.isFinite(sales) || sales === 0 ? '-' : `${(grossProfit / sales * 100).toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}%`;
 }
 
 type AssessmentTableRow = {
@@ -388,33 +474,38 @@ type AssessmentTableRow = {
   开发员?: string;
   店铺?: string;
   销售额: number;
+  毛利润: number;
+  毛利率: number | null;
   中企销售额: number;
   本土销售额: number;
   children?: AssessmentTableRow[];
 };
 
-function DepartmentAssessmentView({ data, developerFilter, onDeveloperChange, onMonthChange }: { data: DepartmentAssessmentPayload; developerFilter: string; onDeveloperChange: (developer: string) => void; onMonthChange: (month: string) => void }) {
-  const [ratio, setRatio] = useState(readAssessmentRatio);
-  const [ratioError, setRatioError] = useState('');
-  const [selectedDeveloper, setSelectedDeveloper] = useState(developerFilter);
-  useEffect(() => setSelectedDeveloper(developerFilter), [developerFilter]);
-  useEffect(() => {
-    try { window.localStorage.setItem(ASSESSMENT_RATIO_STORAGE_KEY, String(ratio)); } catch { /* 本地存储不可用时仍保留本次输入。 */ }
-  }, [ratio]);
+function DepartmentAssessmentView({ data, developerFilter, onApplyFilters }: { data: DepartmentAssessmentPayload; developerFilter: string[]; onApplyFilters: (developers: string[], month: string) => void }) {
+  const { ratio, ratioError, onRatioChange } = useDepartmentRatio();
+  const [selectedDevelopers, setSelectedDevelopers] = useState(developerFilter);
+  const [selectedMonth, setSelectedMonth] = useState(data.selected_month);
+  useEffect(() => setSelectedDevelopers(developerFilter), [developerFilter.join(',')]);
+  useEffect(() => setSelectedMonth(data.selected_month), [data.selected_month]);
 
   const assessmentValue = (row: { 中企销售额: number; 本土销售额: number }) => row.中企销售额 + ratio * row.本土销售额;
-  const visibleSourceRows = selectedDeveloper ? data.rows.filter(row => row.开发员 === selectedDeveloper) : data.rows;
+  const visibleSourceRows = developerFilter.length ? data.rows.filter(row => developerFilter.includes(row.开发员)) : data.rows;
+  const developers = Array.from(new Set(data.rows.map(row => row.开发员))).sort((a, b) => a.localeCompare(b, 'zh-CN'));
   const rows: AssessmentTableRow[] = visibleSourceRows
     .map(row => ({
       key: `developer-${row.开发员}`,
       开发员: row.开发员,
       销售额: row.销售额,
+      毛利润: row.毛利润,
+      毛利率: row.毛利率,
       中企销售额: row.中企销售额,
       本土销售额: row.本土销售额,
       children: [...row.店铺明细].sort((left, right) => assessmentValue(right) - assessmentValue(left) || right.销售额 - left.销售额 || String(left.店铺).localeCompare(String(right.店铺), 'zh-CN')).map(store => ({
         key: `developer-${row.开发员}-store-${store.店铺}`,
         店铺: store.店铺,
         销售额: store.销售额,
+        毛利润: store.毛利润,
+        毛利率: store.毛利率,
         中企销售额: store.中企销售额,
         本土销售额: store.本土销售额,
       })),
@@ -422,32 +513,27 @@ function DepartmentAssessmentView({ data, developerFilter, onDeveloperChange, on
     .sort((left, right) => assessmentValue(right) - assessmentValue(left) || String(left.开发员).localeCompare(String(right.开发员), 'zh-CN'));
   const totals = rows.reduce((result, row) => ({
     销售额: result.销售额 + row.销售额,
+    毛利润: result.毛利润 + row.毛利润,
     中企销售额: result.中企销售额 + row.中企销售额,
     本土销售额: result.本土销售额 + row.本土销售额,
-  }), { 销售额: 0, 中企销售额: 0, 本土销售额: 0 });
+  }), { 销售额: 0, 毛利润: 0, 中企销售额: 0, 本土销售额: 0 });
   const columns: TableProps<AssessmentTableRow>['columns'] = [
     { title: '开发员 / 店铺', key: 'name', render: (_, row) => row.开发员 || row.店铺 || '未分配开发员' },
     { title: '销售额', key: '销售额', align: 'right', render: (_, row) => assessmentAmount(row.销售额) },
     { title: '中企销售额', key: '中企销售额', align: 'right', render: (_, row) => assessmentAmount(row.中企销售额) },
     { title: '本土销售额', key: '本土销售额', align: 'right', render: (_, row) => assessmentAmount(row.本土销售额) },
     { title: '考核销售额', key: '考核销售额', align: 'right', render: (_, row) => assessmentAmount(assessmentValue(row)) },
+    { title: '毛利率', key: '毛利率', align: 'right', render: (_, row) => assessmentMargin(row.毛利润, row.销售额) },
   ];
-  const onRatioChange = (value: number | null) => {
-    if (value === null || !Number.isFinite(value) || value < 0 || value > 1) {
-      setRatioError('请输入 0～1 之间的比例');
-      return;
-    }
-    setRatioError('');
-    setRatio(value);
-  };
   return <Card className="department-assessment-card" title={`${data.selected_month} 考核销售额`}>
     <Space wrap className="department-assessment-controls">
       <Typography.Text>统计月份</Typography.Text>
-      <Select aria-label="考核监控统计月份" value={data.selected_month} options={data.months.map(month => ({ value: month, label: month }))} onChange={onMonthChange} style={{ width: 150 }} />
+      <ConfirmFilterSelect ariaLabel="考核监控统计月份" mode="single" value={selectedMonth} options={data.months.map(month => ({ value: month, label: month }))} onConfirm={value => onApplyFilters(selectedDevelopers, String(value || data.months[data.months.length - 1] || data.selected_month))} placeholder="选择月份" style={{ width: 150 }} />
       <Typography.Text>开发员筛选</Typography.Text>
-      <Select aria-label="考核监控开发员筛选" allowClear showSearch optionFilterProp="label" value={selectedDeveloper || undefined} placeholder="全部开发员" options={Array.from(new Set(data.rows.map(row => row.开发员))).map(developer => ({ value: developer, label: developer }))} onChange={value => { const next = value || ''; setSelectedDeveloper(next); onDeveloperChange(next); }} style={{ width: 170 }} />
+      <ConfirmFilterSelect ariaLabel="考核监控开发员筛选" mode="multiple" value={selectedDevelopers} options={developers.map(developer => ({ value: developer, label: developer }))} onConfirm={value => onApplyFilters(Array.isArray(value) ? value.map(String) : [], selectedMonth)} placeholder="全部开发员" style={{ width: 220 }} />
+      <FilterActions onReset={() => onApplyFilters([], data.months[data.months.length - 1] || data.selected_month)} />
       <Typography.Text>本土业绩折扣比例 x</Typography.Text>
-      <InputNumber aria-label="本土业绩折扣比例" min={0} max={1} step={0.01} precision={2} value={ratio} onChange={onRatioChange} style={{ width: 120 }} />
+      <InputNumber aria-label="本土业绩折扣比例" step={0.01} value={ratio} onChange={onRatioChange} style={{ width: 120 }} />
       <Typography.Text type="secondary">考核销售额 = 中企销售额 + x × 本土销售额</Typography.Text>
       {ratioError && <Typography.Text type="danger">{ratioError}</Typography.Text>}
     </Space>
@@ -466,6 +552,7 @@ function DepartmentAssessmentView({ data, developerFilter, onDeveloperChange, on
         <Table.Summary.Cell index={2} align="right"><strong>{assessmentAmount(totals.中企销售额)}</strong></Table.Summary.Cell>
         <Table.Summary.Cell index={3} align="right"><strong>{assessmentAmount(totals.本土销售额)}</strong></Table.Summary.Cell>
         <Table.Summary.Cell index={4} align="right"><strong>{assessmentAmount(assessmentValue(totals))}</strong></Table.Summary.Cell>
+        <Table.Summary.Cell index={5} align="right"><strong>{assessmentMargin(totals.毛利润, totals.销售额)}</strong></Table.Summary.Cell>
       </Table.Summary.Row>}
     />}
   </Card>;
@@ -481,22 +568,24 @@ export default function DashboardPage({ page, active = true, routeVersion = 0, r
   const [error, setError] = useState('');
   const [selection, setSelection] = useState<Record<string, string | string[]>>({});
   const [appliedParams, setAppliedParams] = useState<Record<string, string>>({});
-  const [searchTerms, setSearchTerms] = useState<Record<string, string>>({});
   const [lastUpdated, setLastUpdated] = useState('');
   const [assessmentData, setAssessmentData] = useState<DepartmentAssessmentPayload>();
+  const { ratio, ratioError, onRatioChange } = useDepartmentRatio();
+  const performanceSections = useMemo(() => data?.sections.map(section => page === 'department' ? withForecastAssessment(section, ratio) : section), [data, page, ratio]);
   const [productTab, setProductTab] = useState<ProductManagementTab>(() => productManagementTabFromSearch(window.location.search));
   const [departmentTab, setDepartmentTab] = useState<DepartmentMonitoringTab>(() => departmentMonitoringTabFromSearch(window.location.search));
-  const [assessmentDeveloper, setAssessmentDeveloper] = useState(() => assessmentDeveloperFromSearch(window.location.search));
+  const [assessmentDeveloper, setAssessmentDeveloper] = useState<string[]>(() => assessmentDevelopersFromSearch(window.location.search));
   const abortRef = useRef<AbortController | undefined>(undefined);
   const requestRef = useRef(0);
   const seenRefreshVersion = useRef(refreshVersion);
   const seenRouteVersion = useRef(routeVersion);
 
-  const load = useCallback(async (params: Record<string, string>, targetDepartmentTab: DepartmentMonitoringTab = departmentTab) => {
+  const load = useCallback(async (params: Record<string, string>, requestedDepartmentTab?: DepartmentMonitoringTab, adoptSelection = false) => {
+    const targetDepartmentTab = requestedDepartmentTab || departmentMonitoringTabFromSearch(window.location.search);
     abortRef.current?.abort();
     const controller = new AbortController(); abortRef.current = controller;
     const requestId = ++requestRef.current;
-    setLoading(true); setError(''); setData(undefined); setAssessmentData(undefined);
+    setLoading(true); setError('');
     try {
       if (page === 'department' && targetDepartmentTab === 'assessment') {
         const result = await api.departmentAssessment(params.month, controller.signal);
@@ -505,10 +594,16 @@ export default function DashboardPage({ page, active = true, routeVersion = 0, r
         setLastUpdated(updatedAtLabel(result.updated_at));
         return true;
       }
-      const result = await api.dashboard(page, params, controller.signal);
+      const requestedTab = new URLSearchParams(window.location.search).get('tab') || '';
+      const view = page === 'products' ? productManagementTabFromSearch(window.location.search) : page === 'department' && requestedTab !== 'assessment' ? departmentMonitoringTabFromSearch(window.location.search) : '';
+      const result = await api.dashboard(page, view ? { ...params, view } : params, controller.signal);
       if (requestId !== requestRef.current) return;
-      const appliedSelection = selectionFromServer(result.selected);
-      setData(result); setSelection(appliedSelection); setAppliedParams(selectionParams(appliedSelection));
+      setData(result);
+      if (adoptSelection) {
+        const appliedSelection = selectionFromServer(result.selected);
+        setSelection(appliedSelection);
+        setAppliedParams(selectionParams(appliedSelection));
+      }
       setLastUpdated(updatedAtLabel(result.updated_at));
       return true;
     } catch (loadError) {
@@ -518,24 +613,24 @@ export default function DashboardPage({ page, active = true, routeVersion = 0, r
     } finally {
       if (requestId === requestRef.current) setLoading(false);
     }
-  }, [departmentTab, page]);
+  }, [page]);
 
-  useEffect(() => { void load(filtersFromUrl()); return () => abortRef.current?.abort(); }, [load]);
-  const manualRefresh = async () => { const refreshed = await load(departmentTab === 'assessment' ? { month: assessmentData?.selected_month || '' } : appliedParams); if (refreshed) message.success('数据已刷新'); else if (refreshed === false) message.error('数据刷新失败'); };
+  useEffect(() => { if (active && requestRef.current === 0) void load(filtersFromUrl(), departmentMonitoringTabFromSearch(window.location.search), true); return () => abortRef.current?.abort(); }, [active, load]);
+  const manualRefresh = async () => { const refreshed = await load(departmentTab === 'assessment' ? { month: assessmentData?.selected_month || '' } : appliedParams, departmentTab); if (refreshed) message.success('数据已刷新'); else if (refreshed === false) message.error('数据刷新失败'); };
   useEffect(() => {
     if (!active || seenRefreshVersion.current === refreshVersion) return;
     seenRefreshVersion.current = refreshVersion;
-    void load(appliedParams);
-  }, [active, appliedParams, load, refreshVersion]);
+    void load(departmentTab === 'assessment' ? { month: assessmentData?.selected_month || '' } : appliedParams, departmentTab);
+  }, [active, appliedParams, assessmentData?.selected_month, departmentTab, load, refreshVersion]);
   useEffect(() => {
     if (!active || seenRouteVersion.current === routeVersion) return;
     seenRouteVersion.current = routeVersion;
     if (page === 'products') setProductTab(productManagementTabFromSearch(window.location.search));
     if (page === 'department') {
       setDepartmentTab(departmentMonitoringTabFromSearch(window.location.search));
-      setAssessmentDeveloper(assessmentDeveloperFromSearch(window.location.search));
+      setAssessmentDeveloper(assessmentDevelopersFromSearch(window.location.search));
     }
-    void load(filtersFromUrl());
+    void load(filtersFromUrl(), departmentMonitoringTabFromSearch(window.location.search), true);
   }, [active, load, page, routeVersion]);
   useEffect(() => {
     const onPopState = () => {
@@ -544,71 +639,66 @@ export default function DashboardPage({ page, active = true, routeVersion = 0, r
         if (page === 'products') setProductTab(productManagementTabFromSearch(window.location.search));
         if (page === 'department') {
           setDepartmentTab(departmentMonitoringTabFromSearch(window.location.search));
-          setAssessmentDeveloper(assessmentDeveloperFromSearch(window.location.search));
+          setAssessmentDeveloper(assessmentDevelopersFromSearch(window.location.search));
         }
-        void load(filtersFromUrl());
+        void load(filtersFromUrl(), departmentMonitoringTabFromSearch(window.location.search), true);
       }
     };
     window.addEventListener('popstate', onPopState); return () => window.removeEventListener('popstate', onPopState);
   }, [active, load, page]);
 
-  const applyFilters = () => { const params = selectionParams(selection); updateDashboardUrl(page, params); void load(params); };
-  const changeProductTab = (value: string) => {
-    const next = value === 'low-margin' ? 'low-margin' : 'detail';
-    if (next === productTab) return;
-    const url = new URL(window.location.href);
-    url.searchParams.set('page', 'products');
-    url.searchParams.set('tab', next);
-    window.history.pushState({}, '', url);
-    window.dispatchEvent(new Event('sales-dashboard-route-change'));
-    setProductTab(next);
+  const confirmFilter = (key: string, value: string | string[] | number[] | number | undefined) => {
+    const nextSelection = { ...selection };
+    if (Array.isArray(value) ? value.length > 0 : value !== undefined && String(value) !== '') nextSelection[key] = Array.isArray(value) ? value.map(String) : String(value);
+    else delete nextSelection[key];
+    const params = selectionParams(nextSelection);
+    setSelection(nextSelection);
+    setAppliedParams(params);
+    updateDashboardUrl(page, params);
+    void load(params, departmentTab, true);
   };
-  const changeAssessmentMonth = (month: string) => {
+  const resetFilters = () => { setSelection({}); setAppliedParams({}); updateDashboardUrl(page, {}); void load({}, departmentTab, true); };
+  const applyAssessmentFilters = (developers: string[], month: string) => {
     const url = new URL(window.location.href);
     url.searchParams.set('page', 'department');
     url.searchParams.set('tab', 'assessment');
     url.searchParams.set('month', month);
-    if (assessmentDeveloper) url.searchParams.set('developer', assessmentDeveloper); else url.searchParams.delete('developer');
+    url.searchParams.delete('developer');
+    url.searchParams.delete('developers');
+    if (developers.length) url.searchParams.set('developers', developers.join(','));
     window.history.pushState({}, '', url);
-    window.dispatchEvent(new Event('sales-dashboard-route-change'));
-    void load({ month }, 'assessment');
+    const monthChanged = month !== assessmentData?.selected_month;
+    setAssessmentDeveloper(developers);
+    if (monthChanged) void load({ month }, 'assessment');
   };
-  const changeAssessmentDeveloper = (developer: string) => {
-    const url = new URL(window.location.href);
-    url.searchParams.set('page', 'department');
-    url.searchParams.set('tab', 'assessment');
-    if (developer) url.searchParams.set('developer', developer); else url.searchParams.delete('developer');
-    window.history.pushState({}, '', url);
-    window.dispatchEvent(new Event('sales-dashboard-route-change'));
-    setAssessmentDeveloper(developer);
-  };
-  const matchedOptions = (key: string, options: string[]) => { const keyword = (searchTerms[key] || '').trim().toLocaleLowerCase(); return keyword ? options.filter(value => value.toLocaleLowerCase().includes(keyword)) : options; };
-  const selectMatchedOptions = (key: string, options: string[]) => setSelection(current => ({ ...current, [key]: Array.from(new Set([...(Array.isArray(current[key]) ? current[key] : []), ...matchedOptions(key, options)])) }));
-  const multiFilter = (key: string, options: string[] | undefined, placeholder: string, width: number) => options ? <Select
-    allowClear mode="multiple" showSearch maxTagCount="responsive" value={(selection[key] as string[]) || []}
-    onChange={value => setSelection(current => ({ ...current, [key]: value }))}
-    onSearch={value => setSearchTerms(current => ({ ...current, [key]: value }))}
-    placeholder={placeholder} options={options.map(value => ({ value, label: value }))}
-    dropdownRender={menu => <><Button block type="text" disabled={!matchedOptions(key, options).length} onMouseDown={event => event.preventDefault()} onClick={() => selectMatchedOptions(key, options)}>全选当前搜索结果（{matchedOptions(key, options).length}）</Button>{menu}</>}
+  const multiFilter = (key: string, options: string[] | undefined, placeholder: string, width: number) => options ? <ConfirmFilterSelect
+    mode="multiple"
+    ariaLabel={key === 'developers' ? '开发员' : placeholder.replace(/^选择/, '')}
+    value={(selection[key] as string[]) || []}
+    onConfirm={value => confirmFilter(key, Array.isArray(value) ? value.map(String) : [])}
+    placeholder={placeholder === '选择开发员' ? '全部开发员' : placeholder.replace(/^选择/, '全部')}
+    options={options.map(value => ({ value, label: value }))}
     style={{ minWidth: width }}
   /> : null;
   const showDepartmentFilters = page !== 'department' || departmentTab === 'commission';
   const filterControls = data && showDepartmentFilters ? <Space wrap>
     {multiFilter('developers', data.filters.developers, '选择开发员', 260)}
-    {data.filters.months && (page === 'overview' ? multiFilter('months', data.filters.months, '选择月份', 210) : <Select allowClear value={selection.month as string || undefined} onChange={value => setSelection(current => ({ ...current, month: value || '' }))} placeholder="选择月份" options={data.filters.months.map(value => ({ value, label: value }))} style={{ minWidth: 150 }} />)}
+    {data.filters.months && (page === 'overview' ? multiFilter('months', data.filters.months, '选择月份', 210) : <ConfirmFilterSelect mode="single" ariaLabel="月份" value={selection.month as string || undefined} onConfirm={value => confirmFilter('month', value === undefined ? undefined : String(value))} placeholder="选择月份" options={data.filters.months.map(value => ({ value, label: value }))} style={{ minWidth: 150 }} />)}
     {multiFilter('departments', data.filters.departments, '选择部门', 200)}
     {multiFilter('store_types', data.filters.store_types, '选择店铺类型', 180)}
-    {data.filters.thresholds && <Select allowClear value={selection.threshold as string || undefined} onChange={value => setSelection(current => ({ ...current, threshold: value || '' }))} placeholder="选择库龄" options={data.filters.thresholds.map(value => ({ value, label: value }))} style={{ minWidth: 150 }} />}
-    <Button type="primary" loading={loading} icon={<FilterOutlined />} onClick={applyFilters}>应用筛选</Button>
+    {data.filters.thresholds && <ConfirmFilterSelect mode="single" ariaLabel="库龄" value={selection.threshold as string || undefined} onConfirm={value => confirmFilter('threshold', value === undefined ? undefined : String(value))} placeholder="选择库龄" options={data.filters.thresholds.map(value => ({ value, label: value }))} style={{ minWidth: 150 }} />}
+    <FilterActions onReset={resetFilters} />
   </Space> : null;
   const compactSales = page === 'sales';
-  const sectionCards = data?.sections.map(section => (
+  const sectionCards = performanceSections?.map(section => (
     <DashboardSectionCard
       key={section.key}
       initialSection={section}
       dashboardPage={page}
-      filters={appliedParams}
+      filters={{ ...appliedParams, ...((page === 'products' || page === 'department') && departmentTab !== 'assessment' ? { view: page === 'products' ? productTab : departmentTab } : {}) }}
       compactSales={compactSales}
+      commissionConfig={page === 'department' ? data?.commission_config : undefined}
+      onCommissionSaved={page === 'department' ? () => { void load(appliedParams, 'commission'); } : undefined}
     />
   ));
   const visibleSections = page === 'products'
@@ -637,19 +727,16 @@ export default function DashboardPage({ page, active = true, routeVersion = 0, r
     : sectionCards;
 
   return <div className={`dashboard-page dashboard-page-${page}`}>
-    {page === 'products' && <Tabs
-      className="product-management-tabs"
-      activeKey={productTab}
-      onChange={changeProductTab}
-      items={[
-        { key: 'detail', label: '产品管理明细' },
-        { key: 'low-margin', label: '低毛利率 SKU' },
-      ]}
-    />}
-    <div className="page-heading"><div><Typography.Title level={2}>{assessmentData?.title || data?.title || '数据看板'}</Typography.Title><Typography.Text type="secondary">{pageDescriptions[page]}{lastUpdated && ` · 数据更新时间 ${lastUpdated}`}</Typography.Text></div><Button loading={loading} icon={<ReloadOutlined />} onClick={() => void manualRefresh()}>刷新</Button></div>
-    {error && <Alert className="persistent-page-error" type="error" showIcon message="看板加载失败" description={error} action={<Button size="small" onClick={() => void load(filtersFromUrl())}>重试</Button>} />}
-    {loading ? <DashboardSkeleton /> : departmentTab === 'assessment' && assessmentData ? <DepartmentAssessmentView data={assessmentData} developerFilter={assessmentDeveloper} onDeveloperChange={changeAssessmentDeveloper} onMonthChange={changeAssessmentMonth} /> : data ? <>
+    <div className="page-heading"><div><Typography.Title level={2}>{assessmentData?.title || data?.title || '数据看板'}</Typography.Title><Typography.Text type="secondary">{pageDescriptions[page]}{lastUpdated && ` · 数据更新时间 ${lastUpdated}`}{loading && (data || assessmentData) && ' · 正在更新'}</Typography.Text></div><Button loading={loading} icon={<ReloadOutlined />} onClick={() => void manualRefresh()}>刷新</Button></div>
+    {error && <Alert className="persistent-page-error" type="error" showIcon message="看板加载失败" description={error} action={<Button size="small" onClick={() => void load(filtersFromUrl(), departmentMonitoringTabFromSearch(window.location.search), true)}>重试</Button>} />}
+    {loading && !data && !assessmentData ? <DashboardSkeleton /> : departmentTab === 'assessment' && assessmentData ? <DepartmentAssessmentView data={assessmentData} developerFilter={assessmentDeveloper} onApplyFilters={applyAssessmentFilters} /> : data ? <>
       {filterControls && <Card className="filter-card">{filterControls}</Card>}
+      {page === 'department' && departmentTab === 'performance' && <Card className="filter-card"><Space wrap>
+        <Typography.Text>本土业绩折扣比例 x</Typography.Text>
+        <InputNumber aria-label="本土业绩折扣比例" step={0.01} value={ratio} onChange={onRatioChange} style={{ width: 120 }} />
+        <Typography.Text type="secondary">预估考核销售额 = 中企原始预估 × 0.8 + 本土原始预估 × x</Typography.Text>
+        {ratioError && <Typography.Text type="danger">{ratioError}</Typography.Text>}
+      </Space></Card>}
       {data.warnings?.length && (page !== 'department' || departmentTab === 'performance') ? <Alert className="dashboard-warning" type="warning" showIcon message="数据质量提醒" description={<ul>{data.warnings.map((warning, index) => <li key={`${warning}-${index}`}>{warning}</li>)}</ul>} /> : null}
       {!data.has_data && <Alert type="info" showIcon message={data.message || '当前没有可展示的数据'} />}
       {data.metrics?.length ? <div className="metric-grid">{data.metrics.map(item => <Card key={item.name}><Statistic title={displayLabel(item.name, item)} value={formattedValue(item.value, item, item.name)} /></Card>)}</div> : null}

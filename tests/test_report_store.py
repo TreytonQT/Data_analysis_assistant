@@ -6,18 +6,22 @@ from unittest.mock import patch
 
 from dashboard.report_store import (
     delete_upload_record,
+    department_sales_amount_history_path,
     get_latest_source_path,
     get_operational_sales_source_path,
     load_latest_source_record,
+    load_department_sales_amount_history,
     load_operational_sales_source_record,
     load_reports_from_records,
     load_upload_records,
     normalize_uploaded_report_month,
     persist_latest_source,
+    persist_sales_amount_detail_source,
     persist_operational_sales_source,
     persist_uploaded_reports,
     validate_report_month,
 )
+from dashboard.data_processing import normalize_sales_amount_detail, read_csv_bytes
 
 
 class FakeUpload:
@@ -96,6 +100,59 @@ class ReportStoreTests(unittest.TestCase):
         self.assertEqual(source_path, latest_path)
         self.assertFalse((data_dir / "sources" / "operational_sales.xlsx").exists())
         self.assertEqual(latest_path.read_bytes(), b"new-data")
+
+    def amount_detail_csv(self, day_values: dict[str, int]) -> str:
+        columns = ",".join(day_values)
+        values = ",".join(str(value) for value in day_values.values())
+        return f"msku,店铺,开发专员,{columns}\nSKU,6-ZXU 德国,运营六部-甲,{values}\nSKU,6-ZXU 德国,运营六部-甲,{values}\n"
+
+    def test_sales_amount_detail_history_replaces_overlapping_dates_and_keeps_old_dates(self):
+        data_dir = self.temporary_data_dir()
+        first = FakeUpload("amount.csv", self.amount_detail_csv({"09-02销售额": 10, "09-01销售额": 5}))
+        persist_sales_amount_detail_source(
+            first,
+            normalize_sales_amount_detail(read_csv_bytes(first.getvalue())),
+            data_dir=data_dir,
+            reference_date="2026-09-02",
+        )
+        second = FakeUpload("amount.csv", self.amount_detail_csv({"09-03销售额": 30, "09-02销售额": 20}))
+        persist_sales_amount_detail_source(
+            second,
+            normalize_sales_amount_detail(read_csv_bytes(second.getvalue())),
+            data_dir=data_dir,
+            reference_date="2026-09-03",
+        )
+
+        history = load_department_sales_amount_history(data_dir)
+        by_date = history.set_index("日期")["销售额（元）"]
+        self.assertEqual(sorted(by_date.index.astype(str).tolist()), ["2026-09-01", "2026-09-02", "2026-09-03"])
+        self.assertEqual(by_date.loc["2026-09-01"], 5)
+        self.assertEqual(by_date.loc["2026-09-02"], 20)
+        self.assertEqual(by_date.loc["2026-09-03"], 30)
+        self.assertTrue(department_sales_amount_history_path(data_dir).exists())
+
+    def test_sales_amount_detail_history_write_failure_restores_previous_source_and_history(self):
+        data_dir = self.temporary_data_dir()
+        first = FakeUpload("amount.csv", self.amount_detail_csv({"09-02销售额": 10, "09-01销售额": 5}))
+        persist_sales_amount_detail_source(
+            first,
+            normalize_sales_amount_detail(read_csv_bytes(first.getvalue())),
+            data_dir=data_dir,
+            reference_date="2026-09-02",
+        )
+        old_source = get_latest_source_path("sales_amount_detail", data_dir).read_bytes()
+        old_history = department_sales_amount_history_path(data_dir).read_bytes()
+        second = FakeUpload("amount.csv", self.amount_detail_csv({"09-03销售额": 30, "09-02销售额": 20}))
+        with patch("dashboard.report_store._atomic_write_frame", side_effect=[None, OSError("history failed")]):
+            with self.assertRaises(OSError):
+                persist_sales_amount_detail_source(
+                    second,
+                    normalize_sales_amount_detail(read_csv_bytes(second.getvalue())),
+                    data_dir=data_dir,
+                    reference_date="2026-09-03",
+                )
+        self.assertEqual(get_latest_source_path("sales_amount_detail", data_dir).read_bytes(), old_source)
+        self.assertEqual(department_sales_amount_history_path(data_dir).read_bytes(), old_history)
 
     def test_generic_latest_source_keeps_latest_upload_only(self):
         data_dir = self.temporary_data_dir()
