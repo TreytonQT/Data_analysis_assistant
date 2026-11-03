@@ -1,14 +1,22 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { FORECAST_ASSESSMENT_COLUMN, useDepartmentRatio, withForecastAssessment } from './departmentRatio';
-import { Alert, Button, Card, Input, InputNumber, Pagination, Skeleton, Space, Statistic, Table, Typography } from 'antd';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { Alert, Button, Card, Input, InputNumber, Pagination, Skeleton, Space, Table, Typography } from 'antd';
 import { DownloadOutlined, ReloadOutlined } from '@ant-design/icons';
 import type { TableProps } from 'antd';
+
+import type { PageLifecycleProps } from './pageLifecycle';
+import { formatAmountInWan as amountInWan } from './formatters';
+import { SectionEmpty } from './components/PageState';
+import MetricCard from './components/MetricCard';
+import PageHeading from './components/PageHeading';
+import ChartAxisTooltip, { useChartAxisTooltip } from './components/ChartAxisTooltip';
+import type { PageKey } from './navigation';
+import { FORECAST_ASSESSMENT_COLUMN, useDepartmentRatio, withForecastAssessment } from './departmentRatio';
 import { api, type DepartmentAssessmentPayload, type DepartmentCommissionConfigDetails, type DepartmentCommissionConfigPayload, type DashboardChartSeries, type DashboardPayload, type DashboardSection } from './api';
 import { feedbackMessage as message, downloadBlobWithFeedback, downloadWithFeedback } from './feedback';
 import { DashboardDecisionMatrix, dashboardMatrixKind } from './DashboardDecisionMatrices';
 import FilterActions from './FilterActions';
 import ConfirmFilterSelect from './ConfirmFilterSelect';
-
+import OverviewBoard from './OverviewBoard';
 const pageDescriptions: Record<string, string> = {
   overview: '销售、利润、提成与经营指标总览', sales: '按店铺、产品等级和日期对比分析销量与库存',
   'slow-moving': '识别高库龄库存、占用资金、库存计提与弃置费', products: '汇总产品销量、库存、毛利和 Rating',
@@ -41,10 +49,6 @@ function isAmountField(name = '', meta: ValueMeta = {}) {
   return ['金额', 'amount', 'currency'].includes(meta.format || '') || meta.type === 'currency' || ['元', '人民币元', '万', '万元'].includes(unit) || amountNamePattern.test(name);
 }
 
-function amountInWan(value: number) {
-  return (value / 10000).toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-}
-
 function displayLabel(name: string, meta: ValueMeta = {}) {
   if (!isAmountField(name, meta)) return name;
   return name.replace(/（元）|\(元\)/g, '（万）');
@@ -74,7 +78,7 @@ export function exportSection(section: DashboardSection) {
   downloadBlobWithFeedback(new Blob([csv], { type: 'text/csv;charset=utf-8' }), `${section.title}.csv`, section.title);
 }
 
-function MiniChart({ section }: { section: DashboardSection }) {
+function MiniChart({ section, responsive = false }: { section: DashboardSection; responsive?: boolean }) {
   if (!section.chart || !section.rows.length) return null;
   const chart = section.chart;
   const yesterday = chart.series.find(series => series.key === '昨日订单') || (columnKeys(section).includes('昨日订单') ? { key: '昨日订单', label: '昨日订单', format: 'integer' } : undefined);
@@ -84,7 +88,7 @@ function MiniChart({ section }: { section: DashboardSection }) {
   if (!series) return null;
   const rows = section.rows.slice(0, 15).filter(row => Number.isFinite(Number(row[series.key])));
   if (!rows.length) return null;
-  if (chart.kind === 'line') return <LineChart rows={rows} xKey={chart.x} series={series} />;
+  if (chart.kind === 'line') return <LineChart rows={rows} xKey={chart.x} series={series} responsive={responsive} />;
   const maximum = Math.max(...rows.map(row => Math.abs(Number(row[series.key]))), 1);
   return <div className="mini-chart">{rows.map((row, index) => <div className="mini-chart-row" key={`${String(row[chart.x])}-${index}`}><span title={String(row[chart.x])}>{String(row[chart.x])}</span><div><i style={{ width: `${Math.max(2, Math.abs(Number(row[series.key])) / maximum * 100)}%` }} /></div><b>{formattedValue(row[series.key], series, series.label || series.key)}</b></div>)}</div>;
 }
@@ -92,16 +96,30 @@ function MiniChart({ section }: { section: DashboardSection }) {
 function StoreSalesCharts({ rows, xKey, yesterday, average }: { rows: Record<string, unknown>[]; xKey: string; yesterday: DashboardChartSeries; average: DashboardChartSeries }) {
   const yesterdayKey = yesterday.key; const averageKey = average.key;
   const chartRows = rows.filter(row => Number.isFinite(Number(row[yesterdayKey])) || Number.isFinite(Number(row[averageKey])));
-  if (!chartRows.length) return <Typography.Text type="secondary">暂无店铺销量数据</Typography.Text>;
   const width = 1200; const height = 340; const left = 58; const right = 20; const top = 40; const bottom = 70;
   const yesterdayValues = chartRows.map(row => Number(row[yesterdayKey]) || 0); const averageValues = chartRows.map(row => Number(row[averageKey]) || 0);
   const maximum = Math.max(...yesterdayValues, ...averageValues, 1); const plotWidth = width - left - right; const plotHeight = height - top - bottom;
-  const step = plotWidth / chartRows.length; const barWidth = Math.max(4, Math.min(26, step * 0.32)); const groupGap = Math.max(2, Math.min(6, step * 0.06));
+  const step = plotWidth / Math.max(1, chartRows.length); const barWidth = Math.max(4, Math.min(26, step * 0.32)); const groupGap = Math.max(2, Math.min(6, step * 0.06));
   const ticks = Array.from({ length: 4 }, (_, index) => maximum * (3 - index) / 3);
-  return <div className="store-chart-grid"><section className="store-bar-chart"><div className="store-bar-chart-header"><div className="store-bar-chart-title">店铺销量对比</div><div className="store-chart-legend"><span><i className="store-chart-legend-yesterday" />{yesterday.label || yesterday.key}</span><span><i className="store-chart-legend-average" />{average.label || average.key}</span></div></div><svg viewBox={`0 0 ${width} ${height}`} role="img" aria-label="店铺销量分组柱状图">
+  const axis = useChartAxisTooltip({
+    points: chartRows.map((_, index) => ({ x: left + (index + .5) * step, y: top + (maximum - Math.max(yesterdayValues[index], averageValues[index])) / maximum * plotHeight })),
+    width, height, revision: rows,
+  });
+  const activeRow = axis.activeIndex === null ? null : chartRows[axis.activeIndex];
+  if (!chartRows.length) return <Typography.Text type="secondary">暂无店铺销量数据</Typography.Text>;
+  return <div className="store-chart-grid"><section className="store-bar-chart"><div className="store-bar-chart-header"><div className="store-bar-chart-title">店铺销量对比</div><div className="store-chart-legend"><span><i className="store-chart-legend-yesterday" />{yesterday.label || yesterday.key}</span><span><i className="store-chart-legend-average" />{average.label || average.key}</span></div></div><svg {...axis.svgProps} className="app-chart-interactive" viewBox={`0 0 ${width} ${height}`} role="img" aria-label="店铺销量分组柱状图">
     {ticks.map(value => { const y = top + (maximum - value) / maximum * plotHeight; return <g key={value}><line className="store-chart-gridline" x1={left} x2={width - right} y1={y} y2={y} /><text className="store-chart-axis" x={left - 8} y={y + 4} textAnchor="end">{formattedValue(value)}</text></g>; })}
-    {chartRows.map((row, index) => { const yesterdayValue = yesterdayValues[index]; const averageValue = averageValues[index]; const groupWidth = barWidth * 2 + groupGap; const groupX = left + index * step + (step - groupWidth) / 2; const baseline = top + plotHeight; const yesterdayHeight = yesterdayValue / maximum * plotHeight; const averageHeight = averageValue / maximum * plotHeight; const yesterdayY = baseline - yesterdayHeight; const averageY = baseline - averageHeight; return <g key={`${String(row[xKey])}-${index}`}><title>{`${String(row[xKey])}：${yesterday.label || yesterday.key} ${formattedValue(yesterdayValue, yesterday)}，${average.label || average.key} ${formattedValue(averageValue, average)}`}</title><rect className="store-chart-bar store-chart-bar-yesterday" x={groupX} y={yesterdayY} width={barWidth} height={Math.max(yesterdayValue ? 2 : 0, yesterdayHeight)} rx="2" /><rect className="store-chart-bar store-chart-bar-average" x={groupX + barWidth + groupGap} y={averageY} width={barWidth} height={Math.max(averageValue ? 2 : 0, averageHeight)} rx="2" /><text className="store-chart-value" x={groupX + barWidth / 2} y={Math.max(top + 11, yesterdayY - 6)} textAnchor="middle">{formattedValue(yesterdayValue, yesterday)}</text><text className="store-chart-value store-chart-value-average" x={groupX + barWidth + groupGap + barWidth / 2} y={Math.max(top + 11, averageY - 6)} textAnchor="middle">{formattedValue(averageValue, average)}</text><text className="store-chart-axis" x={left + index * step + step / 2} y={height - bottom + 18} textAnchor="end" transform={`rotate(-38 ${left + index * step + step / 2} ${height - bottom + 18})`}>{String(row[xKey])}</text></g>; })}
-  </svg></section></div>;
+    {chartRows.map((row, index) => { const yesterdayValue = yesterdayValues[index]; const averageValue = averageValues[index]; const groupWidth = barWidth * 2 + groupGap; const groupX = left + index * step + (step - groupWidth) / 2; const baseline = top + plotHeight; const yesterdayHeight = yesterdayValue / maximum * plotHeight; const averageHeight = averageValue / maximum * plotHeight; const yesterdayY = baseline - yesterdayHeight; const averageY = baseline - averageHeight; return <g key={`${String(row[xKey])}-${index}`}>
+      {axis.activeIndex === index && <rect className="app-chart-active-band" x={left + index * step} y={top} width={step} height={plotHeight} />}
+      <rect className="store-chart-bar store-chart-bar-yesterday" x={groupX} y={yesterdayY} width={barWidth} height={Math.max(yesterdayValue ? 2 : 0, yesterdayHeight)} rx="2" /><rect className="store-chart-bar store-chart-bar-average" x={groupX + barWidth + groupGap} y={averageY} width={barWidth} height={Math.max(averageValue ? 2 : 0, averageHeight)} rx="2" /><text className="store-chart-axis" x={left + index * step + step / 2} y={height - bottom + 18} textAnchor="end" transform={`rotate(-38 ${left + index * step + step / 2} ${height - bottom + 18})`}>{String(row[xKey])}</text></g>; })}
+    {axis.activeIndex !== null && <line className="app-chart-crosshair" x1={left + (axis.activeIndex + .5) * step} x2={left + (axis.activeIndex + .5) * step} y1={top} y2={height - bottom} data-index={axis.activeIndex} />}
+    <rect {...axis.hitAreaProps} className="app-chart-hit-area" aria-label="按店铺查看销量数据" x={left} y={top} width={plotWidth} height={plotHeight} />
+  </svg>
+    {activeRow && <ChartAxisTooltip id={axis.tooltipId} anchor={axis.anchor} title={String(activeRow[xKey])} items={[
+      { label: yesterday.label || yesterday.key, value: formattedValue(activeRow[yesterdayKey], yesterday), color: 'var(--app-color-primary)' },
+      { label: average.label || average.key, value: formattedValue(activeRow[averageKey], average), color: 'var(--app-color-negative)' },
+    ]} />}
+  </section></div>;
 }
 
 function performanceValue(column: string, value: unknown) {
@@ -145,20 +163,39 @@ function PerformanceOverviewImage({ section }: { section: DashboardSection }) {
   </svg></div>;
 }
 
-function LineChart({ rows, xKey, series }: { rows: Record<string, unknown>[]; xKey: string; series: DashboardChartSeries }) {
-  if (!rows.length) return null;
-  const width = 920; const height = 280; const left = 76; const right = 24; const top = 22; const bottom = 46;
+function LineChart({ rows, xKey, series, responsive = false }: { rows: Record<string, unknown>[]; xKey: string; series: DashboardChartSeries; responsive?: boolean }) {
+  const chartRef = useRef<HTMLDivElement>(null);
+  const [measuredWidth, setMeasuredWidth] = useState(920);
+  useLayoutEffect(() => {
+    const element = chartRef.current;
+    if (!responsive || !element) return;
+    const measure = () => setMeasuredWidth(Math.max(320, element.clientWidth));
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [responsive]);
+  const width = responsive ? measuredWidth : 920; const height = responsive ? 200 : 280; const left = 76; const right = 24; const top = 22; const bottom = 46;
   const values = rows.map(row => Number(row[series.key])); const minimum = Math.min(0, ...values); const maximum = Math.max(...values, 1); const range = maximum - minimum || 1;
   const plotWidth = width - left - right; const plotHeight = height - top - bottom;
   const point = (value: number, index: number) => ({ x: left + (rows.length === 1 ? plotWidth / 2 : index * plotWidth / (rows.length - 1)), y: top + (maximum - value) / range * plotHeight });
   const points = values.map(point); const path = points.map((item, index) => `${index ? 'L' : 'M'} ${item.x} ${item.y}`).join(' ');
   const ticks = Array.from({ length: 5 }, (_, index) => minimum + range * (4 - index) / 4);
-  return <div className="line-chart"><svg viewBox={`0 0 ${width} ${height}`} role="img" aria-label={`${series.label || series.key}月度趋势折线图`}>
+  const axis = useChartAxisTooltip({ points, width, height, revision: rows });
+  const activeRow = axis.activeIndex === null ? null : rows[axis.activeIndex];
+  if (!rows.length) return null;
+  return <div className="line-chart" ref={chartRef}><svg {...axis.svgProps} className="app-chart-interactive" viewBox={`0 0 ${width} ${height}`} role="img" aria-label={`${series.label || series.key}月度趋势折线图`}>
     {ticks.map(value => { const y = top + (maximum - value) / range * plotHeight; return <g key={value}><line className="line-chart-grid" x1={left} x2={width - right} y1={y} y2={y} /><text className="line-chart-axis" x={left - 12} y={y + 4} textAnchor="end">{formattedValue(value, series, series.label || series.key)}</text></g>; })}
     <line className="line-chart-axis-line" x1={left} x2={left} y1={top} y2={height - bottom} /><line className="line-chart-axis-line" x1={left} x2={width - right} y1={height - bottom} y2={height - bottom} />
     <path className="line-chart-path" d={path} />
-    {points.map((item, index) => <g key={`${String(rows[index][xKey])}-${index}`}><circle className="line-chart-point" cx={item.x} cy={item.y} r="4" /><text className="line-chart-value" x={item.x} y={item.y - 10} textAnchor="middle">{formattedValue(values[index], series, series.label || series.key)}</text><text className="line-chart-axis" x={item.x} y={height - 18} textAnchor="middle">{String(rows[index][xKey])}</text></g>)}
-  </svg></div>;
+    {points.map((item, index) => <g key={`${String(rows[index][xKey])}-${index}`}><circle className={`line-chart-point${axis.activeIndex === index ? ' is-active' : ''}`} cx={item.x} cy={item.y} r={axis.activeIndex === index ? 6 : 4} /><text className="line-chart-axis" x={item.x} y={height - 18} textAnchor="middle">{String(rows[index][xKey])}</text></g>)}
+    {axis.activeIndex !== null && <line className="app-chart-crosshair" x1={points[axis.activeIndex].x} x2={points[axis.activeIndex].x} y1={top} y2={height - bottom} data-index={axis.activeIndex} />}
+    <rect {...axis.hitAreaProps} className="app-chart-hit-area" aria-label="按横坐标查看趋势数据" x={left} y={top} width={plotWidth} height={plotHeight} />
+  </svg>
+    {activeRow && <ChartAxisTooltip id={axis.tooltipId} anchor={axis.anchor} title={String(activeRow[xKey])} items={[
+      { label: series.label || series.key, value: formattedValue(activeRow[series.key], series, series.label || series.key), color: 'var(--app-color-primary)' },
+    ]} />}
+  </div>;
 }
 
 function compareValues(left: unknown, right: unknown) {
@@ -298,11 +335,15 @@ export function DashboardSectionCard({ initialSection, dashboardPage, filters, c
     rowExpandable: (row: Record<string, unknown>) => String(row.人员 || '') !== '合计' && Boolean(commissionDetailFor(row)),
   } : undefined;
 
+  const rowKeys = new Map(section.rows.map((row, index) => [row, isCommission
+    ? String(row.人员 || `commission-${index}`)
+    : String(row._rowId || row.id || `${section.page || 1}-${index}-${Object.values(row).slice(0, 2).join('-')}`)]));
   const tableColumns: TableProps<Record<string, unknown>>['columns'] = section.columns.map(column => ({
     title: displayLabel(column.label, column),
     dataIndex: column.key,
     key: column.key,
     ellipsis: true,
+    align: column.type === 'string' || column.format === 'text' ? 'left' : 'right',
     render: value => formattedValue(value, column, column.label),
     sorter: remote ? column.sortable !== false : column.sortable === false ? undefined : (left, right) => compareValues(left[column.key], right[column.key]),
     sortOrder: query.sortBy === column.key && query.sortOrder ? query.sortOrder === 'asc' ? 'ascend' : 'descend' : undefined,
@@ -320,8 +361,8 @@ export function DashboardSectionCard({ initialSection, dashboardPage, filters, c
     showSizeChanger: true, pageSizeOptions: [10, 20, 50, 100, 200], showTotal: (total: number) => `共 ${total} 行`,
   } : { pageSize: compactSales ? 8 : 20, showSizeChanger: true, pageSizeOptions: [10, 20, 50, 100], showTotal: (total: number) => `共 ${total} 行` };
   const exportButton = remote
-    ? <Button size="small" icon={<DownloadOutlined />} disabled={(section.total || 0) === 0} href={sectionExportUrl(dashboardPage, section.key, filters, query)} onClick={event => { event.preventDefault(); void downloadWithFeedback(sectionExportUrl(dashboardPage, section.key, filters, query), `${section.title}.csv`, section.title); }}>导出全部 CSV</Button>
-    : <Button size="small" icon={<DownloadOutlined />} disabled={!section.rows.length} onClick={() => exportSection(section)}>导出筛选结果</Button>;
+    ? <Button icon={<DownloadOutlined />} disabled={(section.total || 0) === 0} href={sectionExportUrl(dashboardPage, section.key, filters, query)} onClick={event => { event.preventDefault(); void downloadWithFeedback(sectionExportUrl(dashboardPage, section.key, filters, query), `${section.title}.csv`, section.title); }}>导出筛选结果</Button>
+    : <Button icon={<DownloadOutlined />} disabled={!section.rows.length} onClick={() => exportSection(section)}>导出筛选结果</Button>;
   const tableSummary = section.summary ? () => <Table.Summary.Row className="dashboard-summary-row">
     {section.columns.map((column, index) => <Table.Summary.Cell key={column.key} index={index}>
       <strong>{formattedValue(section.summary?.[column.key], column, column.label)}</strong>
@@ -378,7 +419,6 @@ export function DashboardSectionCard({ initialSection, dashboardPage, filters, c
         style={{ width: 180, minWidth: 180 }}
       />}
       {matrixKind && remote && <Button
-        size="small"
         aria-label={`${section.title}排序方向`}
         disabled={!query.sortBy}
         onClick={toggleMatrixSortOrder}
@@ -395,17 +435,15 @@ export function DashboardSectionCard({ initialSection, dashboardPage, filters, c
         ? loading
           ? <div className="dashboard-matrix-loading"><Skeleton active paragraph={{ rows: 5 }} title={false} /></div>
           : !section.rows.length
-            ? <Typography.Text type="secondary">暂无数据</Typography.Text>
+            ? <SectionEmpty />
             : <>
               <DashboardDecisionMatrix kind={matrixKind} section={section} />
               {matrixPagination}
             </>
-        : !loading && !section.rows.length ? <Typography.Text type="secondary">暂无数据</Typography.Text> : <>
+        : !loading && !section.rows.length ? <SectionEmpty /> : <>
         <MiniChart section={section} />
         <Table
-          rowKey={(row, index) => isCommission
-            ? String(row.人员 || `commission-${index}`)
-            : String(row._rowId || row.id || `${section.page || 1}-${index}-${Object.values(row).slice(0, 2).join('-')}`)}
+          rowKey={row => rowKeys.get(row)!}
           size="small" sticky loading={loading} columns={tableColumns} dataSource={section.rows}
           expandable={commissionExpandable}
           pagination={pagination} onChange={handleTableChange}
@@ -462,7 +500,7 @@ function updatedAtLabel(value: DashboardPayload['updated_at'] | null) {
 function assessmentAmount(value: unknown) {
   const numeric = Number(value);
   const amount = Number.isFinite(numeric) ? numeric : 0;
-  return `${(amount / 10000).toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} 万`;
+  return `${amountInWan(amount)} 万`;
 }
 
 function assessmentMargin(grossProfit: number, sales: number) {
@@ -530,7 +568,7 @@ function DepartmentAssessmentView({ data, developerFilter, onApplyFilters }: { d
       <Typography.Text>统计月份</Typography.Text>
       <ConfirmFilterSelect ariaLabel="考核监控统计月份" mode="single" value={selectedMonth} options={data.months.map(month => ({ value: month, label: month }))} onConfirm={value => onApplyFilters(selectedDevelopers, String(value || data.months[data.months.length - 1] || data.selected_month))} placeholder="选择月份" style={{ width: 150 }} />
       <Typography.Text>开发员筛选</Typography.Text>
-      <ConfirmFilterSelect ariaLabel="考核监控开发员筛选" mode="multiple" value={selectedDevelopers} options={developers.map(developer => ({ value: developer, label: developer }))} onConfirm={value => onApplyFilters(Array.isArray(value) ? value.map(String) : [], selectedMonth)} placeholder="全部开发员" style={{ width: 220 }} />
+      <ConfirmFilterSelect ariaLabel="考核监控开发员筛选" selectionUnit="人" mode="multiple" value={selectedDevelopers} options={developers.map(developer => ({ value: developer, label: developer }))} onConfirm={value => onApplyFilters(Array.isArray(value) ? value.map(String) : [], selectedMonth)} placeholder="全部开发员" style={{ width: 220 }} />
       <FilterActions onReset={() => onApplyFilters([], data.months[data.months.length - 1] || data.selected_month)} />
       <Typography.Text>本土业绩折扣比例 x</Typography.Text>
       <InputNumber aria-label="本土业绩折扣比例" step={0.01} value={ratio} onChange={onRatioChange} style={{ width: 120 }} />
@@ -562,7 +600,7 @@ function DashboardSkeleton() {
   return <><Card className="filter-card"><Skeleton active paragraph={{ rows: 1 }} title={false} /></Card><div className="metric-grid">{Array.from({ length: 4 }, (_, index) => <Card key={index}><Skeleton active paragraph={{ rows: 1 }} /></Card>)}</div><Card className="dashboard-section"><Skeleton active paragraph={{ rows: 8 }} /></Card></>;
 }
 
-export default function DashboardPage({ page, active = true, routeVersion = 0, refreshVersion = 0 }: { page: string; active?: boolean; routeVersion?: number; refreshVersion?: number }) {
+export default function DashboardPage({ page, active = true, routeVersion = 0, refreshVersion = 0 }: PageLifecycleProps & { page: PageKey }) {
   const [data, setData] = useState<DashboardPayload>();
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
@@ -674,6 +712,7 @@ export default function DashboardPage({ page, active = true, routeVersion = 0, r
   const multiFilter = (key: string, options: string[] | undefined, placeholder: string, width: number) => options ? <ConfirmFilterSelect
     mode="multiple"
     ariaLabel={key === 'developers' ? '开发员' : placeholder.replace(/^选择/, '')}
+    selectionUnit={key === 'developers' ? '人' : '项'}
     value={(selection[key] as string[]) || []}
     onConfirm={value => confirmFilter(key, Array.isArray(value) ? value.map(String) : [])}
     placeholder={placeholder === '选择开发员' ? '全部开发员' : placeholder.replace(/^选择/, '全部')}
@@ -727,7 +766,7 @@ export default function DashboardPage({ page, active = true, routeVersion = 0, r
     : sectionCards;
 
   return <div className={`dashboard-page dashboard-page-${page}`}>
-    <div className="page-heading"><div><Typography.Title level={2}>{assessmentData?.title || data?.title || '数据看板'}</Typography.Title><Typography.Text type="secondary">{pageDescriptions[page]}{lastUpdated && ` · 数据更新时间 ${lastUpdated}`}{loading && (data || assessmentData) && ' · 正在更新'}</Typography.Text></div><Button loading={loading} icon={<ReloadOutlined />} onClick={() => void manualRefresh()}>刷新</Button></div>
+    <PageHeading title={assessmentData?.title || data?.title || '数据看板'} description={<>{pageDescriptions[page]}{lastUpdated && ` · 数据更新时间 ${lastUpdated}`}{loading && (data || assessmentData) && ' · 正在更新'}</>} density={compactSales ? 'compact' : 'default'} actions={<Button loading={loading} icon={<ReloadOutlined />} onClick={() => void manualRefresh()}>刷新</Button>} />
     {error && <Alert className="persistent-page-error" type="error" showIcon message="看板加载失败" description={error} action={<Button size="small" onClick={() => void load(filtersFromUrl(), departmentMonitoringTabFromSearch(window.location.search), true)}>重试</Button>} />}
     {loading && !data && !assessmentData ? <DashboardSkeleton /> : departmentTab === 'assessment' && assessmentData ? <DepartmentAssessmentView data={assessmentData} developerFilter={assessmentDeveloper} onApplyFilters={applyAssessmentFilters} /> : data ? <>
       {filterControls && <Card className="filter-card">{filterControls}</Card>}
@@ -739,8 +778,16 @@ export default function DashboardPage({ page, active = true, routeVersion = 0, r
       </Space></Card>}
       {data.warnings?.length && (page !== 'department' || departmentTab === 'performance') ? <Alert className="dashboard-warning" type="warning" showIcon message="数据质量提醒" description={<ul>{data.warnings.map((warning, index) => <li key={`${warning}-${index}`}>{warning}</li>)}</ul>} /> : null}
       {!data.has_data && <Alert type="info" showIcon message={data.message || '当前没有可展示的数据'} />}
-      {data.metrics?.length ? <div className="metric-grid">{data.metrics.map(item => <Card key={item.name}><Statistic title={displayLabel(item.name, item)} value={formattedValue(item.value, item, item.name)} /></Card>)}</div> : null}
-      <div className={compactSales ? 'sales-sections' : undefined}>{visibleSections}</div>
+      {page === 'overview' ? <OverviewBoard
+        metrics={data.metrics || []}
+        sections={performanceSections || []}
+        sectionCards={sectionCards || []}
+        renderMetric={item => <MetricCard variant="plain" key={item.name} title={displayLabel(item.name, item)} value={formattedValue(item.value, item, item.name)} />}
+        renderChart={section => <MiniChart section={section} responsive />}
+      /> : <>
+        {data.metrics?.length ? <div className="metric-grid">{data.metrics.map(item => <MetricCard key={item.name} title={displayLabel(item.name, item)} value={formattedValue(item.value, item, item.name)} />)}</div> : null}
+        <div className={compactSales ? 'sales-sections' : undefined}>{visibleSections}</div>
+      </>}
     </> : null}
   </div>;
 }

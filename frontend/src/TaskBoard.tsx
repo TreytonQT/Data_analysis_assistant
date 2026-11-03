@@ -1,11 +1,12 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import dayjs, { Dayjs } from 'dayjs';
-import { Alert, Badge, Button, Card, DatePicker, Form, Input, Modal, Select, Space, Spin, Tag, Typography, Upload } from 'antd';
-import { feedbackMessage as message, downloadWithFeedback } from './feedback';
+import { Alert, Badge, Button, Card, DatePicker, Form, Input, Select, Space, Spin, Tag, Typography, Upload } from 'antd';
 import { HolderOutlined, PlusOutlined, ReloadOutlined } from '@ant-design/icons';
 import type { UploadProps } from 'antd';
-import { api, type Status, type Task, type TaskInput } from './api';
 
+import MutationModal from './components/MutationModal';
+import { feedbackMessage as message, downloadWithFeedback } from './feedback';
+import { api, type Status, type Task, type TaskInput } from './api';
 const statusMeta: Record<Status, { label: string; color: string }> = {
   todo: { label: '待办', color: '#3b82f6' }, current: { label: '当前待办', color: '#fb7185' }, in_progress: { label: '进行中', color: '#f59e0b' }, snoozed: { label: '已搁置', color: '#94a3b8' }, completed: { label: '已完成', color: '#34c38f' },
 };
@@ -91,8 +92,8 @@ function TaskModal({ task, open, onClose, onSaved }: { task?: Task; open: boolea
     }
   };
 
-  return <Modal title={task ? '编辑任务' : '新建任务'} open={open} onCancel={cancel} onOk={submit} confirmLoading={saving} okText="保存" closable={!saving} maskClosable={!saving} keyboard={!saving} cancelButtonProps={{ disabled: saving }} destroyOnHidden>
-    <Form form={form} layout="vertical"><Form.Item name="title" label="任务标题" rules={[{ required: true, message: '请输入任务标题' }]}><Input autoFocus placeholder="例如：检查补货建议" /></Form.Item><Form.Item name="notes" label="备注"><Input.TextArea rows={4} placeholder="补充任务说明、链接或清单" /></Form.Item><Space size="large" wrap><Form.Item name="status" label="状态"><Select options={(Object.keys(statusMeta) as Status[]).map(value => ({ value, label: statusMeta[value].label }))} /></Form.Item><Form.Item name="remind_at" label="提醒时间"><DatePicker showTime /></Form.Item></Space><Space size="large" wrap>
+  return <MutationModal title={task ? '编辑任务' : '新建任务'} open={open} onCancel={cancel} onOk={submit} busy={saving} okText="保存" cancelButtonProps={{ disabled: saving }} destroyOnHidden>
+    <Form form={form} layout="vertical" disabled={saving}><Form.Item name="title" label="任务标题" rules={[{ required: true, message: '请输入任务标题' }]}><Input autoFocus placeholder="例如：检查补货建议" /></Form.Item><Form.Item name="notes" label="备注"><Input.TextArea rows={4} placeholder="补充任务说明、链接或清单" /></Form.Item><Space size="large" wrap><Form.Item name="status" label="状态"><Select options={(Object.keys(statusMeta) as Status[]).map(value => ({ value, label: statusMeta[value].label }))} /></Form.Item><Form.Item name="remind_at" label="提醒时间"><DatePicker showTime /></Form.Item></Space><Space size="large" wrap>
   <Form.Item name="recurrence_type" label="重复">
     <Select options={[['none', '不重复'], ['daily', '每天'], ['weekly', '每周'], ['monthly', '每月']].map(([value, label]) => ({ value, label }))} />
   </Form.Item>
@@ -111,7 +112,7 @@ function TaskModal({ task, open, onClose, onSaved }: { task?: Task; open: boolea
     }}
   </Form.Item>
 </Space></Form>
-  </Modal>;
+  </MutationModal>;
 }
 
 export default function TaskBoard({ active, onTasksChanged }: { active: boolean; onTasksChanged: () => Promise<void> | void }) {
@@ -195,6 +196,6 @@ export default function TaskBoard({ active, onTasksChanged }: { active: boolean;
       </section>;
     })}</div></Spin>
     <TaskModal open={modal.open} task={modal.task} onClose={() => setModal({ open: false })} onSaved={() => { void refresh(); }} />
-    <Modal title="确认删除待办？" open={Boolean(deleteCandidate)} onCancel={() => setDeleteCandidate(undefined)} onOk={confirmDelete} confirmLoading={deleting} okText="确认删除" okButtonProps={{ danger: true }} cancelText="取消">“{deleteCandidate?.title}”删除后无法恢复。</Modal>
+    <MutationModal title="确认删除待办？" open={Boolean(deleteCandidate)} onCancel={() => setDeleteCandidate(undefined)} onOk={confirmDelete} busy={deleting} okText="确认删除" okButtonProps={{ danger: true }} cancelText="取消">“{deleteCandidate?.title}”删除后无法恢复。</MutationModal>
   </>;
 }

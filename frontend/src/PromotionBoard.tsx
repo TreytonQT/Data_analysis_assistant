@@ -7,17 +7,14 @@ import {
   DatePicker,
   Form,
   Input,
-  Modal,
   Popconfirm,
   Skeleton,
   Space,
-  Statistic,
   Table,
   Tabs,
   Tag,
   Typography,
 } from 'antd';
-import { feedbackMessage as message, copyWithFeedback, downloadWithFeedback, writeClipboardText } from './feedback';
 import {
   CopyOutlined,
   DeleteOutlined,
@@ -28,6 +25,12 @@ import {
   TagsOutlined,
 } from '@ant-design/icons';
 import type { TableProps } from 'antd';
+
+import type { PageLifecycleProps } from './pageLifecycle';
+import MutationModal from './components/MutationModal';
+import MetricCard from './components/MetricCard';
+import PageHeading from './components/PageHeading';
+import { feedbackMessage as message, copyWithFeedback, downloadWithFeedback, writeClipboardText } from './feedback';
 import { PricingBatches, PricingHistory, PricingRegistration } from './PricingPanels';
 import FilterActions from './FilterActions';
 import ConfirmFilterSelect from './ConfirmFilterSelect';
@@ -45,7 +48,6 @@ import {
   type PromotionStatusFilter,
   type ListingObservation,
 } from './api';
-
 type ListQuery = {
   page: number;
   pageSize: number;
@@ -253,13 +255,13 @@ function PromotionOverviewPanel({ refreshToken, onRefresh }: { refreshToken: num
     {error && <Alert className="persistent-page-error" type="error" showIcon message="促销汇总加载失败" description={error} action={<Button size="small" onClick={() => setRetry(value => value + 1)}>重试</Button>} />}
     {data && <>
       <div className="promotion-metric-grid">
-        <Card><Statistic title="长期调价 SKU" value={formatNumber(data.adjusted_sku_count, 0)} suffix="个" /></Card>
-        <Card><Statistic title="两者同时生效 SKU" value={formatNumber(data.overlap_sku_count, 0)} suffix="个" /></Card>
-        <Card><Statistic title="正在限时促销 SKU" value={formatNumber(data.active_sku_count, 0)} suffix="个" /></Card>
-        <Card><Statistic title="7天日均销量合计" value={formatNumber(data.average_7d_total)} /></Card>
-        <Card><Statistic title="30天日均销量合计" value={formatNumber(data.average_30d_total)} /></Card>
-        <Card><Statistic title="近7天与近30天日均差合计" value={`${Number(data.daily_lift_total) > 0 ? '+' : ''}${formatNumber(data.daily_lift_total)}`} valueStyle={{ color: Number(data.daily_lift_total) < 0 ? '#ef4444' : '#16a34a' }} /></Card>
-        <Card><Statistic title="单 SKU 平均日均差" value={`${Number(data.daily_lift_average) > 0 ? '+' : ''}${formatNumber(data.daily_lift_average)}`} valueStyle={{ color: Number(data.daily_lift_average) < 0 ? '#ef4444' : '#16a34a' }} /></Card>
+        <MetricCard title="长期调价 SKU" value={formatNumber(data.adjusted_sku_count, 0)} suffix="个" />
+        <MetricCard title="两者同时生效 SKU" value={formatNumber(data.overlap_sku_count, 0)} suffix="个" />
+        <MetricCard title="正在限时促销 SKU" value={formatNumber(data.active_sku_count, 0)} suffix="个" />
+        <MetricCard title="7天日均销量合计" value={formatNumber(data.average_7d_total)} />
+        <MetricCard title="30天日均销量合计" value={formatNumber(data.average_30d_total)} />
+        <MetricCard title="近7天与近30天日均差合计" value={`${Number(data.daily_lift_total) > 0 ? '+' : ''}${formatNumber(data.daily_lift_total)}`} tone={Number(data.daily_lift_total) < 0 ? 'negative' : 'positive'} />
+        <MetricCard title="单 SKU 平均日均差" value={`${Number(data.daily_lift_average) > 0 ? '+' : ''}${formatNumber(data.daily_lift_average)}`} tone={Number(data.daily_lift_average) < 0 ? 'negative' : 'positive'} />
       </div>
       {Number(data.source_missing_count) > 0 && <Alert className="promotion-source-warning" type="warning" showIcon message={`${formatNumber(data.source_missing_count, 0)} 个促销 SKU 已不在当前源数据中`} description="记录仍会保留，但不会计入上方销量趋势汇总。" />}
       <Alert type="info" message="总体销量按 SKU 去重；近7天与近30天日均差仅反映趋势，不代表单项措施带来的独立增量。" />
@@ -368,7 +370,7 @@ function CandidateTable({ discount, refreshToken, onMark }: { discount: Promotio
     <div className="promotion-table-toolbar">
       <Space wrap>
         <Input.Search value={searchDraft} onChange={event => setSearchDraft(event.target.value)} onSearch={applySearch} allowClear placeholder="搜索 SKU、ASIN、开发员" style={{ width: 260 }} />
-        <ConfirmFilterSelect mode="multiple" ariaLabel="开发员" value={query.developers} onConfirm={value => { setSelected([]); setQuery(current => ({ ...current, page: 1, developers: Array.isArray(value) ? value.map(String) : [] })); }} placeholder="全部开发员" options={developerOptions.map(value => ({ value, label: value }))} style={{ minWidth: 220 }} />
+        <ConfirmFilterSelect mode="multiple" ariaLabel="开发员" selectionUnit="人" value={query.developers} onConfirm={value => { setSelected([]); setQuery(current => ({ ...current, page: 1, developers: Array.isArray(value) ? value.map(String) : [] })); }} placeholder="全部开发员" options={developerOptions.map(value => ({ value, label: value }))} style={{ minWidth: 220 }} />
         <FilterActions onReset={resetFilters} />
       </Space>
       <Space wrap>
@@ -498,22 +500,19 @@ function PromotionDateModal({ dialog, onClose, onSaved }: { dialog: PromotionDia
   };
 
   const skus = dialog?.kind === 'create' ? dialog.skus : [];
-  return <Modal
+  return <MutationModal
     title={dialog?.kind === 'edit' ? `编辑促销 · ${dialog.record.sku}` : '标记正在促销'}
     open={Boolean(dialog)}
     onCancel={close}
     onOk={() => void submit()}
     okText="保存"
     cancelText="取消"
-    confirmLoading={saving}
-    closable={!saving}
-    maskClosable={!saving}
-    keyboard={!saving}
+    busy={saving}
     cancelButtonProps={{ disabled: saving }}
     destroyOnHidden
   >
     {dialog?.kind === 'create' && <Alert className="promotion-dialog-summary" type="info" showIcon message={`将标记 ${skus.length} 个 SKU`} description={<Typography.Paragraph ellipsis={{ rows: 3, expandable: true, symbol: '展开' }} copyable={{ text: skuCopyText(skus), onCopy: () => message.success({ key: 'copy-promotion-skus', content: `已复制 ${skus.length} 个 SKU` }) }}>{skus.join('、')}</Typography.Paragraph>} />}
-    <Form form={form} layout="vertical" preserve={false}>
+    <Form form={form} layout="vertical" preserve={false} disabled={saving}>
       <Form.Item name="promotion_name" label="促销名称" rules={[
         { required: true, whitespace: true, message: '请输入促销名称' },
         { max: 100, message: '促销名称不能超过 100 个字符' },
@@ -522,7 +521,7 @@ function PromotionDateModal({ dialog, onClose, onSaved }: { dialog: PromotionDia
       <Form.Item name="end_date" label="结束日期" dependencies={['start_date']} rules={[{ required: true, message: '请选择结束日期' }, ({ getFieldValue }) => ({ validator(_, value?: Dayjs | null) { const start = getFieldValue('start_date') as Dayjs | undefined; return value && start && value.isBefore(start, 'day') ? Promise.reject(new Error('结束日期不能早于开始日期')) : Promise.resolve(); } })]}><DatePicker placeholder="请选择结束日期" style={{ width: '100%' }} /></Form.Item>
       <Typography.Text type="secondary">结束日期当天仍计为“正在促销”，次日自动转为“已结束”。</Typography.Text>
     </Form>
-  </Modal>;
+  </MutationModal>;
 }
 
 function RecordsTable({ refreshToken, onRefresh, onEdit, onManualAdd }: { refreshToken: number; onRefresh: () => void; onEdit: (record: PromotionRecord) => void; onManualAdd: () => void }) {
@@ -607,7 +606,7 @@ function RecordsTable({ refreshToken, onRefresh, onEdit, onManualAdd }: { refres
       <Space wrap>
         <ConfirmFilterSelect mode="single" ariaLabel="促销状态" value={status} normalizeValue={value => value || 'active'} onConfirm={value => { setStatus((value ? String(value) : 'active') as PromotionStatusFilter); setQuery(current => ({ ...current, page: 1 })); }} options={[{ value: 'active', label: '正在促销' }, { value: 'pending', label: '待开始' }, { value: 'ended', label: '已结束' }, { value: 'all', label: '全部状态' }]} placeholder="正在促销" style={{ width: 160 }} />
         <Input.Search value={searchDraft} onChange={event => setSearchDraft(event.target.value)} onSearch={applySearch} allowClear placeholder="搜索 SKU、ASIN、开发员" style={{ width: 260 }} />
-        <ConfirmFilterSelect mode="multiple" ariaLabel="开发员" value={query.developers} onConfirm={value => setQuery(current => ({ ...current, page: 1, developers: Array.isArray(value) ? value.map(String) : [] }))} placeholder="全部开发员" options={developerOptions.map(value => ({ value, label: value }))} style={{ minWidth: 220 }} />
+        <ConfirmFilterSelect mode="multiple" ariaLabel="开发员" selectionUnit="人" value={query.developers} onConfirm={value => setQuery(current => ({ ...current, page: 1, developers: Array.isArray(value) ? value.map(String) : [] }))} placeholder="全部开发员" options={developerOptions.map(value => ({ value, label: value }))} style={{ minWidth: 220 }} />
         <FilterActions onReset={resetFilters} />
       </Space>
       <Space>
@@ -676,6 +675,7 @@ function ActualPricePanel({ refreshToken }: { refreshToken: number }) {
     <Typography.Paragraph type="secondary">价格事件来自相邻 Listing 快照；“首次观察到”不等于精确改价时间。销量响应仅作方向参考，不代表因果。</Typography.Paragraph>
     {error && <Alert type="error" showIcon message="实际价格加载失败" description={error} action={<Button size="small" onClick={() => setReloadToken(value => value + 1)}>重试</Button>} />}
     <Table<ListingObservation>
+      size="small"
       rowKey={row => `${row.sku}-${row.country}-${row.date}-${row.type}`}
       loading={loading}
       dataSource={rows}
@@ -698,7 +698,7 @@ function ActualPricePanel({ refreshToken }: { refreshToken: number }) {
     />
   </Card>;
 }
-export default function PromotionBoard({ active = true, routeVersion = 0, refreshVersion = 0 }: { active?: boolean; routeVersion?: number; refreshVersion?: number }) {
+export default function PromotionBoard({ active = true, routeVersion = 0, refreshVersion = 0 }: PageLifecycleProps) {
   const [refreshToken, setRefreshToken] = useState(0);
   const [dialog, setDialog] = useState<PromotionDialog>(null);
   const [manualOpen, setManualOpen] = useState(false);
@@ -744,10 +744,7 @@ export default function PromotionBoard({ active = true, routeVersion = 0, refres
     { key: 'candidates-5', label: '促销候选 -5%' },
   ];
   return <div className="promotion-board">
-    <div className="page-heading promotion-page-heading">
-      <div><Typography.Title level={2}>{dataTab === 'actual-prices' ? '实际价格观察' : '调价与促销'}</Typography.Title><Typography.Text type="secondary">{dataTab === 'actual-prices' ? '仅展示相邻 Listing 快照中的实际价格变化' : '长期调价与限时额外优惠独立登记；记录不会修改平台售价'}</Typography.Text></div>
-      <Button icon={<ReloadOutlined />} onClick={refresh}>刷新</Button>
-    </div>
+    <PageHeading title={dataTab === 'actual-prices' ? '实际价格观察' : '调价与促销'} description={dataTab === 'actual-prices' ? '仅展示相邻 Listing 快照中的实际价格变化' : '长期调价与限时额外优惠独立登记；记录不会修改平台售价'} className="promotion-page-heading" actions={<Button icon={<ReloadOutlined />} onClick={refresh}>刷新</Button>} />
     {dataTab === 'actual-prices' ? <ActualPricePanel refreshToken={refreshToken} /> : <>
       <PromotionOverviewPanel refreshToken={refreshToken} onRefresh={refresh} />
       <Tabs className="promotion-data-tabs" activeKey={dataTab} onChange={changeDataTab} items={tabItems} />

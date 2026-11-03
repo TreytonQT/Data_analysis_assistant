@@ -1,12 +1,13 @@
-import { render, screen, waitFor } from '@testing-library/react';
+import { cleanup, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { feedbackMessage } from './feedback';
 import UploadCenter, { uploadFrequencyTabFromSearch } from './UploadCenter';
 
-const mocks = vi.hoisted(() => ({ reports: vi.fn() }));
+const mocks = vi.hoisted(() => ({ reports: vi.fn(), uploadReports: vi.fn() }));
 
 vi.mock('./api', () => ({
-  api: { reports: mocks.reports },
+  api: { reports: mocks.reports, uploadReports: mocks.uploadReports },
   apiErrorMessage: (_payload: unknown, fallback = '请求失败') => fallback,
 }));
 
@@ -16,6 +17,8 @@ describe('UploadCenter', () => {
   });
 
   afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
     window.history.replaceState({}, '', '/');
     vi.clearAllMocks();
   });
@@ -53,6 +56,7 @@ describe('UploadCenter', () => {
     await waitFor(() => expect(screen.getByTestId('sales-history-rolling')).toBeInTheDocument());
     expect(new URLSearchParams(window.location.search).get('tab')).toBe('monthly');
     expect(screen.getByTestId('source-sku_image_map')).toBeInTheDocument();
+    expect(screen.getByText('新版字段：MSKU、ASIN、图片链接；按 MSKU + ASIN 关联图片，空链接跳过并显示无图片')).toBeInTheDocument();
     expect(screen.getByTestId('sales-history-rolling')).toBeInTheDocument();
     expect(screen.queryByTestId('performance-reports')).not.toBeInTheDocument();
   });
@@ -66,5 +70,23 @@ describe('UploadCenter', () => {
     window.dispatchEvent(new PopStateEvent('popstate'));
     await waitFor(() => expect(screen.getByTestId('sales-history-rolling')).toBeInTheDocument());
     expect(screen.queryByTestId('performance-reports')).not.toBeInTheDocument();
+  });
+
+  it('keeps upload warnings and refreshes records after the shared upload succeeds', async () => {
+    const user = userEvent.setup();
+    window.history.replaceState({}, '', '/?page=uploads');
+    mocks.reports.mockResolvedValue({ reports: [], sources: {} });
+    mocks.uploadReports.mockResolvedValue({ warnings: ['保留已有价格'] });
+    vi.spyOn(feedbackMessage, 'loading').mockImplementation(() => undefined as never);
+    const warning = vi.spyOn(feedbackMessage, 'warning').mockImplementation(() => undefined as never);
+    render(<UploadCenter />);
+    const card = await screen.findByTestId('source-operational_sales');
+    await waitFor(() => expect(card.closest('.ant-spin-container')).not.toHaveClass('ant-spin-blur'));
+    const input = card.querySelector('input[type="file"]') as HTMLInputElement;
+    const file = new File(['source'], '运营.xlsx', { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+    await user.upload(input, file);
+    await waitFor(() => expect(mocks.uploadReports).toHaveBeenCalledWith('/api/reports/source/operational_sales', [file], false));
+    expect(warning).toHaveBeenCalledWith(expect.objectContaining({ content: expect.stringContaining('保留已有价格') }));
+    expect(mocks.reports.mock.calls.length).toBeGreaterThanOrEqual(2);
   });
 });

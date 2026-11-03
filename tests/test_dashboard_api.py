@@ -373,6 +373,34 @@ class DashboardApiTests(unittest.TestCase):
         self.assertIsNone(rows[1]["image"])
         self.assertIsNone(rows[2]["image"])
 
+    def test_new_sku_images_match_asin_in_matrix_and_csv_without_local_sku(self):
+        operational = pd.DataFrame([
+            {"MSKU": " sku-1 ", "ASIN": " b001 ", "销量": pd.NA},
+            {"MSKU": "SKU-1", "ASIN": "B002", "销量": 0},
+        ])
+        operational["销量"] = operational["销量"].astype("Int64")
+        image_map = pd.DataFrame([
+            {"MSKU": "SKU-1", "ASIN": "B001", "图片链接": "https://cdn.example.com/1.jpg"},
+            {"MSKU": "SKU-1", "ASIN": "B002", "图片链接": "https://cdn.example.com/2.jpg"},
+        ])
+        lookup = dashboard_api._sku_image_lookup(operational, image_map)
+        self.assertEqual(dashboard_api._sku_image_lookup(operational.drop(columns=["ASIN"]), image_map), {})
+        frame = pd.DataFrame([
+            {"SKU": "SKU-1", "ASIN": "B001"},
+            {"SKU": "SKU-1", "ASIN": "B002"},
+            {"SKU": "SKU-1", "ASIN": "WRONG"},
+        ])
+        rows = dashboard_api._rows_with_sku_images(lookup)(frame)
+        self.assertEqual(rows[0]["image"]["url"], "https://cdn.example.com/1.jpg")
+        self.assertEqual(rows[1]["image"]["url"], "https://cdn.example.com/2.jpg")
+        self.assertEqual(rows[0]["image"]["inventory_sku"], "")
+        self.assertIsNone(rows[2]["image"])
+        self.assertIsNone(dashboard_api._rows_with_sku_images(lookup)(pd.DataFrame({"SKU": ["SKU-1"]}))[0]["image"])
+        exported = dashboard_api._slow_moving_csv_frame(lookup)(frame)
+        self.assertEqual(exported.loc[0, "库存图片链接"], "https://cdn.example.com/1.jpg")
+        self.assertEqual(exported.loc[1, "库存图片链接"], "https://cdn.example.com/2.jpg")
+        self.assertTrue(pd.isna(exported.loc[2, "库存图片链接"]))
+
     def test_representative_asin_uses_the_same_image_mapping_as_replenishment(self):
         operational = pd.DataFrame(
             [{"本地SKU": "MDERAM240701CQT027", "MSKU": "RAM240701CQT027", "ASIN": "B0D9L92YXY"}]
@@ -513,12 +541,19 @@ class DashboardApiTests(unittest.TestCase):
             patch("backend.dashboard_api._replenishment_tables", return_value={"detail": detail}),
         ):
             payload = dashboard_api._build_replenishment(None, min_qty=30)
+            default_payload = dashboard_api._build_replenishment(None)
 
         visible = payload["sections"][0]["frame"]
         self.assertEqual(visible["ASIN"].tolist(), ["B002"])
         self.assertEqual(payload["metrics"][0]["value"], 1)
         self.assertEqual(payload["metrics"][1]["value"], 30)
         self.assertEqual(payload["metrics"][2]["value"], 0)
+
+        default_visible = default_payload["sections"][0]["frame"]
+        self.assertEqual(default_visible["ASIN"].tolist(), ["B001", "B002", "B004"])
+        self.assertEqual(default_payload["metrics"][0]["value"], 2)
+        self.assertEqual(default_payload["metrics"][1]["value"], 50)
+        self.assertEqual(default_payload["metrics"][2]["value"], 1)
 
     def test_replenishment_switch_overlay_reuses_calculation_and_preserves_data_errors(self):
         detail = pd.DataFrame([

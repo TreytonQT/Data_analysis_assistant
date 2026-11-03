@@ -533,7 +533,7 @@ describe('DashboardDecisionMatrix', () => {
       expect.any(AbortSignal),
     ));
 
-    const exportLink = screen.getByRole('link', { name: /导出全部 CSV/ });
+    const exportLink = screen.getByRole('link', { name: /导出筛选结果/ });
     await waitFor(() => expect(exportLink).toHaveAttribute(
       'href',
       expect.stringContaining('sort_by=30%E5%A4%A9%E9%94%80%E9%87%8F'),

@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: Release tag, for example v2.2.0
+        description: Release tag, for example v2.3.0
         required: true
-        default: v2.2.0
+        default: v2.3.0
 
 permissions:
   contents: write
@@ -20,8 +20,8 @@ jobs:
     timeout-minutes: 20
     env:
       APP_NAME: DataAnalysisAssistant
-      DEFAULT_RELEASE_TAG: v2.2.0
-      RELEASE_SUBTITLE: 新品与价格监控
+      DEFAULT_RELEASE_TAG: v2.3.0
+      RELEASE_SUBTITLE: 桌面工作台与图表交互升级
 
     steps:
       - name: Check out source
@@ -70,8 +70,10 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw "Backend regression failed: $($_.Name)" }
           }
           Push-Location frontend
-          python ../scripts/run_bounded.py --timeout 85 -- cmd.exe /d /c npm.cmd test -- --testTimeout=10000
-          if ($LASTEXITCODE -ne 0) { throw "Frontend regression failed" }
+          Get-ChildItem src -Recurse -Include *.test.ts,*.test.tsx | Sort-Object FullName | ForEach-Object {
+            python ../scripts/run_bounded.py --timeout 85 -- cmd.exe /d /c npm.cmd test -- $_.FullName --maxWorkers=2 --testTimeout=10000
+            if ($LASTEXITCODE -ne 0) { throw "Frontend regression failed: $($_.Name)" }
+          }
           Pop-Location
 
       - name: Build portable application

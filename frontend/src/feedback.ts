@@ -1,6 +1,8 @@
 import { message as antdMessage } from 'antd';
 import type { MessageInstance } from 'antd/es/message/interface';
 
+import { designTokens } from './designTokens';
+import { apiErrorMessage } from './apiErrors';
 export type OperationFeedbackOptions<T> = {
   key: string;
   loading?: string;
@@ -10,12 +12,22 @@ export type OperationFeedbackOptions<T> = {
   warningWhen?: (result: T) => boolean;
 };
 
-export const feedbackMessage = antdMessage;
 let activeMessage: MessageInstance = antdMessage;
+
+// Preserve existing call sites while forwarding every operation to AntApp's context.
+export const feedbackMessage: MessageInstance = {
+  info: (...args) => activeMessage.info(...args),
+  success: (...args) => activeMessage.success(...args),
+  error: (...args) => activeMessage.error(...args),
+  warning: (...args) => activeMessage.warning(...args),
+  loading: (...args) => activeMessage.loading(...args),
+  open: (...args) => activeMessage.open(...args),
+  destroy: (...args) => activeMessage.destroy(...args),
+};
 
 export function configureFeedback(messageApi?: MessageInstance) {
   activeMessage = messageApi || antdMessage;
-  if (!messageApi) antdMessage.config({ top: 24, maxCount: 3, duration: 2.5 });
+  if (!messageApi) antdMessage.config(designTokens.feedback);
 }
 
 export const feedbackError = (reason: unknown, fallback = '操作失败') => reason instanceof Error && reason.message ? reason.message : fallback;
@@ -31,20 +43,20 @@ function messageText<T>(value: string | ((value: T) => string) | undefined, data
 }
 
 export async function runOperation<T>(operation: () => Promise<T>, options: OperationFeedbackOptions<T>) {
-  if (options.loading) activeMessage.loading({ key: options.key, content: options.loading, duration: 0 });
+  if (options.loading) feedbackMessage.loading({ key: options.key, content: options.loading, duration: 0 });
   try {
     const result = await operation();
     const hasWarning = Boolean(options.warningWhen?.(result));
     if (hasWarning && options.warning) {
-      activeMessage.warning({ key: options.key, content: messageText(options.warning, result, '操作完成，但有部分结果需要注意'), duration: 6 });
+      feedbackMessage.warning({ key: options.key, content: messageText(options.warning, result, '操作完成，但有部分结果需要注意'), duration: 6 });
     } else if (options.success) {
-      activeMessage.success({ key: options.key, content: messageText(options.success, result, '操作已完成'), duration: 2.5 });
+      feedbackMessage.success({ key: options.key, content: messageText(options.success, result, '操作已完成'), duration: 2.5 });
     } else if (options.warning) {
-      activeMessage.warning({ key: options.key, content: messageText(options.warning, result, '操作完成，但有部分结果需要注意'), duration: 6 });
+      feedbackMessage.warning({ key: options.key, content: messageText(options.warning, result, '操作完成，但有部分结果需要注意'), duration: 6 });
     }
     return result;
   } catch (reason) {
-    if (!isAbortError(reason)) activeMessage.error({ key: options.key, content: messageText(options.error, reason, feedbackError(reason)), duration: 6 });
+    if (!isAbortError(reason)) feedbackMessage.error({ key: options.key, content: messageText(options.error, reason, feedbackError(reason)), duration: 6 });
     throw reason;
   }
 }
@@ -74,16 +86,16 @@ export async function writeClipboardText(text: string) {
 export async function copyWithFeedback(text: string, label: string, count?: number) {
   const key = `copy-${label}`;
   if (!text.trim()) {
-    activeMessage.info({ key, content: `暂无${label}可复制`, duration: 3 });
+    feedbackMessage.info({ key, content: `暂无${label}可复制`, duration: 3 });
     return false;
   }
   try {
-    activeMessage.loading({ key, content: `正在复制${label}…`, duration: 0 });
+    feedbackMessage.loading({ key, content: `正在复制${label}…`, duration: 0 });
     await writeClipboardText(text);
-    activeMessage.success({ key, content: `已复制${count === undefined ? '' : ` ${count} 个`}${label}`, duration: 2.5 });
+    feedbackMessage.success({ key, content: `已复制${count === undefined ? '' : ` ${count} 个`}${label}`, duration: 2.5 });
     return true;
   } catch (reason) {
-    activeMessage.error({ key, content: feedbackError(reason, `复制${label}失败，请手动复制`), duration: 6 });
+    feedbackMessage.error({ key, content: feedbackError(reason, `复制${label}失败，请手动复制`), duration: 6 });
     return false;
   }
 }
@@ -114,29 +126,29 @@ function responseFilename(response: Response, fallback: string) {
 export function downloadBlobWithFeedback(blob: Blob, filename: string, label = filename) {
   try {
     triggerBlobDownload(blob, filename);
-    activeMessage.success({ content: `${label}已生成并开始下载`, duration: 2.5 });
+    feedbackMessage.success({ content: `${label}已生成并开始下载`, duration: 2.5 });
     return true;
   } catch (reason) {
-    activeMessage.error({ content: feedbackError(reason, `${label}下载失败，请重试`), duration: 6 });
+    feedbackMessage.error({ content: feedbackError(reason, `${label}下载失败，请重试`), duration: 6 });
     return false;
   }
 }
 
 export async function downloadWithFeedback(url: string, fallbackFilename: string, label = fallbackFilename) {
   const key = `download-${url}`;
-  activeMessage.loading({ key, content: `正在生成${label}…`, duration: 0 });
+  feedbackMessage.loading({ key, content: `正在生成${label}…`, duration: 0 });
   try {
     const response = await fetch(url, { credentials: 'same-origin' });
     if (!response.ok) {
       const payload = await response.clone().json().catch(() => null) as { detail?: unknown; message?: unknown } | null;
-      const detail = typeof payload?.detail === 'string' ? payload.detail : typeof payload?.message === 'string' ? payload.message : `请求失败（${response.status}）`;
+      const detail = apiErrorMessage(payload?.detail == null && payload?.message ? payload.message : payload, `请求失败（${response.status}）`);
       throw new Error(detail);
     }
     triggerBlobDownload(await response.blob(), responseFilename(response, fallbackFilename));
-    activeMessage.success({ key, content: `${label}已生成并开始下载`, duration: 2.5 });
+    feedbackMessage.success({ key, content: `${label}已生成并开始下载`, duration: 2.5 });
     return true;
   } catch (reason) {
-    if (!isAbortError(reason)) activeMessage.error({ key, content: feedbackError(reason, `${label}下载失败，请重试`), duration: 6 });
+    if (!isAbortError(reason)) feedbackMessage.error({ key, content: feedbackError(reason, `${label}下载失败，请重试`), duration: 6 });
     return false;
   }
 }

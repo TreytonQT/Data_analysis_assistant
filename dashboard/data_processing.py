@@ -35,6 +35,7 @@ REPLENISHMENT_COVERAGE_RULE_COLUMNS = [
 REPLENISHMENT_SWITCH_COLUMNS = ["ASIN", "是否补货", "关闭原因"]
 REPLENISHMENT_PRODUCT_TAG_COLUMNS = ["ASIN", "产品标签", "标签颜色", "是否启用", "备注"]
 SKU_IMAGE_MAP_COLUMNS = ["库存SKU", "虚拟SKU", "库存图片链接"]
+SKU_IMAGE_EXPORT_COLUMNS = ["MSKU", "ASIN", "图片链接"]
 SALES_HISTORY_2025_SHEETS = [f"{month}月" for month in range(1, 13)]
 SALES_HISTORY_2025_COUNTRIES = {
     "德国": "DE",
@@ -1668,7 +1669,7 @@ def normalize_replenishment_operational(df: pd.DataFrame) -> pd.DataFrame:
     if missing:
         raise ValueError(f"运营原始表缺少补货管理列：{', '.join(missing)}")
 
-    optional_columns = AGING_STOCK_COLUMNS + ["备注", "本地SKU"] + [
+    optional_columns = AGING_STOCK_COLUMNS + ["备注", "本地SKU", "本地SKU名称"] + [
         column
         for column in REPLENISHMENT_MONITOR_SALES_COLUMNS
         if column not in REPLENISHMENT_OPERATIONAL_REQUIRED_COLUMNS
@@ -1680,7 +1681,7 @@ def normalize_replenishment_operational(df: pd.DataFrame) -> pd.DataFrame:
     for column in optional_columns:
         if column not in base.columns:
             base[column] = pd.NA
-    for col in ["ASIN", "MSKU", "本地SKU", "店铺名称", "开发员"]:
+    for col in ["ASIN", "MSKU", "本地SKU", "本地SKU名称", "店铺名称", "开发员"]:
         base[col] = base[col].fillna("").astype(str).str.strip()
     base["ASIN"] = base["ASIN"].str.upper()
     base["备注"] = base["备注"].fillna("").astype(str).str.strip()
@@ -1695,36 +1696,42 @@ def normalize_replenishment_operational(df: pd.DataFrame) -> pd.DataFrame:
 def normalize_sku_image_map(df: pd.DataFrame) -> pd.DataFrame:
     """Validate and normalize the latest SKU-to-image master table."""
 
-    # Excel exports occasionally vary only the ASCII ``SKU`` casing (for
-    # example ``虚拟sku``). Match headers case-insensitively while preserving
-    # the canonical names in the normalized result.
+    # New exports identify an image by MSKU + ASIN. Keep previously uploaded
+    # inventory/virtual-SKU files readable, but prefer the new schema whenever
+    # its complete headers are present. Never infer inventory SKU prefixes.
     header_matches: dict[str, str] = {}
     duplicate_headers: list[str] = []
+    known_headers = {item.lower() for item in SKU_IMAGE_MAP_COLUMNS + SKU_IMAGE_EXPORT_COLUMNS}
     for column in df.columns:
         normalized_header = str(column).strip().lower()
-        if normalized_header in {item.lower() for item in SKU_IMAGE_MAP_COLUMNS}:
+        if normalized_header in known_headers:
             if normalized_header in header_matches:
                 duplicate_headers.append(str(column))
             else:
                 header_matches[normalized_header] = column
     if duplicate_headers:
         raise ValueError(f"SKU图片映射表包含重复列：{', '.join(duplicate_headers)}")
+    new_format = all(column.lower() in header_matches for column in SKU_IMAGE_EXPORT_COLUMNS)
+    legacy_format = all(column.lower() in header_matches for column in SKU_IMAGE_MAP_COLUMNS)
+    columns = SKU_IMAGE_EXPORT_COLUMNS if new_format or not legacy_format else SKU_IMAGE_MAP_COLUMNS
+    key_columns = columns[:2]
+    url_column = columns[2]
     missing = [
         column
-        for column in SKU_IMAGE_MAP_COLUMNS
+        for column in columns
         if column.lower() not in header_matches
     ]
     if missing:
         raise ValueError(f"SKU图片映射表缺少列：{', '.join(missing)}")
 
     data = df[
-        [header_matches[column.lower()] for column in SKU_IMAGE_MAP_COLUMNS]
-    ].copy()
-    data.columns = SKU_IMAGE_MAP_COLUMNS
-    for column in SKU_IMAGE_MAP_COLUMNS:
+        [header_matches[column.lower()] for column in columns]
+    ].copy().reset_index(drop=True)
+    data.columns = columns
+    for column in columns:
         data[column] = data[column].fillna("").astype(str).str.strip()
 
-    empty_key_rows = data[["库存SKU", "虚拟SKU"]].eq("").any(axis=1)
+    empty_key_rows = data[key_columns].eq("").any(axis=1)
     if empty_key_rows.any():
         empty_positions = [
             position + 2
@@ -1732,9 +1739,9 @@ def normalize_sku_image_map(df: pd.DataFrame) -> pd.DataFrame:
             if is_empty
         ][:5]
         examples = ", ".join(str(position) for position in empty_positions)
-        raise ValueError(f"SKU图片映射表的库存SKU或虚拟SKU存在空值，问题行：{examples}")
+        raise ValueError(f"SKU图片映射表的{'或'.join(key_columns)}存在空值，问题行：{examples}")
 
-    empty_url_rows = data["库存图片链接"].eq("")
+    empty_url_rows = data[url_column].eq("")
     empty_url_count = int(empty_url_rows.sum())
     if empty_url_count:
         # A blank image URL means the SKU currently has no image. Keep the
@@ -1743,11 +1750,12 @@ def normalize_sku_image_map(df: pd.DataFrame) -> pd.DataFrame:
         data = data.loc[~empty_url_rows].copy()
 
     invalid_urls: list[str] = []
-    for position, value in enumerate(data["库存图片链接"].tolist()):
+    for position, value in enumerate(data[url_column].tolist()):
+        source_row = int(data.index[position]) + 2
         try:
             parsed = urlparse(value)
         except ValueError:
-            invalid_urls.append(str(position + 2))
+            invalid_urls.append(str(source_row))
             if len(invalid_urls) >= 5:
                 break
             continue
@@ -1768,40 +1776,43 @@ def normalize_sku_image_map(df: pd.DataFrame) -> pd.DataFrame:
             or not is_public_host
             or any(character.isspace() for character in value)
         ):
-            invalid_urls.append(str(position + 2))
+            invalid_urls.append(str(source_row))
             if len(invalid_urls) >= 5:
                 break
     if invalid_urls:
         raise ValueError(
-            "库存图片链接必须是有效的公网 HTTPS URL，问题行："
+            f"{url_column}必须是有效的公网 HTTPS URL，问题行："
             + ", ".join(invalid_urls)
         )
 
-    data["_库存SKU关联键"] = data["库存SKU"].str.upper()
-    data["_虚拟SKU关联键"] = data["虚拟SKU"].str.upper()
+    match_keys = ["_图片关联键1", "_图片关联键2"]
+    for column, key in zip(key_columns, match_keys):
+        data[key] = data[column].str.upper()
     # Treat whitespace/case variants as the same logical row while retaining
     # the first original value for display/export.
     exact_duplicates = data.duplicated(
-        subset=["_库存SKU关联键", "_虚拟SKU关联键", "库存图片链接"],
+        subset=[*match_keys, url_column],
         keep="first",
     )
     data = data.loc[~exact_duplicates].copy()
 
     pair_link_conflicts = data.groupby(
-        ["_库存SKU关联键", "_虚拟SKU关联键"]
-    )["库存图片链接"].nunique()
+        match_keys
+    )[url_column].nunique()
     conflicting_pairs = pair_link_conflicts[pair_link_conflicts.gt(1)].index.tolist()
     if conflicting_pairs:
         examples = "、".join(f"{inventory}/{virtual}" for inventory, virtual in conflicting_pairs[:3])
         raise ValueError(
-            "SKU图片映射表存在同一库存SKU和虚拟SKU对应多个图片链接；"
+            f"SKU图片映射表存在同一{'和'.join(key_columns)}对应多个图片链接；"
             f"示例：{examples}"
         )
 
-    inventory_conflicts = data.groupby("_库存SKU关联键")["_虚拟SKU关联键"].nunique()
-    virtual_conflicts = data.groupby("_虚拟SKU关联键")["_库存SKU关联键"].nunique()
-    conflicting_inventory = inventory_conflicts[inventory_conflicts.gt(1)].index.tolist()
-    conflicting_virtual = virtual_conflicts[virtual_conflicts.gt(1)].index.tolist()
+    # Many MSKUs may belong to one ASIN in the new export. Only the pair must
+    # have a unique URL. The old inventory/virtual relation remains one-to-one.
+    inventory_conflicts = data.groupby(match_keys[0])[match_keys[1]].nunique()
+    virtual_conflicts = data.groupby(match_keys[1])[match_keys[0]].nunique()
+    conflicting_inventory = inventory_conflicts[inventory_conflicts.gt(1)].index.tolist() if not new_format else []
+    conflicting_virtual = virtual_conflicts[virtual_conflicts.gt(1)].index.tolist() if not new_format else []
     if conflicting_inventory or conflicting_virtual:
         examples = [*conflicting_inventory[:3], *conflicting_virtual[:3]]
         raise ValueError(
@@ -1809,9 +1820,47 @@ def normalize_sku_image_map(df: pd.DataFrame) -> pd.DataFrame:
             f"示例：{'、'.join(examples)}"
         )
 
-    normalized = data[SKU_IMAGE_MAP_COLUMNS].reset_index(drop=True)
+    normalized = data[columns].reset_index(drop=True)
     normalized.attrs["empty_url_rows"] = empty_url_count
     return normalized
+
+
+def attach_sku_image_map(operational: pd.DataFrame, image_map: pd.DataFrame) -> pd.DataFrame:
+    """Attach validated images without changing operational rows or order."""
+
+    data = operational.copy()
+    for column in SKU_IMAGE_MAP_COLUMNS:
+        data[column] = pd.NA
+    if image_map.empty:
+        return data
+    new_format = set(SKU_IMAGE_EXPORT_COLUMNS).issubset(image_map.columns)
+    source_keys = ["MSKU", "ASIN"] if new_format else ["本地SKU", "MSKU"]
+    mapping_keys = ["MSKU", "ASIN"] if new_format else ["库存SKU", "虚拟SKU"]
+    if not set(source_keys).issubset(data.columns):
+        return data
+
+    match_keys = ["_图片关联键1", "_图片关联键2"]
+    mapping = image_map.copy()
+    for source, mapped, key in zip(source_keys, mapping_keys, match_keys):
+        data[key] = data[source].fillna("").astype(str).str.strip().str.upper()
+        mapping[key] = mapping[mapped].fillna("").astype(str).str.strip().str.upper()
+    if new_format:
+        mapping["虚拟SKU"] = mapping["MSKU"]
+        mapping["库存图片链接"] = mapping["图片链接"]
+        mapping["库存SKU"] = pd.NA
+    data = data.merge(
+        mapping[[*match_keys, *SKU_IMAGE_MAP_COLUMNS]],
+        on=match_keys,
+        how="left",
+        sort=False,
+        validate="many_to_one",
+        suffixes=("", "_映射"),
+    )
+    for column in SKU_IMAGE_MAP_COLUMNS:
+        data[column] = data.pop(f"{column}_映射")
+    if new_format and "本地SKU" in data.columns:
+        data["库存SKU"] = data["本地SKU"].where(data["库存图片链接"].notna(), pd.NA)
+    return data.drop(columns=match_keys)
 
 
 def normalize_replenishment_listing_dates(values: pd.Series) -> pd.Series:
@@ -2739,27 +2788,7 @@ def build_replenishment_management_tables(
             "history": history,
         }
 
-    data = operational.copy()
-    data["库存SKU"] = pd.NA
-    data["虚拟SKU"] = pd.NA
-    data["库存图片链接"] = pd.NA
-    if not image_map.empty:
-        data["_库存SKU关联键"] = data["本地SKU"].fillna("").astype(str).str.strip().str.upper()
-        data["_虚拟SKU关联键"] = data["MSKU"].fillna("").astype(str).str.strip().str.upper()
-        mapping = image_map.copy()
-        mapping["_库存SKU关联键"] = mapping["库存SKU"].str.upper()
-        mapping["_虚拟SKU关联键"] = mapping["虚拟SKU"].str.upper()
-        data = data.merge(
-            mapping[["_库存SKU关联键", "_虚拟SKU关联键", *SKU_IMAGE_MAP_COLUMNS]],
-            on=["_库存SKU关联键", "_虚拟SKU关联键"],
-            how="left",
-            sort=False,
-            validate="many_to_one",
-            suffixes=("", "_映射"),
-        )
-        for column in SKU_IMAGE_MAP_COLUMNS:
-            data[column] = data.pop(f"{column}_映射")
-        data = data.drop(columns=["_库存SKU关联键", "_虚拟SKU关联键"])
+    data = attach_sku_image_map(operational, image_map)
     missing_asin = data["ASIN"].astype(str).str.strip().eq("")
     data["补货组ID"] = data["ASIN"].astype(str)
     for index in data.index[missing_asin]:
@@ -2868,7 +2897,7 @@ def build_replenishment_management_tables(
     enabled_rules["重量上限排序"] = enabled_rules["重量上限"].fillna(float("inf"))
     enabled_rules = enabled_rules.sort_values(["重量下限", "重量上限排序"], kind="stable")
     sku_columns = [
-        "补货组ID", "ASIN", "SKU角色", "MSKU", "库存SKU", "虚拟SKU", "库存图片链接", "店铺名称", "店铺状态", "开发员",
+        "补货组ID", "ASIN", "SKU角色", "MSKU", "本地SKU名称", "库存SKU", "虚拟SKU", "库存图片链接", "店铺名称", "店铺状态", "开发员",
         "上架时间", "上架天数", "单品重量(g)", *REPLENISHMENT_MONITOR_SALES_COLUMNS,
         "T值", "校准日销量", "SKU亚马逊可售", "SKU总库存", "库龄90天以上", "库龄180-365天",
         "库龄365天以上", *REPLENISHMENT_FORMULA_STOCK_COLUMNS, "数据异常",
@@ -2896,6 +2925,24 @@ def build_replenishment_management_tables(
     for group_id, positions in group_positions.items():
         member_rows = [ordered_records[int(position)] for position in positions]
         first_row = original_by_group[group_id]
+        product_names: list[str] = []
+        seen_product_names: set[str] = set()
+        for sku_row in member_rows:
+            raw_name = sku_row.get("本地SKU名称")
+            if raw_name is None or pd.isna(raw_name):
+                continue
+            product_name = str(raw_name).strip()
+            name_key = product_name.casefold()
+            if product_name and name_key not in seen_product_names:
+                product_names.append(product_name)
+                seen_product_names.add(name_key)
+        raw_original_name = first_row.get("本地SKU名称")
+        original_product_name = (
+            ""
+            if raw_original_name is None or pd.isna(raw_original_name)
+            else str(raw_original_name).strip()
+        )
+        display_product_name = original_product_name or (product_names[0] if product_names else pd.NA)
         group_issues = issues_by_group.get(group_id, [])
         max_weight = group_max_weight.get(group_id)
         matched_rules = []
@@ -2934,6 +2981,8 @@ def build_replenishment_management_tables(
         parent_rows.append(
             {
                 "补货组ID": str(group_id), "ASIN": asin_values, "原SKU": str(first_row["MSKU"]),
+                "产品名称": display_product_name,
+                "组内产品名称": "；".join(product_names) if product_names else pd.NA,
                 "跟卖SKU": follower_skus, "SKU数量": len({row["MSKU"] for row in member_rows}), "店铺编码": join_operational_store_codes([row["店铺名称"] for row in member_rows]),
                 "店铺状态": join_store_statuses([row["店铺状态"] for row in member_rows]),
                 "库存SKU": representative_image.get("库存SKU") if representative_image is not None else pd.NA,
@@ -3090,7 +3139,7 @@ def build_replenishment_store_distribution(detail: pd.DataFrame) -> pd.DataFrame
 
 def replenishment_management_columns() -> list[str]:
     return [
-        "补货组ID", "ASIN", "原SKU", "跟卖SKU", "SKU数量", "店铺编码", "店铺状态", "库存SKU", "虚拟SKU", "库存图片链接", "开发员",
+        "补货组ID", "ASIN", "产品名称", "组内产品名称", "原SKU", "跟卖SKU", "SKU数量", "店铺编码", "店铺状态", "库存SKU", "虚拟SKU", "库存图片链接", "开发员",
         "最大重量(g)", *REPLENISHMENT_MONITOR_SALES_COLUMNS, "库存覆盖天数", "T值", "校准日销量", "亚马逊可售", "总可售",
         "跟卖总可售", "ASIN总库存", "库龄90天以上", "库龄180-365天", "库龄365天以上",
         "目标库存", "测算建议补货数量", "建议补货数量", "是否补货", "关闭原因",
@@ -3101,7 +3150,7 @@ def replenishment_management_columns() -> list[str]:
 
 def replenishment_sku_detail_columns() -> list[str]:
     return [
-        "补货组ID", "ASIN", "SKU角色", "MSKU", "库存SKU", "库存图片链接", "店铺名称", "店铺状态", "开发员",
+        "补货组ID", "ASIN", "SKU角色", "MSKU", "本地SKU名称", "库存SKU", "库存图片链接", "店铺名称", "店铺状态", "开发员",
         *[f"{country}毛利率" for country in PRODUCT_COUNTRIES],
         "上架时间", "上架天数", "单品重量(g)", *REPLENISHMENT_MONITOR_SALES_COLUMNS,
         "T值", "校准日销量", "SKU亚马逊可售", "SKU总库存", "库龄90天以上",

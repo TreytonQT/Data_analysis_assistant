@@ -139,6 +139,46 @@ class DataProcessingTests(unittest.TestCase):
 
         self.assertEqual(normalized.loc[0, "月份"], "2026-07")
 
+    def test_sku_image_map_accepts_new_export_and_preserves_image_urls(self):
+        url = "https://m.media-amazon.com/images/I/41SQsD+yOJL._SL75_.jpg?token=a%2Bb&sig=x+y"
+        source = pd.DataFrame([
+            {" msku ": " sku-1 ", " asin ": " b001 ", "图片链接": url},
+            {" msku ": "SKU-1", " asin ": "B001", "图片链接": url},
+            {" msku ": "SKU-2", " asin ": "B001", "图片链接": "https://cdn.example.com/2.jpg"},
+            {" msku ": "SKU-1", " asin ": "B002", "图片链接": "https://cdn.example.com/3.jpg"},
+            {" msku ": "SKU-3", " asin ": "B003", "图片链接": None},
+        ])
+        normalized = normalize_sku_image_map(source)
+        self.assertEqual(normalized.columns.tolist(), ["MSKU", "ASIN", "图片链接"])
+        self.assertEqual(len(normalized), 3)
+        self.assertEqual(normalized.loc[0].tolist(), ["sku-1", "b001", url])
+        self.assertEqual(normalized.attrs["empty_url_rows"], 1)
+        pd.testing.assert_frame_equal(normalize_sku_image_map(normalized), normalized)
+
+    def test_new_sku_image_map_rejects_missing_keys_and_conflicting_pair(self):
+        with self.assertRaisesRegex(ValueError, "ASIN"):
+            normalize_sku_image_map(pd.DataFrame({"MSKU": ["SKU-1"], "图片链接": ["https://cdn.example.com/1.jpg"]}))
+        with self.assertRaisesRegex(ValueError, "空值"):
+            normalize_sku_image_map(pd.DataFrame({"MSKU": ["SKU-1"], "ASIN": [""], "图片链接": ["https://cdn.example.com/1.jpg"]}))
+        with self.assertRaisesRegex(ValueError, "多个图片链接"):
+            normalize_sku_image_map(pd.DataFrame([
+                {"MSKU": "SKU-1", "ASIN": "B001", "图片链接": "https://cdn.example.com/1.jpg"},
+                {"MSKU": "sku-1", "ASIN": "b001", "图片链接": "https://cdn.example.com/2.jpg"},
+            ]))
+        with self.assertRaisesRegex(ValueError, "问题行：3"):
+            normalize_sku_image_map(pd.DataFrame([
+                {"MSKU": "SKU-1", "ASIN": "B001", "图片链接": ""},
+                {"MSKU": "SKU-2", "ASIN": "B002", "图片链接": "http://cdn.example.com/2.jpg"},
+            ], index=[10, 20]))
+
+    def test_sku_image_map_prefers_complete_new_headers_over_legacy(self):
+        normalized = normalize_sku_image_map(pd.DataFrame([{
+            "MSKU": "SKU-1", "ASIN": "B001", "图片链接": "https://cdn.example.com/new.jpg",
+            "库存SKU": "LOCAL-1", "虚拟SKU": "OLD-SKU", "库存图片链接": "https://cdn.example.com/old.jpg",
+        }]))
+        self.assertEqual(normalized.columns.tolist(), ["MSKU", "ASIN", "图片链接"])
+        self.assertEqual(normalized.loc[0, "图片链接"], "https://cdn.example.com/new.jpg")
+
     def test_past_month_partial_range_is_still_excluded_from_dashboards(self):
         report = pd.DataFrame(
             {
@@ -1361,6 +1401,40 @@ class DataProcessingTests(unittest.TestCase):
         baseline_row = baseline["detail"].set_index("ASIN").loc["B001"]
         self.assertEqual(parent["建议补货数量"], baseline_row["建议补货数量"])
 
+    def test_replenishment_product_names_prefer_original_then_follower_and_keep_all_names(self):
+        source = self.replenishment_operational_source().copy()
+        source["本地SKU名称"] = [" 原SKU商品名 ", "跟卖商品名", "", "独立商品名"]
+
+        tables = build_replenishment_management_tables(source, today="2026-07-29", only_needed=False)
+        parents = tables["detail"].set_index("ASIN")
+        sku_detail = tables["sku_detail"].set_index("MSKU")
+
+        self.assertEqual(parents.loc["B001", "产品名称"], "原SKU商品名")
+        self.assertEqual(parents.loc["B001", "组内产品名称"], "原SKU商品名；跟卖商品名")
+        self.assertTrue(pd.isna(parents.loc["B002", "产品名称"]))
+        self.assertEqual(parents.loc["B003", "产品名称"], "独立商品名")
+        self.assertEqual(sku_detail.loc["SKU1", "本地SKU名称"], "原SKU商品名")
+        self.assertEqual(sku_detail.loc["SKU2", "本地SKU名称"], "跟卖商品名")
+
+        fallback_source = source.copy()
+        fallback_source.loc[fallback_source["MSKU"].eq("SKU1"), "本地SKU名称"] = "  "
+        fallback = build_replenishment_management_tables(fallback_source, today="2026-07-29", only_needed=False)
+        fallback_parent = fallback["detail"].set_index("ASIN").loc["B001"]
+        self.assertEqual(fallback_parent["产品名称"], "跟卖商品名")
+
+    def test_replenishment_product_name_is_optional_and_does_not_change_calculation(self):
+        source = self.replenishment_operational_source()
+        baseline = build_replenishment_management_tables(source, today="2026-07-29", only_needed=False)
+        with_name_column = source.assign(**{"本地SKU名称": pd.NA})
+        named = build_replenishment_management_tables(with_name_column, today="2026-07-29", only_needed=False)
+
+        baseline_rows = baseline["detail"].set_index("ASIN")
+        named_rows = named["detail"].set_index("ASIN")
+        self.assertTrue(named_rows["产品名称"].isna().all())
+        self.assertEqual(named_rows["建议补货数量"].tolist(), baseline_rows["建议补货数量"].tolist())
+        self.assertEqual(named_rows["总可售"].tolist(), baseline_rows["总可售"].tolist())
+        self.assertIn("本地SKU名称", named["sku_detail"].columns)
+
     def test_replenishment_uses_original_sku_image_then_follower_fallback(self):
         source = self.replenishment_operational_source().copy()
         source["本地SKU"] = ["LOCAL1", "LOCAL2", "LOCAL3", "LOCAL4"]
@@ -1383,6 +1457,36 @@ class DataProcessingTests(unittest.TestCase):
         fallback_row = fallback["detail"].set_index("ASIN").loc["B001"]
         self.assertEqual(fallback_row["库存SKU"], "LOCAL2")
         self.assertEqual(fallback_row["虚拟SKU"], "SKU2")
+
+    def test_replenishment_new_images_match_msku_and_asin_without_inventory_sku(self):
+        source = self.replenishment_operational_source().drop(columns=["本地SKU"], errors="ignore")
+        image_map = pd.DataFrame([
+            {"MSKU": " sku1 ", "ASIN": " b001 ", "图片链接": "https://cdn.example.com/original.jpg"},
+            {"MSKU": "SKU2", "ASIN": "B001", "图片链接": "https://cdn.example.com/follower.jpg"},
+        ])
+        baseline = build_replenishment_management_tables(source, today="2026-07-29", only_needed=False)
+        tables = build_replenishment_management_tables(source, sku_image_map=image_map, today="2026-07-29", only_needed=False)
+        row = tables["detail"].set_index("ASIN").loc["B001"]
+        self.assertEqual(row["库存图片链接"], "https://cdn.example.com/original.jpg")
+        self.assertEqual(row["虚拟SKU"], "sku1")
+        for name in ("detail", "sku_detail"):
+            columns = [column for column in baseline[name] if column not in {"库存SKU", "虚拟SKU", "库存图片链接"}]
+            pd.testing.assert_frame_equal(tables[name][columns], baseline[name][columns])
+
+        wrong_asin = image_map.copy()
+        wrong_asin.loc[0, "ASIN"] = "WRONG"
+        fallback = build_replenishment_management_tables(source, sku_image_map=wrong_asin, today="2026-07-29", only_needed=False)
+        row = fallback["detail"].set_index("ASIN").loc["B001"]
+        self.assertEqual(row["库存图片链接"], "https://cdn.example.com/follower.jpg")
+        self.assertEqual(row["虚拟SKU"], "SKU2")
+        self.assertTrue(pd.isna(fallback["sku_detail"].set_index("MSKU").loc["SKU1", "库存图片链接"]))
+
+    def test_replenishment_new_images_keep_inventory_sku_as_audit_only(self):
+        source = self.replenishment_operational_source().copy()
+        source["本地SKU"] = ["LOCAL1", "LOCAL2", "LOCAL3", "LOCAL4"]
+        image_map = pd.DataFrame([{"MSKU": "SKU1", "ASIN": "B001", "图片链接": "https://cdn.example.com/1.jpg"}])
+        tables = build_replenishment_management_tables(source, sku_image_map=image_map, today="2026-07-29", only_needed=False)
+        self.assertEqual(tables["detail"].set_index("ASIN").loc["B001", "库存SKU"], "LOCAL1")
 
     def test_replenishment_sku_site_margins_aggregate_before_ratio(self):
         gross = self.replenishment_gross_source()

@@ -18,7 +18,7 @@ from backend.system_api import router as system_router
 from backend.tasks import router as tasks_router
 from app_paths import FRONTEND_DIST
 
-app = FastAPI(title="销售数据看板 API", version="2.2.0")
+app = FastAPI(title="销售数据看板 API", version="2.3.0")
 app.add_middleware(GZipMiddleware, minimum_size=500, compresslevel=6)
 app.include_router(tasks_router)
 app.include_router(reports_router)

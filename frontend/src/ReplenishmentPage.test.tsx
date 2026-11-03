@@ -31,6 +31,7 @@ const row: ReplenishmentGroupRow = {
   group_id: 'B001',
   identity: {
     asin: 'B001',
+    product_name: null,
     image: null,
     original_sku: 'SKU-1',
     follower_skus: ['SKU-2', 'SKU-3', 'SKU-4'],
@@ -236,6 +237,34 @@ describe('ReplenishmentDecisionBoard', () => {
     fireEvent.pointerLeave(hitArea, { pointerType: 'mouse' });
     expect(screen.queryByRole('tooltip')).not.toBeInTheDocument();
   });
+  it('keeps price explanations and chart keyboard input separate from the parent row', () => {
+    const onToggle = vi.fn();
+    const country = priceRow.pricing!.countries.DE;
+    const annotated = {
+      ...priceRow,
+      pricing: { ...priceRow.pricing!, countries: { ...priceRow.pricing!.countries, DE: {
+        ...country,
+        history: country.history!.map((point, index) => index === country.history!.length - 1
+          ? { ...point, is_promotion: true, gap_days: 3, anomaly: '测试异常' } : point),
+      } } },
+    };
+    const { container } = render(<ReplenishmentDecisionBoard rows={[annotated]} expanded={new Set()} details={{}} detailLoading={new Set()} detailErrors={{}} onToggle={onToggle} onRetry={vi.fn()} onDisable={vi.fn()} />);
+    const svg = container.querySelector('.replenishment-price-trend-svg') as SVGSVGElement;
+    vi.spyOn(svg, 'getBoundingClientRect').mockReturnValue({ left: 100, top: 100, width: 190, height: 58, right: 290, bottom: 158, x: 100, y: 100, toJSON: () => ({}) });
+    fireEvent.focus(svg);
+    fireEvent.keyDown(svg, { key: 'End' });
+    const tooltip = screen.getByRole('tooltip');
+    expect(tooltip).toHaveTextContent('促销中');
+    expect(tooltip).toHaveTextContent('较开售 100.0%');
+    expect(tooltip).toHaveTextContent('+10 · 100.0%');
+    expect(tooltip).toHaveTextContent('间隔 3 天 · 首次观察到');
+    expect(tooltip).toHaveTextContent('异常：测试异常');
+    expect(tooltip).toHaveTextContent('代表SKU：SKU-1');
+    fireEvent.keyDown(svg, { key: 'Enter' });
+    fireEvent.keyDown(svg, { key: ' ' });
+    expect(onToggle).not.toHaveBeenCalled();
+  });
+
   it('keeps rows without monthly history compact and shows the missing chart state', () => {
     const compactRow = {
       ...row,
@@ -415,6 +444,41 @@ describe('ReplenishmentDecisionBoard', () => {
     const image = container.querySelector('.replenishment-asin-image');
     expect(image).toHaveAttribute('src', 'https://cdn.example.com/SKU-1.jpg');
     expect(image).toHaveAttribute('alt', 'B001库存图片');
+  });
+
+  it('shows the product name above SKU identifiers and uses a placeholder when missing', () => {
+    const namedRow = { ...row, identity: { ...row.identity, product_name: '可折叠露营灯 产品名称完整展示' } };
+    const { container, rerender } = render(
+      <ReplenishmentDecisionBoard
+        rows={[namedRow]}
+        expanded={new Set()}
+        details={{}}
+        detailLoading={new Set()}
+        detailErrors={{}}
+        onToggle={vi.fn()}
+        onRetry={vi.fn()}
+        onDisable={vi.fn()}
+      />,
+    );
+
+    const productName = container.querySelector('.replenishment-product-name');
+    expect(productName).toHaveTextContent('可折叠露营灯 产品名称完整展示');
+    expect(productName).toHaveClass('replenishment-product-name');
+    expect(container.querySelector('.replenishment-product-name')?.nextElementSibling).toHaveClass('replenishment-sku-summary');
+
+    rerender(
+      <ReplenishmentDecisionBoard
+        rows={[row]}
+        expanded={new Set()}
+        details={{}}
+        detailLoading={new Set()}
+        detailErrors={{}}
+        onToggle={vi.fn()}
+        onRetry={vi.fn()}
+        onDisable={vi.fn()}
+      />,
+    );
+    expect(container.querySelector('.replenishment-product-name')).toHaveTextContent('—');
   });
 
   it('retries a failed ASIN image with cache-busting URLs', () => {
@@ -682,11 +746,12 @@ describe('ReplenishmentDecisionBoard', () => {
     expect(screen.getByText('0（0）')).not.toHaveClass('rating-danger');
   });
 
-  it('defaults to min quantity 30 and can select all matched developers', async () => {
+  it('defaults to all quantities and can select all matched developers', async () => {
     const user = userEvent.setup();
     render(<ReplenishmentPage />);
 
-    await waitFor(() => expect(apiMocks.dashboard).toHaveBeenCalledWith('replenishment', expect.objectContaining({ include_pricing: 'false', min_qty: '30', page: '1' }), expect.any(AbortSignal)));
+    await waitFor(() => expect(apiMocks.dashboard).toHaveBeenCalledWith('replenishment', expect.objectContaining({ include_pricing: 'false', min_qty: '0', page: '1' }), expect.any(AbortSignal)));
+    expect(screen.getByRole('button', { name: '建议补货数量门槛: 全部' })).toBeInTheDocument();
     const initialCalls = apiMocks.dashboard.mock.calls.length;
     await user.click(screen.getByRole('button', { name: '开发员筛选: 全部开发员' }));
     await user.type(screen.getByRole('textbox', { name: '搜索开发员筛选' }), '张');
@@ -697,9 +762,34 @@ describe('ReplenishmentDecisionBoard', () => {
     await waitFor(() => expect(apiMocks.dashboard).toHaveBeenLastCalledWith('replenishment', expect.objectContaining({
       developers: '张三',
       include_pricing: 'false',
-      min_qty: '30',
+      min_qty: '0',
       page: '1',
     }), expect.any(AbortSignal)));
+  });
+
+  it('returns the quantity filter to all when cleared or reset', async () => {
+    const user = userEvent.setup();
+    render(<ReplenishmentPage />);
+    await screen.findByRole('grid', { name: 'ASIN补货运营决策矩阵' });
+
+    await user.click(screen.getByRole('button', { name: '建议补货数量门槛: 全部' }));
+    await user.click(await screen.findByRole('radio', { name: '≥30' }));
+    await user.click(screen.getByRole('button', { name: '确定' }));
+    await waitFor(() => expect(apiMocks.dashboard).toHaveBeenLastCalledWith('replenishment', expect.objectContaining({ min_qty: '30' }), expect.any(AbortSignal)));
+
+    await user.click(screen.getByRole('button', { name: '建议补货数量门槛: ≥30' }));
+    await user.click(await screen.findByRole('button', { name: '清空' }));
+    await user.click(screen.getByRole('button', { name: '确定' }));
+    await waitFor(() => expect(apiMocks.dashboard).toHaveBeenLastCalledWith('replenishment', expect.objectContaining({ min_qty: '0' }), expect.any(AbortSignal)));
+    expect(screen.getByRole('button', { name: '建议补货数量门槛: 全部' })).toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: '建议补货数量门槛: 全部' }));
+    await user.click(await screen.findByRole('radio', { name: '≥50' }));
+    await user.click(screen.getByRole('button', { name: '确定' }));
+    await waitFor(() => expect(apiMocks.dashboard).toHaveBeenLastCalledWith('replenishment', expect.objectContaining({ min_qty: '50' }), expect.any(AbortSignal)));
+    await user.click(screen.getByRole('button', { name: '重置筛选' }));
+    await waitFor(() => expect(apiMocks.dashboard).toHaveBeenLastCalledWith('replenishment', expect.objectContaining({ min_qty: '0' }), expect.any(AbortSignal)));
+    expect(screen.getByRole('button', { name: '建议补货数量门槛: 全部' })).toBeInTheDocument();
   });
 
   it('changes the server-side quantity threshold and requires a close reason', async () => {
@@ -707,7 +797,7 @@ describe('ReplenishmentDecisionBoard', () => {
     render(<ReplenishmentPage />);
     await screen.findByRole('grid', { name: 'ASIN补货运营决策矩阵' });
 
-    await user.click(screen.getByRole('button', { name: '建议补货数量门槛: ≥30' }));
+    await user.click(screen.getByRole('button', { name: '建议补货数量门槛: 全部' }));
     await user.click(await screen.findByText('≥50'));
     const callsBeforeConfirm = apiMocks.dashboard.mock.calls.length;
     expect(apiMocks.dashboard).toHaveBeenCalledTimes(callsBeforeConfirm);

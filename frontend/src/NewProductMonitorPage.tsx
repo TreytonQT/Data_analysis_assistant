@@ -1,12 +1,16 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Alert, Badge, Button, Card, Collapse, Image, Input, Space, Statistic, Table, Tag, Typography } from 'antd';
+import { Alert, Badge, Button, Card, Collapse, Input, Space, Table, Tag, Typography } from 'antd';
 import { DownloadOutlined, ReloadOutlined } from '@ant-design/icons';
+
+import type { PageLifecycleProps } from './pageLifecycle';
+import SkuImagePreview from './SkuImagePreview';
+import MetricCard from './components/MetricCard';
+import PageHeading from './components/PageHeading';
 import type { DashboardRow, DashboardSection, NewProductCopyLists, NewProductDashboardPayload } from './api';
 import { api } from './api';
 import { copyWithFeedback, downloadWithFeedback } from './feedback';
 import FilterActions from './FilterActions';
 import ConfirmFilterSelect from './ConfirmFilterSelect';
-
 type LaunchStage = 'all' | '0-6' | '7-29' | '30-59' | '60-100';
 type MonitorStatus = 'all' | 'raise' | 'lower' | 'normal' | 'out_of_stock' | 'observing' | 'invalid';
 
@@ -51,9 +55,8 @@ function uploadedAtLabel(value?: string | null) {
 }
 
 function rowImage(row: DashboardRow) {
-  const image = row.image;
-  if (!image || typeof image !== 'object' || !('url' in image)) return <Typography.Text type="secondary">—</Typography.Text>;
-  return <Image width={36} height={36} src={image.url} alt={String(row.SKU || 'SKU 图片')} style={{ objectFit: 'cover', borderRadius: 6 }} />;
+  return <SkuImagePreview image={row.image} alt={String(row.SKU || 'SKU 图片')}
+    width={36} height={36} className="new-product-image" placeholderClassName="new-product-image-placeholder" />;
 }
 
 function extraDetails(row: DashboardRow) {
@@ -71,11 +74,7 @@ export default function NewProductMonitorPage({
   active = true,
   routeVersion = 0,
   refreshVersion = 0,
-}: {
-  active?: boolean;
-  routeVersion?: number;
-  refreshVersion?: number;
-}) {
+}: PageLifecycleProps) {
   const [data, setData] = useState<NewProductDashboardPayload>();
   const [section, setSection] = useState<DashboardSection>();
   const [copyLists, setCopyLists] = useState<NewProductCopyLists>({ raise_skus: [], lower_skus: [], calculation_date: '' });
@@ -181,9 +180,9 @@ export default function NewProductMonitorPage({
   }, [appliedStatus, baseParams, sortBy, sortOrder]);
 
   const columns = useMemo(() => [
-    { title: '图片', key: 'image', width: 64, render: (_: unknown, row: DashboardRow) => rowImage(row) },
-    { title: 'SKU', dataIndex: 'SKU', key: 'SKU', sorter: true, sortOrder: sortBy === 'SKU' ? (sortOrder === 'asc' ? 'ascend' as const : 'descend' as const) : null, width: 160 },
-    { title: 'ASIN', dataIndex: 'ASIN', key: 'ASIN', width: 120 },
+    { title: '图片', key: 'image', fixed: 'left' as const, width: 64, render: (_: unknown, row: DashboardRow) => rowImage(row) },
+    { title: 'SKU', dataIndex: 'SKU', key: 'SKU', fixed: 'left' as const, sorter: true, sortOrder: sortBy === 'SKU' ? (sortOrder === 'asc' ? 'ascend' as const : 'descend' as const) : null, width: 160 },
+    { title: 'ASIN', dataIndex: 'ASIN', key: 'ASIN', fixed: 'left' as const, width: 120 },
     { title: '开发员', dataIndex: '开发员', key: '开发员', width: 110 },
     { title: '开售日期', dataIndex: '开售时间', key: '开售时间', width: 120 },
     { title: '开售天数', dataIndex: '开售天数', key: '开售天数', sorter: true, sortOrder: sortBy === '开售天数' ? (sortOrder === 'asc' ? 'ascend' as const : 'descend' as const) : null, width: 100 },
@@ -195,9 +194,12 @@ export default function NewProductMonitorPage({
     { title: '14天', dataIndex: '14天销量', key: '14天销量', width: 78, render: (value: unknown) => numberText(value, 0) },
     { title: '30天', dataIndex: '30天销量', key: '30天销量', width: 78, render: (value: unknown) => numberText(value, 0) },
     { title: '90天', dataIndex: '90天销量', key: '90天销量', width: 78, render: (value: unknown) => numberText(value, 0) },
-    { title: '提醒状态', dataIndex: '监控状态', key: '监控状态', width: 150, render: (value: unknown) => statusTag(value) },
     { title: '提醒原因', dataIndex: '提醒原因', key: '提醒原因', width: 190 },
-  ], [sortBy, sortOrder]);
+    { title: '提醒状态', dataIndex: '监控状态', key: '监控状态', fixed: 'right' as const, width: 150, render: (value: unknown) => statusTag(value) },
+  ].map(column => ({
+    ...column,
+    align: ['开售天数', '可售数量', '日均销量', '可售覆盖天数', '昨天销量', '7天销量', '14天销量', '30天销量', '90天销量'].includes(column.key) ? 'right' as const : 'left' as const,
+  })), [sortBy, sortOrder]);
 
   const metrics = data?.metrics || [];
   const metricsByName = new Map(metrics.map(item => [item.name, item]));
@@ -217,15 +219,7 @@ export default function NewProductMonitorPage({
   };
 
   return <div className="dashboard-page dashboard-page-new-products">
-    <div className="page-heading">
-      <div>
-        <Typography.Title level={2}>新品监控</Typography.Title>
-        <Typography.Text type="secondary">
-          首批到货后 100 天内 · 计算日期 {data?.calculation_date || '—'} · 运营表上传于 {uploadedAtLabel(data?.source_uploaded_at)}
-        </Typography.Text>
-      </div>
-      <Button icon={<ReloadOutlined />} loading={loading} onClick={refresh}>刷新</Button>
-    </div>
+    <PageHeading title={'新品监控'} description={<>首批到货后 100 天内 · 计算日期 {data?.calculation_date || '—'} · 运营表上传于 {uploadedAtLabel(data?.source_uploaded_at)}</>} actions={<Button icon={<ReloadOutlined />} loading={loading} onClick={refresh}>刷新</Button>} />
     {error && <Alert className="persistent-page-error" type="error" showIcon message="新品监控加载失败" description={error} action={<Button size="small" onClick={refresh}>重试</Button>} />}
     {data && (data.excluded_invalid_launch_count || 0) > 0 &&
       <Alert className="dashboard-warning" type="warning" showIcon message={'有 ' + data.excluded_invalid_launch_count + ' 个 SKU 缺少或有无效开售日期，未纳入新品监控。'} />}
@@ -233,7 +227,7 @@ export default function NewProductMonitorPage({
       <Space wrap>
         <ConfirmFilterSelect
           mode="multiple"
-          ariaLabel="开发员"
+          ariaLabel="开发员" selectionUnit="人"
           value={appliedDevelopers}
           options={developerOptions.map(value => ({ value, label: value }))}
           onConfirm={value => { setAppliedDevelopers(Array.isArray(value) ? value.map(String) : []); setPage(1); }}
@@ -274,7 +268,7 @@ export default function NewProductMonitorPage({
     {data && <div className="metric-grid new-product-metrics">
       {mainMetricNames.map(name => {
         const item = metricsByName.get(name);
-        return <Card key={name}><Statistic title={name} value={item?.value == null ? 0 : Number(item.value)} /></Card>;
+        return <MetricCard key={name} title={name} value={item?.value == null ? 0 : Number(item.value)} />;
       })}
     </div>}
     {data && <Space className="new-product-status-counts" wrap>
@@ -286,10 +280,10 @@ export default function NewProductMonitorPage({
     </Space>}
     {data && <Typography.Text className="new-product-copy-scope" type="secondary">清单按当前已应用的开发员、开售阶段和SKU/ASIN搜索生成，忽略提醒状态和表格分页。</Typography.Text>}
     {data && <div className="new-product-copy-grid">
-      <Card title={'建议涨价 SKU（' + copyLists.raise_skus.length + '）'} extra={<Button type="primary" danger disabled={loading} onClick={() => void copy(copyLists.raise_skus, '涨价 SKU')}>复制涨价 SKU</Button>}>
+      <Card className="new-product-copy-card" title={'建议涨价 SKU（' + copyLists.raise_skus.length + '）'} extra={<Button disabled={loading} onClick={() => void copy(copyLists.raise_skus, '涨价 SKU')}>复制涨价 SKU</Button>}>
         <Collapse items={[{ key: 'raise', label: '查看清单（' + copyLists.raise_skus.length + '）', children: <Input.TextArea readOnly value={copyLists.raise_skus.join('\n')} autoSize={{ minRows: 1, maxRows: 5 }} placeholder="暂无建议涨价 SKU" /> }]} />
       </Card>
-      <Card title={'建议降价 SKU（' + copyLists.lower_skus.length + '）'} extra={<Button type="primary" disabled={loading} onClick={() => void copy(copyLists.lower_skus, '降价 SKU')}>复制降价 SKU</Button>}>
+      <Card className="new-product-copy-card" title={'建议降价 SKU（' + copyLists.lower_skus.length + '）'} extra={<Button disabled={loading} onClick={() => void copy(copyLists.lower_skus, '降价 SKU')}>复制降价 SKU</Button>}>
         <Collapse items={[{ key: 'lower', label: '查看清单（' + copyLists.lower_skus.length + '）', children: <Input.TextArea readOnly value={copyLists.lower_skus.join('\n')} autoSize={{ minRows: 1, maxRows: 5 }} placeholder="暂无建议降价 SKU" /> }]} />
       </Card>
     </div>}

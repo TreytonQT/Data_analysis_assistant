@@ -1,5 +1,5 @@
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
-import { feedbackMessage, runOperation, copyWithFeedback, downloadWithFeedback, isAbortError } from './feedback';
+import { feedbackMessage, runOperation, copyWithFeedback, downloadWithFeedback, isAbortError, configureFeedback } from './feedback';
 
 function stubMessage(method: 'loading' | 'success' | 'warning' | 'error' | 'info') {
   return vi.spyOn(feedbackMessage, method).mockImplementation(() => undefined as never);
@@ -71,5 +71,36 @@ describe('feedback helpers', () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(failed));
     await expect(downloadWithFeedback('/api/report', 'fallback.csv', '业绩报表')).resolves.toBe(false);
     expect(feedbackMessage.error).toHaveBeenCalled();
+  });
+});
+
+
+describe('configured feedback context', () => {
+  afterEach(() => { configureFeedback(); vi.restoreAllMocks(); });
+
+  it('routes page messages and operation/copy/download helpers through the injected instance', async () => {
+    const context = {
+      loading: vi.fn(), success: vi.fn(), warning: vi.fn(), error: vi.fn(), info: vi.fn(),
+      open: vi.fn(), destroy: vi.fn(),
+    };
+    configureFeedback(context as unknown as Parameters<typeof configureFeedback>[0]);
+    feedbackMessage.success('已保存');
+    await runOperation(async () => 1, { key: 'save', loading: '保存中', success: '已保存' });
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText: vi.fn().mockResolvedValue(undefined) } });
+    await copyWithFeedback('SKU-A', 'SKU', 1);
+    vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:context');
+    vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => undefined);
+    vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => undefined);
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: true, headers: new Headers(), blob: async () => new Blob(['csv']),
+    }));
+    await downloadWithFeedback('/context.csv', 'context.csv');
+    expect(context.success).toHaveBeenCalledWith('已保存');
+    expect(context.success).toHaveBeenCalledWith(expect.objectContaining({ key: 'save' }));
+    expect(context.success).toHaveBeenCalledWith(expect.objectContaining({ key: 'copy-SKU' }));
+    expect(context.success).toHaveBeenCalledWith(expect.objectContaining({ key: 'download-/context.csv' }));
+    expect(context.error).not.toHaveBeenCalled();
+    feedbackMessage.destroy('save');
+    expect(context.destroy).toHaveBeenCalledWith('save');
   });
 });

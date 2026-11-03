@@ -16,6 +16,7 @@ htmlcov/
 
 # Local app/runtime files
 .tmp/
+.playwright-mcp/
 data/
 data/cache/
 

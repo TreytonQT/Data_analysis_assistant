@@ -1,7 +1,7 @@
 import { lazy, Suspense, useEffect, useRef, useState } from 'react';
-import { Spin } from 'antd';
-import DashboardPage from './DashboardPage';
 
+import { PageLoading } from './components/PageState';
+import DashboardPage from './DashboardPage';
 const PromotionBoard = lazy(() => import('./PromotionBoard'));
 
 export type SlowMovingTab = 'details' | 'promotion';
@@ -11,7 +11,7 @@ export function slowMovingTabFromSearch(search: string): SlowMovingTab {
 }
 
 function PromotionLoading() {
-  return <div className="route-loading"><Spin size="large" tip="正在加载调价与促销…" /></div>;
+  return <PageLoading label="正在加载调价与促销…" />;
 }
 
 export default function SlowMovingPage({ active = true, routeVersion = 0, dashboardRefreshVersion = 0, promotionsRefreshVersion = 0 }: { active?: boolean; routeVersion?: number; dashboardRefreshVersion?: number; promotionsRefreshVersion?: number }) {

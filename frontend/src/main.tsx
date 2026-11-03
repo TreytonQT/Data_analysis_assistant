@@ -1,11 +1,18 @@
 import { lazy, Suspense, useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
 import ReactDOM from 'react-dom/client';
-import { App as AntApp, Badge, Button, ConfigProvider, Drawer, Dropdown, Layout, Menu, Space, Spin, Switch, Tabs, Typography, theme, type MenuProps } from 'antd';
+import { App as AntApp, Badge, Button, Drawer, Dropdown, Layout, Menu, Space, Switch, Tabs, Typography, type MenuProps } from 'antd';
 import { BellOutlined, DashboardOutlined, DeploymentUnitOutlined, FileAddOutlined, FundOutlined, InboxOutlined, MoreOutlined, MoonOutlined, SettingOutlined, SunOutlined, UnorderedListOutlined } from '@ant-design/icons';
+
 import { api, type AppRevisions } from './api';
 import './styles.css';
+import './workspace.css';
+import waterMonster from './assets/water-monster.jpg';
+import { useWorkspacePageMotion } from './useWorkspaceMotion';
 import { configureFeedback } from './feedback';
 import SystemControls from './SystemControls';
+import DesignSystemProvider from './DesignSystemProvider';
+import { PageLoading } from './components/PageState';
+import { designTokens } from './designTokens';
 import {
   ancestorKeysForRoute,
   navigationLeafByKey,
@@ -20,7 +27,6 @@ import {
   type QuickTabState,
   type RouteKey,
 } from './navigation';
-
 const UploadCenter = lazy(() => import('./UploadCenter'));
 const ConfigCenter = lazy(() => import('./ConfigCenter'));
 const DashboardPage = lazy(() => import('./DashboardPage'));
@@ -118,6 +124,8 @@ function App() {
   const routeSearches = useRef<Partial<Record<RouteKey, string>>>({ [initialRoute.key]: initialSearch });
   const seenPageRevisions = useRef<Partial<Record<PageKey, Pick<AppRevisions, RevisionDomain>>>>({});
   const activationRequest = useRef(0);
+  const workspaceRef = useRef<HTMLDivElement>(null);
+  useWorkspacePageMotion(workspaceRef, activeRouteKey);
 
   useEffect(() => { activeRouteRef.current = navigationLeafByKey.get(activeRouteKey)!; }, [activeRouteKey]);
   useEffect(() => { persistQuickTabs(quickTabs); }, [quickTabs]);
@@ -251,18 +259,18 @@ function App() {
   const onMenuClick: MenuProps['onClick'] = ({ key }) => { if (validRouteKey(key)) navigateToRoute(key); };
   const onQuickTabEdit = (key: string | React.MouseEvent | React.KeyboardEvent, action: 'add' | 'remove') => { if (action === 'remove') closeQuickTab(String(key)); };
 
-  return <ConfigProvider theme={{ algorithm: dark ? theme.darkAlgorithm : theme.defaultAlgorithm, token: { colorPrimary: '#3b82f6', borderRadius: 10, fontFamily: 'Inter, Microsoft YaHei, sans-serif', colorBgBase: dark ? '#08111f' : '#ffffff', colorBgContainer: dark ? '#142238' : '#ffffff', colorBgElevated: dark ? '#16263d' : '#ffffff', colorText: dark ? '#edf4ff' : '#172033', colorTextSecondary: dark ? '#a9b9cf' : '#667085', colorBorder: dark ? '#2d4059' : '#e0e7f0' } }}>
-    <AntApp message={{ top: 24, maxCount: 3, duration: 2.5 }}>
+  return <DesignSystemProvider dark={dark}>
+    <AntApp message={designTokens.feedback}>
       <FeedbackBridge />
-      <Layout className={`app-shell ${dark ? 'dark-mode' : ''}`}>
-        <Sider width={240} collapsible collapsed={sidebarCollapsed} onCollapse={setSidebarCollapsed} breakpoint="lg" collapsedWidth={0} className="side-nav">
-          <div className="brand"><div className="brand-mark">数</div><div><strong>销售数据看板</strong><span>经营分析工作台</span></div></div>
+      <Layout className={`app-shell workspace-shell ${dark ? 'dark-mode' : ''}`}>
+        <Sider width={designTokens.layout.sidebarWidth} collapsible collapsed={sidebarCollapsed} onCollapse={setSidebarCollapsed} breakpoint="lg" collapsedWidth={0} className="side-nav">
+          <div className="brand"><img className="brand-mascot" src={waterMonster} alt="小水怪" /><div><strong>销售数据看板</strong><span>经营分析工作台</span></div></div>
           <Menu theme={dark ? 'dark' : 'light'} mode="inline" selectedKeys={[activeRouteKey]} openKeys={openKeys} items={sidebarItems} onOpenChange={setOpenKeys} onClick={onMenuClick} />
         </Sider>
         <Layout className="main-layout">
-          <Header className="topbar"><Typography.Text strong>{topLevelLabelForRoute(activeRouteKey)}</Typography.Text><Space><SystemControls compact /><Switch checked={dark} onChange={value => { setDark(value); localStorage.setItem('dashboard-theme', value ? 'dark' : 'light'); }} checkedChildren={<MoonOutlined />} unCheckedChildren={<SunOutlined />} /><Badge count={notices} size="small"><Button icon={<BellOutlined />} onClick={() => setDrawer(true)}>提醒</Button></Badge></Space></Header>
+          <Header className="topbar"><Typography.Text className="workspace-breadcrumb"><span>工作台</span><span aria-hidden="true"> / </span><strong>{topLevelLabelForRoute(activeRouteKey)}</strong></Typography.Text><Space><SystemControls compact /><Switch aria-label="深色主题" checked={dark} onChange={value => { setDark(value); localStorage.setItem('dashboard-theme', value ? 'dark' : 'light'); }} checkedChildren={<MoonOutlined />} unCheckedChildren={<SunOutlined />} /><Badge count={notices} size="small"><Button icon={<BellOutlined />} onClick={() => setDrawer(true)}>提醒</Button></Badge></Space></Header>
           <div className="quick-tabbar" aria-label="最近访问页面"><Tabs type="editable-card" hideAdd activeKey={activeRouteKey} tabBarExtraContent={<Dropdown menu={{ items: [{ key: 'close-others', label: '关闭其他', disabled: activeRouteKey === 'overview' || quickTabs.length <= 2 }, { key: 'close-right', label: '关闭右侧', disabled: quickTabs.findIndex(tab => tab.key === activeRouteKey) >= quickTabs.length - 1 }], onClick: ({ key }) => key === 'close-others' ? closeOtherQuickTabs() : closeRightQuickTabs() }}><Button type="text" icon={<MoreOutlined />} aria-label="标签操作" /></Dropdown>} items={quickTabs.map(tab => ({ key: tab.key, label: <span title={tab.label} className="quick-tab-label">{tab.label}</span>, closable: tab.closable, children: null }))} onChange={key => { if (validRouteKey(key)) navigateToRoute(key); }} onEdit={onQuickTabEdit} /></div>
-          <Content className="content-viewport">{Array.from(mountedPages).map(renderPage)}</Content>
+          <Content className="content-viewport" ref={workspaceRef}>{Array.from(mountedPages).map(renderPage)}</Content>
         </Layout>
       </Layout>
       <Drawer
@@ -277,11 +285,11 @@ function App() {
         <Suspense fallback={<RouteLoading compact />}><TaskBoard active={drawer} onTasksChanged={refreshNotices} /></Suspense>
       </Drawer>
     </AntApp>
-  </ConfigProvider>;
+  </DesignSystemProvider>;
 }
 
 function RouteLoading({ compact = false }: { compact?: boolean }) {
-  return <div className={compact ? 'drawer-route-loading' : 'route-loading'}><Spin size="large" tip="正在加载页面…" /></div>;
+  return <PageLoading compact={compact} />;
 }
 
 ReactDOM.createRoot(document.getElementById('root')!).render(<App />);

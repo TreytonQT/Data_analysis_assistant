@@ -63,6 +63,7 @@ from dashboard.data_processing import (
     normalize_replenishment_product_tags,
     normalize_replenishment_switches,
     normalize_sku_image_map,
+    attach_sku_image_map,
     normalize_store_config,
     normalize_sales_amount_detail,
     normalize_sales_volume_detail,
@@ -302,38 +303,25 @@ def _optional_sku_image_map() -> pd.DataFrame:
         return pd.DataFrame(columns=["库存SKU", "虚拟SKU", "库存图片链接"])
 
 
-def _sku_image_lookup(operational: pd.DataFrame, image_map: pd.DataFrame) -> dict[str, dict[str, str]]:
-    """Build a virtual-SKU lookup only for exact operational SKU pairs."""
+SkuImageLookup = dict[str | tuple[str, str], dict[str, str]]
 
-    required = {"本地SKU", "MSKU"}
-    if image_map.empty or not required.issubset(operational.columns):
+
+def _sku_image_lookup(operational: pd.DataFrame, image_map: pd.DataFrame) -> SkuImageLookup:
+    """Use exact MSKU/ASIN pairs for new exports; retain legacy SKU pairs."""
+
+    if image_map.empty:
         return {}
-
-    operational_keys = operational[["本地SKU", "MSKU"]].copy()
-    for column in operational_keys.columns:
-        operational_keys[column] = operational_keys[column].map(
-            lambda value: "" if value is None or pd.isna(value) else str(value).strip()
-        )
-    operational_keys["_库存SKU关联键"] = operational_keys["本地SKU"].str.upper()
-    operational_keys["_虚拟SKU关联键"] = operational_keys["MSKU"].str.upper()
-    operational_keys = operational_keys[
-        operational_keys["_库存SKU关联键"].ne("")
-        & operational_keys["_虚拟SKU关联键"].ne("")
-    ].drop_duplicates(["_库存SKU关联键", "_虚拟SKU关联键"])
-    if operational_keys.empty:
+    mapping = normalize_sku_image_map(image_map)
+    new_format = {"MSKU", "ASIN", "图片链接"}.issubset(mapping.columns)
+    required = {"MSKU", "ASIN"} if new_format else {"本地SKU", "MSKU"}
+    if not required.issubset(operational.columns):
         return {}
-
-    mapping = image_map.copy()
-    mapping["_库存SKU关联键"] = mapping["库存SKU"].str.strip().str.upper()
-    mapping["_虚拟SKU关联键"] = mapping["虚拟SKU"].str.strip().str.upper()
-    matched = mapping.merge(
-        operational_keys[["_库存SKU关联键", "_虚拟SKU关联键"]],
-        on=["_库存SKU关联键", "_虚拟SKU关联键"],
-        how="inner",
-        validate="one_to_one",
-    )
+    matched = attach_sku_image_map(operational, mapping)
+    columns = ["MSKU", *(["ASIN"] if new_format else []), "库存SKU", "虚拟SKU", "库存图片链接"]
+    matched = matched.loc[matched["库存图片链接"].notna(), columns].fillna("")
     return {
-        str(row["_虚拟SKU关联键"]): {
+        ((str(row["MSKU"]).strip().upper(), str(row["ASIN"]).strip().upper())
+         if new_format else str(row["MSKU"]).strip().upper()): {
             "url": str(row["库存图片链接"]),
             "inventory_sku": str(row["库存SKU"]),
             "virtual_sku": str(row["虚拟SKU"]),
@@ -342,8 +330,17 @@ def _sku_image_lookup(operational: pd.DataFrame, image_map: pd.DataFrame) -> dic
     }
 
 
+def _sku_image_for_row(image_lookup: SkuImageLookup, sku: object, asin: object = None) -> dict[str, str] | None:
+    def key(value: object) -> str:
+        return "" if value is None or pd.isna(value) else str(value).strip().upper()
+
+    # A new mapping never falls back to MSKU alone, which could select an image
+    # belonging to a different ASIN. String keys exist only for legacy files.
+    return image_lookup.get((key(sku), key(asin))) or image_lookup.get(key(sku))
+
+
 def _rows_with_sku_images(
-    image_lookup: dict[str, dict[str, str]],
+    image_lookup: SkuImageLookup,
     sku_column: str = "SKU",
 ) -> Callable[[pd.DataFrame], list[dict[str, Any]]]:
     """Create a section row serializer that adds a non-column image field."""
@@ -351,9 +348,7 @@ def _rows_with_sku_images(
     def serialize(frame: pd.DataFrame) -> list[dict[str, Any]]:
         result = records(frame)
         for row in result:
-            value = row.get(sku_column)
-            key = "" if value is None or pd.isna(value) else str(value).strip().upper()
-            image = image_lookup.get(key)
+            image = _sku_image_for_row(image_lookup, row.get(sku_column), row.get("ASIN"))
             row["image"] = dict(image) if image else None
         return result
 
@@ -361,7 +356,7 @@ def _rows_with_sku_images(
 
 
 def _slow_moving_csv_frame(
-    image_lookup: dict[str, dict[str, str]],
+    image_lookup: SkuImageLookup,
 ) -> Callable[[pd.DataFrame], pd.DataFrame]:
     """Flatten the slow-moving matrix identity and image fields for CSV export."""
 
@@ -397,19 +392,16 @@ def _slow_moving_csv_frame(
         "可售天数": "可售天数（天）",
     }
 
-    def image_value(value: object, field: str) -> object:
-        if value is None or pd.isna(value):
-            return None
-        key = str(value).strip().upper()
-        return image_lookup.get(key, {}).get(field)
-
     def serialize(frame: pd.DataFrame) -> pd.DataFrame:
         result = frame.copy()
         if "日均销量" not in result.columns:
             result["日均销量"] = pd.NA
-        result["库存图片链接"] = result["SKU"].map(lambda value: image_value(value, "url"))
-        result["库存SKU"] = result["SKU"].map(lambda value: image_value(value, "inventory_sku"))
-        result["虚拟SKU"] = result["SKU"].map(lambda value: image_value(value, "virtual_sku"))
+        images = [
+            _sku_image_for_row(image_lookup, row.get("SKU"), row.get("ASIN")) or {}
+            for row in frame.to_dict("records")
+        ]
+        for column, field in [("库存图片链接", "url"), ("库存SKU", "inventory_sku"), ("虚拟SKU", "virtual_sku")]:
+            result[column] = [image.get(field) for image in images]
         columns = [column for column in ordered if column in result.columns]
         columns.extend(column for column in result.columns if column not in columns)
         return result[columns].rename(columns=amount_renames)
@@ -1021,7 +1013,7 @@ def _cached_new_product_base(revision: str, business_day: str) -> dict[str, Any]
         except Exception:
             pass
 
-    image_lookup: dict[str, dict[str, str]] = {}
+    image_lookup: SkuImageLookup = {}
     try:
         image_lookup = _sku_image_lookup(operational, _optional_sku_image_map())
     except Exception:
@@ -2135,6 +2127,7 @@ def _replenishment_group_rows(
                 "group_id": str(row.get("补货组ID") or ""),
                 "identity": {
                     "asin": str(row.get("ASIN") or ""),
+                    "product_name": _text_value(row.get("产品名称")) or None,
                     "image": image,
                     "original_sku": str(row.get("原SKU") or ""),
                     "follower_skus": _split_compact(row.get("跟卖SKU")),
@@ -2201,7 +2194,7 @@ def _filter_replenishment_detail(
     return result.reset_index(drop=True)
 
 
-def _build_replenishment(developers: str | None, min_qty: int = 30) -> dict[str, Any]:
+def _build_replenishment(developers: str | None, min_qty: int = 0) -> dict[str, Any]:
     operational = load_source_frame("operational_sales", "运营原始表")
     options = developer_options(operational)
     chosen = selected_values(developers, options)
@@ -2395,7 +2388,7 @@ def _bundle(
     store_types: str | None = None,
     threshold: str = "90天以上",
     month: str | None = None,
-    min_qty: int = 30,
+    min_qty: int = 0,
     view: str | None = None,
 ) -> dict[str, Any]:
     revision = _page_revision(page_name, view)
@@ -2761,7 +2754,7 @@ def department_assessment(month: str | None = None):
 @router.get("/replenishment")
 def replenishment(
     developers: str | None = None,
-    min_qty: int = Query(30, ge=0),
+    min_qty: int = Query(0, ge=0),
     include_pricing: bool = True,
     page: int = Query(1, ge=1),
     page_size: int = Query(SUMMARY_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
@@ -2879,7 +2872,7 @@ def replenishment_group_details(group_id: str):
 @router.get("/replenishment/export.xlsx")
 def export_replenishment(
     developers: str | None = None,
-    min_qty: int = Query(30, ge=0),
+    min_qty: int = Query(0, ge=0),
     search: str | None = Query(None, max_length=200),
     sort_by: str | None = Query(None, max_length=100),
     sort_order: str = Query('asc', pattern='^(asc|desc)$'),
@@ -2995,11 +2988,12 @@ def dashboard_section(
     store_types: str | None = None,
     threshold: str = "90天以上",
     month: str | None = None,
-    min_qty: int = Query(30, ge=0),
+    min_qty: int | None = Query(None, ge=0),
     include_pricing: bool = True,
     view: str | None = None,
 ):
     try:
+        effective_min_qty = min_qty if min_qty is not None else (0 if page_name == "replenishment" else 30)
         bundle = _bundle(
             page_name,
             developers=developers,
@@ -3008,7 +3002,7 @@ def dashboard_section(
             store_types=store_types,
             threshold=threshold,
             month=month,
-            min_qty=min_qty,
+            min_qty=effective_min_qty,
             view=view,
         )
         return _serialized_section(_section_model(bundle, section_key), page, page_size, search, sort_by, sort_order, include_pricing=include_pricing)
@@ -3042,10 +3036,11 @@ def export_dashboard_section(
     store_types: str | None = None,
     threshold: str = "90天以上",
     month: str | None = None,
-    min_qty: int = Query(30, ge=0),
+    min_qty: int | None = Query(None, ge=0),
     view: str | None = None,
 ):
     try:
+        effective_min_qty = min_qty if min_qty is not None else (0 if page_name == "replenishment" else 30)
         bundle = _bundle(
             page_name,
             developers=developers,
@@ -3054,7 +3049,7 @@ def export_dashboard_section(
             store_types=store_types,
             threshold=threshold,
             month=month,
-            min_qty=min_qty,
+            min_qty=effective_min_qty,
             view=view,
         )
         model = _section_model(bundle, section_key)

@@ -1,10 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Alert, Button, Card, Input, Popconfirm, Select, Space, Spin, Table, Tag, Typography, Upload } from 'antd';
-import { feedbackMessage as message, downloadWithFeedback } from './feedback';
 import { DeleteOutlined, DownloadOutlined, PlusOutlined, ReloadOutlined, SaveOutlined, UploadOutlined } from '@ant-design/icons';
 import type { UploadProps } from 'antd';
-import { api, apiErrorMessage, type ConfigData } from './api';
 
+import type { PageLifecycleProps } from './pageLifecycle';
+import PageHeading from './components/PageHeading';
+import { feedbackMessage as message, downloadWithFeedback } from './feedback';
+import { api, type ConfigData } from './api';
 type ConfigRow = Record<string, unknown> & { _rowId: string };
 type EditableConfig = Omit<ConfigData, 'rows'> & { rows: ConfigRow[] };
 
@@ -55,7 +57,7 @@ export function configTabFromSearch(search: string) {
   return value || 'metrics_config';
 }
 
-export default function ConfigCenter({ active: pageActive = true, routeVersion = 0, refreshVersion = 0 }: { active?: boolean; routeVersion?: number; refreshVersion?: number }) {
+export default function ConfigCenter({ active: pageActive = true, routeVersion = 0, refreshVersion = 0 }: PageLifecycleProps) {
   const [configs, setConfigs] = useState<EditableConfig[]>([]);
   const [active, setActive] = useState(() => configTabFromSearch(window.location.search));
   const [saving, setSaving] = useState('');
@@ -154,10 +156,7 @@ export default function ConfigCenter({ active: pageActive = true, routeVersion =
       setError('');
       message.loading({ key: operationKey, content: `正在导入并校验${config.title}…`, duration: 0 });
       try {
-        const body = new FormData(); body.append('file', file);
-        const response = await fetch(`/api/config/${config.name}/upload`, { method: 'POST', body });
-        const result = await response.json().catch(() => ({}));
-        if (!response.ok) throw new Error(apiErrorMessage(result, '导入失败'));
+        const result = await api.uploadConfig(config.name, file);
         setConfigs(current => current.map(item => item.name === config.name ? { ...item, rows: attachRowIds(result.rows) } : item));
         clearDirty(config.name);
         setLastUpdated(result.updated_at ? new Date(result.updated_at).toLocaleString('zh-CN', { hour12: false }) : new Date().toLocaleString('zh-CN', { hour12: false }));
@@ -210,10 +209,7 @@ export default function ConfigCenter({ active: pageActive = true, routeVersion =
 
   const reloadButton = <Button disabled={loading || Boolean(saving)} loading={loading} icon={<ReloadOutlined />} onClick={() => { if (!hasDirty) void manualRefresh(); }}>重新载入</Button>;
   return <>
-    <div className="page-heading">
-      <div><Typography.Title level={2}>配置中心</Typography.Title><Typography.Text type="secondary">所有配置均在保存前校验字段、数值和业务规则；库存覆盖规则会校验重量区间完整且不重叠。{lastUpdated && ` · 数据更新时间 ${lastUpdated}`}</Typography.Text></div>
-      {hasDirty ? <Popconfirm title="放弃全部未保存修改并重新载入吗？" onConfirm={() => void refresh()}>{reloadButton}</Popconfirm> : reloadButton}
-    </div>
+    <PageHeading title={'配置中心'} description={<>所有配置均在保存前校验字段、数值和业务规则；库存覆盖规则会校验重量区间完整且不重叠。{lastUpdated && ` · 数据更新时间 ${lastUpdated}`}</>} actions={hasDirty ? <Popconfirm title="放弃全部未保存修改并重新载入吗？" onConfirm={() => void refresh()}>{reloadButton}</Popconfirm> : reloadButton} />
     {error && <Alert className="persistent-page-error" type="error" showIcon message="配置操作失败" description={error} action={hasDirty ? <Button size="small" onClick={() => setError('')}>保留本地修改</Button> : <Button size="small" onClick={() => void manualRefresh()}>重新加载</Button>} />}
     <Spin spinning={loading} tip="正在读取配置…"><div className="page-loading-min-height">{items.find(item => item.key === active)?.children}</div></Spin>
   </>;

@@ -1,7 +1,9 @@
 import { Tooltip } from 'antd';
+
+import { COUNTRIES, marginBand, ratingBand } from './productPresentation';
+import { formatAmountInWan } from './formatters';
 import type { DashboardColumn, DashboardRow, DashboardSection } from './api';
 import SkuImagePreview from './SkuImagePreview';
-
 export type DashboardMatrixKind = 'product-detail' | 'low-margin' | 'slow-moving';
 
 const PRODUCT_GROUPS = {
@@ -36,12 +38,7 @@ export const PRODUCT_MATRIX_FIELDS = Object.values(PRODUCT_GROUPS).flat();
 export const LOW_MARGIN_MATRIX_FIELDS = Object.values(LOW_MARGIN_GROUPS).flat();
 export const SLOW_MOVING_MATRIX_FIELDS = Object.values(SLOW_MOVING_GROUPS).flat();
 
-const COUNTRY_GROUPS = [
-  { code: 'DE', name: '德国' },
-  { code: 'FR', name: '法国' },
-  { code: 'ES', name: '西班牙' },
-  { code: 'IT', name: '意大利' },
-] as const;
+const COUNTRY_GROUPS = COUNTRIES;
 
 const PRODUCT_HEADERS = ['产品识别', '开售信息', '库存效率', '近期销量', 'DE', 'FR', 'ES', 'IT', '整体收益'];
 const LOW_MARGIN_HEADERS = ['产品识别', '站点销量', '收益金额', '毛利风险'];
@@ -66,7 +63,7 @@ function numeric(value: unknown): number | null {
 }
 
 function amountInWan(value: number) {
-  return `${(value / 10000).toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} 万`;
+  return `${formatAmountInWan(value)} 万`;
 }
 
 function launchPrice(value: unknown) {
@@ -105,10 +102,7 @@ function createFormatter(columns: DashboardColumn[]) {
 export function marginTone(value: unknown) {
   const number = numeric(value);
   if (number === null) return 'tone-missing';
-  if (number < 0) return 'tone-negative';
-  if (number < 0.1) return 'tone-low';
-  if (number < 0.2) return 'tone-warning';
-  return 'tone-good';
+  return `tone-${marginBand(number)}`;
 }
 
 export function adRatioTone(value: unknown) {
@@ -134,9 +128,7 @@ export function ratingTone(value: unknown) {
   const { count, score } = ratingParts(value);
   if (count === 0) return 'rating-missing';
   if (score === null || !Number.isFinite(score)) return 'rating-missing';
-  if (score >= 4.3) return 'rating-good';
-  if (score >= 3.5) return 'rating-warning';
-  return 'rating-danger';
+  return `rating-${ratingBand(score)}`;
 }
 
 function CompactText({ value, className = '' }: { value: unknown; className?: string }) {

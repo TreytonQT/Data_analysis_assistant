@@ -15,7 +15,7 @@ describe('ConfirmFilterSelect', () => {
   it('searches and selects all matching developers without committing before confirm', async () => {
     const user = userEvent.setup();
     const onConfirm = vi.fn();
-    render(<ConfirmFilterSelect mode="multiple" ariaLabel="开发员" placeholder="全部开发员" value={['lin-25']} options={developerOptions} onConfirm={onConfirm} />);
+    render(<ConfirmFilterSelect mode="multiple" ariaLabel="开发员" selectionUnit="人" placeholder="全部开发员" value={['lin-25']} options={developerOptions} onConfirm={onConfirm} />);
 
     await user.click(screen.getByRole('button', { name: '开发员: 已选 1 人' }));
     expect(screen.getByRole('checkbox', { name: '全选当前搜索结果' })).toBePartiallyChecked();
@@ -36,7 +36,7 @@ describe('ConfirmFilterSelect', () => {
   it('discards edits on cancel, Escape, and outside click', async () => {
     const user = userEvent.setup();
     const onConfirm = vi.fn();
-    render(<ConfirmFilterSelect mode="multiple" ariaLabel="开发员" placeholder="全部开发员" value={[]} options={developerOptions} onConfirm={onConfirm} />);
+    render(<ConfirmFilterSelect mode="multiple" ariaLabel="开发员" selectionUnit="人" placeholder="全部开发员" value={[]} options={developerOptions} onConfirm={onConfirm} />);
     const trigger = screen.getByRole('button', { name: '开发员: 全部开发员' });
 
     await user.click(trigger);
@@ -58,6 +58,56 @@ describe('ConfirmFilterSelect', () => {
     expect(onConfirm).not.toHaveBeenCalled();
   });
 
+  it('immediately applies only the chosen search result and discards other selections and drafts', async () => {
+    const user = userEvent.setup();
+    const onConfirm = vi.fn();
+    render(<ConfirmFilterSelect ariaLabel="开发员" selectionUnit="人" placeholder="全部开发员" value={['lin-25']} options={developerOptions} onConfirm={onConfirm} />);
+    const trigger = screen.getByRole('button', { name: '开发员: 已选 1 人' });
+
+    await user.click(trigger);
+    await user.click(screen.getByRole('checkbox', { name: '运营二十七部-陈千潼' }));
+    await user.type(screen.getByRole('textbox', { name: '搜索开发员' }), '林飞扬-26');
+    expect(onConfirm).not.toHaveBeenCalled();
+    await user.click(screen.getByRole('button', { name: '仅筛选此项：运营二十七部-林飞扬-26' }));
+
+    expect(onConfirm).toHaveBeenCalledExactlyOnceWith(['lin-26']);
+    await waitFor(() => expect(trigger).toHaveAttribute('aria-expanded', 'false'));
+  });
+
+  it('closes without resubmitting when the only chosen option is already applied', async () => {
+    const user = userEvent.setup();
+    const onConfirm = vi.fn();
+    render(<ConfirmFilterSelect ariaLabel="开发员" selectionUnit="人" placeholder="全部开发员" value={['chen']} options={developerOptions} onConfirm={onConfirm} />);
+    const trigger = screen.getByRole('button', { name: '开发员: 已选 1 人' });
+
+    await user.click(trigger);
+    await user.click(screen.getByRole('checkbox', { name: '运营二十七部-林飞扬-25' }));
+    await user.click(screen.getByRole('button', { name: '仅筛选此项：运营二十七部-陈千潼' }));
+    expect(onConfirm).not.toHaveBeenCalled();
+    await waitFor(() => expect(trigger).toHaveAttribute('aria-expanded', 'false'));
+  });
+
+  it('supports keyboard quick selection for numeric single filters and preserves normalized defaults', async () => {
+    const user = userEvent.setup();
+    const onConfirm = vi.fn();
+    const options = [{ value: 30, label: '≥30' }, { value: 50, label: '≥50' }];
+    const { rerender } = render(<ConfirmFilterSelect mode="single" ariaLabel="补货数量" placeholder="补货数量门槛" value={30} options={options} onConfirm={onConfirm} />);
+
+    await user.click(screen.getByRole('button', { name: '补货数量: ≥30' }));
+    screen.getByRole('button', { name: '仅筛选此项：≥50' }).focus();
+    await user.keyboard('{Enter}');
+    expect(onConfirm).toHaveBeenCalledExactlyOnceWith(50);
+    await waitFor(() => expect(screen.getByRole('button', { name: '补货数量: ≥30' })).toHaveAttribute('aria-expanded', 'false'));
+
+    onConfirm.mockClear();
+    rerender(<ConfirmFilterSelect mode="single" ariaLabel="补货数量" placeholder="补货数量门槛" options={options} normalizeValue={value => value ?? 30} onConfirm={onConfirm} />);
+    const trigger = screen.getByRole('button', { name: '补货数量: 补货数量门槛' });
+    await user.click(trigger);
+    await user.click(screen.getByRole('button', { name: '仅筛选此项：≥30' }));
+    expect(onConfirm).not.toHaveBeenCalled();
+    await waitFor(() => expect(trigger).toHaveAttribute('aria-expanded', 'false'));
+  });
+
   it('confirms a numeric single selection and skips a semantic no-op', async () => {
     const user = userEvent.setup();
     const onConfirm = vi.fn();
@@ -71,7 +121,7 @@ describe('ConfirmFilterSelect', () => {
     expect(onConfirm).toHaveBeenCalledWith(50);
 
     onConfirm.mockClear();
-    rerender(<ConfirmFilterSelect mode="multiple" ariaLabel="开发员" placeholder="全部开发员" value={[]} options={developerOptions} onConfirm={onConfirm} />);
+    rerender(<ConfirmFilterSelect mode="multiple" ariaLabel="开发员" selectionUnit="人" placeholder="全部开发员" value={[]} options={developerOptions} onConfirm={onConfirm} />);
     await user.click(screen.getByRole('button', { name: '开发员: 全部开发员' }));
     await user.click(screen.getByRole('checkbox', { name: '全选当前搜索结果' }));
     await user.click(screen.getByRole('button', { name: '确定' }));
@@ -81,7 +131,7 @@ describe('ConfirmFilterSelect', () => {
   it('clears a selection only after confirmation', async () => {
     const user = userEvent.setup();
     const onConfirm = vi.fn();
-    render(<ConfirmFilterSelect mode="multiple" ariaLabel="开发员" placeholder="全部开发员" value={['chen']} options={developerOptions} onConfirm={onConfirm} />);
+    render(<ConfirmFilterSelect mode="multiple" ariaLabel="开发员" selectionUnit="人" placeholder="全部开发员" value={['chen']} options={developerOptions} onConfirm={onConfirm} />);
 
     await user.click(screen.getByRole('button', { name: '开发员: 已选 1 人' }));
     await user.click(screen.getByRole('button', { name: '清空' }));

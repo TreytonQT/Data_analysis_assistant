@@ -194,17 +194,20 @@ def _sku_image_map_unmatched_warning(frame: pd.DataFrame) -> str | None:
         operational = read_local_table(operational_path)
     except (OSError, ValueError, TypeError):
         return warning(len(frame), list(range(2, len(frame) + 2)), "当前运营原始表无法读取；") if not frame.empty else None
-    if not {"本地SKU", "MSKU"}.issubset(operational.columns):
-        return warning(len(frame), list(range(2, len(frame) + 2)), "当前运营原始表缺少本地SKU或MSKU；") if not frame.empty else None
+    new_format = {"MSKU", "ASIN", "图片链接"}.issubset(frame.columns)
+    operational_columns = ["MSKU", "ASIN"] if new_format else ["本地SKU", "MSKU"]
+    mapping_columns = ["MSKU", "ASIN"] if new_format else ["库存SKU", "虚拟SKU"]
+    if not set(operational_columns).issubset(operational.columns):
+        return warning(len(frame), list(range(2, len(frame) + 2)), f"当前运营原始表缺少{'或'.join(operational_columns)}；") if not frame.empty else None
 
     current_keys = {
-        (str(row["本地SKU"]).strip().upper(), str(row["MSKU"]).strip().upper())
-        for _, row in operational[["本地SKU", "MSKU"]].fillna("").iterrows()
+        tuple(str(value).strip().upper() for value in row)
+        for row in operational[operational_columns].fillna("").itertuples(index=False, name=None)
     }
     missing = [
         position + 2
-        for position, (_, row) in enumerate(frame.iterrows())
-        if (row["库存SKU"].upper(), row["虚拟SKU"].upper()) not in current_keys
+        for position, row in enumerate(frame[mapping_columns].itertuples(index=False, name=None))
+        if tuple(str(value).strip().upper() for value in row) not in current_keys
     ]
     if not missing:
         return None
@@ -405,8 +408,9 @@ async def upload_source(source_key: str, file: Annotated[UploadFile, File(...)])
             if duplicate_count:
                 duplicate_warning = f"检测到 {duplicate_count} 条完全重复图片映射，已合并为唯一映射"
             if empty_url_count:
+                url_column = "图片链接" if "图片链接" in normalized.columns else "库存图片链接"
                 source_warnings.append(
-                    f"检测到 {empty_url_count} 行库存图片链接为空，已跳过；这些记录将在补货页显示无图片"
+                    f"检测到 {empty_url_count} 行{url_column}为空，已跳过；这些记录将在补货页显示无图片"
                 )
             unmatched_warning = _sku_image_map_unmatched_warning(normalized)
             if unmatched_warning:

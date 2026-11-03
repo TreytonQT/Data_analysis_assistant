@@ -4,7 +4,7 @@
 
 ## Windows 便携版（推荐）
 
-从 [GitHub Releases](https://github.com/TreytonQT/Data_analysis_assistant/releases/latest) 下载 `DataAnalysisAssistant-windows-x64-v2.2.0.zip` 和对应的 `.sha256.txt`：
+从 [GitHub Releases](https://github.com/TreytonQT/Data_analysis_assistant/releases/latest) 下载 `DataAnalysisAssistant-windows-x64-v2.3.0.zip` 和对应的 `.sha256.txt`：
 
 1. 可选：使用 `Get-FileHash` 核对压缩包 SHA-256。
 2. 将压缩包完整解压到固定目录，不要直接在压缩包中运行。
@@ -12,7 +12,7 @@
 4. 保留启动窗口；关闭窗口或按 `Ctrl+C` 即停止程序。
 
 ```powershell
-Get-FileHash .\DataAnalysisAssistant-windows-x64-v2.2.0.zip -Algorithm SHA256
+Get-FileHash .\DataAnalysisAssistant-windows-x64-v2.3.0.zip -Algorithm SHA256
 ```
 
 便携版内置前端和 Python 运行环境，不要求另行安装 Python、Node.js 或 Docker。首次运行会在程序目录旁创建 `data/` 和空数据库，默认配置位于 `configs/`。
@@ -111,6 +111,10 @@ docker compose down
 4. 新品监控依赖运营原始表及有效开售日期；实际价格依赖按日上传的 Listing 快照，部门预测依赖销售额按日历史。首次升级缺少这些数据时，先按上传中心提示补充，历史间隔不会被虚构为连续观测。
 
 本土考核比例保存在当前浏览器的 localStorage 中，复制 `data/` 和 `configs/` 不会把该偏好带到另一台电脑或浏览器。提成与部门费用率请在部门提成监控的展开行中维护。
+
+## 从 v2.2.x 升级到 v2.3.0
+
+停止旧程序并完整备份 `data/`、`configs/`，再复制到完整解压的新版目录。旧图片映射仍可读取，无需批量改写；新上传推荐使用 `MSKU、ASIN、图片链接`。补货默认最低数量现为 0，如需原来的筛选范围，请手动选择 30。本次保留 CSV/SQLite 结构及业务数据目录约定；源码部署须重新安装锁定的前端依赖并构建，以包含新增 GSAP 与品牌资源。
 
 ## 常见问题
 

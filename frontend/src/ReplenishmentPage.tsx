@@ -1,8 +1,13 @@
-import { useCallback, useEffect, useId, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react';
-import { createPortal } from 'react-dom';
-import { Alert, Button, Card, Empty, Input, Modal, Pagination, Select, Space, Spin, Statistic, Tag, Tooltip, Typography } from 'antd';
-import { feedbackMessage as message, downloadWithFeedback } from './feedback';
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
+import { Alert, Button, Card, Empty, Input, Pagination, Select, Space, Spin, Statistic, Tag, Tooltip, Typography } from 'antd';
 import { DownOutlined, DownloadOutlined, ReloadOutlined, RightOutlined, SearchOutlined } from '@ant-design/icons';
+
+import type { PageLifecycleProps } from './pageLifecycle';
+import { COUNTRY_ORDER, COUNTRY_NAMES, marginBand, ratingBand } from './productPresentation';
+import MutationModal from './components/MutationModal';
+import MetricCard from './components/MetricCard';
+import PageHeading from './components/PageHeading';
+import { feedbackMessage as message, downloadWithFeedback } from './feedback';
 import {
   api,
   type DashboardPayload,
@@ -17,14 +22,7 @@ import {
 import SkuImagePreview from './SkuImagePreview';
 import FilterActions from './FilterActions';
 import ConfirmFilterSelect from './ConfirmFilterSelect';
-
-const COUNTRY_ORDER = ['DE', 'FR', 'ES', 'IT'] as const;
-const COUNTRY_NAMES: Record<typeof COUNTRY_ORDER[number], string> = {
-  DE: '德国',
-  FR: '法国',
-  ES: '西班牙',
-  IT: '意大利',
-};
+import ChartAxisTooltip, { useChartAxisTooltip } from './components/ChartAxisTooltip';
 const SORT_OPTIONS = [
   { value: '建议补货数量:desc', label: '建议补货数量：高到低' },
   { value: 'ASIN总库存:desc', label: '总库存：高到低' },
@@ -74,10 +72,8 @@ function percent(value: number | null) {
 
 function marginClass(value: number | null) {
   if (value === null || value === undefined || Number.isNaN(Number(value))) return 'margin-missing';
-  if (value < 0) return 'margin-negative';
-  if (value < 0.1) return 'margin-low';
-  if (value < 0.2) return 'margin-warning';
-  return 'margin-healthy';
+  const band = marginBand(value);
+  return band === 'good' ? 'margin-healthy' : `margin-${band}`;
 }
 
 function trendClass(value: number | null) {
@@ -110,13 +106,6 @@ function normalizedHistoryMonths(months: ReplenishmentHistoryMonth[] | undefined
 }
 
 type ChartPoint = { x: number; y: number };
-type ChartTooltipPosition = {
-  left: number;
-  top: number;
-  horizontal: 'left' | 'center' | 'right';
-  vertical: 'above' | 'below';
-};
-
 function monotonePath(points: ChartPoint[]) {
   if (!points.length) return '';
   if (points.length === 1) return `M ${points[0].x.toFixed(2)} ${points[0].y.toFixed(2)}`;
@@ -168,12 +157,9 @@ function MonthlySalesTrendChart({
   months?: ReplenishmentHistoryMonth[];
   compact?: boolean;
 }) {
-  const data = normalizedHistoryMonths(months);
+  const data = useMemo(() => normalizedHistoryMonths(months), [months]);
   const chartId = useId();
   const gradientId = useMemo(() => `replenishment-monthly-gradient-${chartId.replace(/[^a-zA-Z0-9_-]/g, '-')}`, [chartId]);
-  const svgRef = useRef<SVGSVGElement | null>(null);
-  const [activeIndex, setActiveIndex] = useState<number | null>(null);
-  const [tooltipPosition, setTooltipPosition] = useState<ChartTooltipPosition | null>(null);
   const width = compact ? 360 : 960;
   const height = compact ? 86 : 250;
   const padding = compact
@@ -196,64 +182,22 @@ function MonthlySalesTrendChart({
   const totalAreaPath = `${totalPath} L ${x(data.length - 1).toFixed(2)} ${baselineY.toFixed(2)} L ${x(0).toFixed(2)} ${baselineY.toFixed(2)} Z`;
   const totalTicks = compact ? [] : [0, .5, 1].map(ratio => ({ ratio, value: totalMax * ratio }));
   const averageTicks = compact ? [] : [0, .5, 1].map(ratio => ({ ratio, value: averageMax * ratio }));
-  const clearActivePoint = useCallback(() => {
-    setActiveIndex(null);
-    setTooltipPosition(null);
-  }, []);
-  useEffect(() => {
-    if (activeIndex !== null && activeIndex >= data.length) clearActivePoint();
-  }, [activeIndex, clearActivePoint, data.length]);
-  useEffect(() => {
-    if (activeIndex === null) return undefined;
-    const clearOnViewportChange = () => clearActivePoint();
-    window.addEventListener('scroll', clearOnViewportChange, true);
-    window.addEventListener('resize', clearOnViewportChange);
-    return () => {
-      window.removeEventListener('scroll', clearOnViewportChange, true);
-      window.removeEventListener('resize', clearOnViewportChange);
-    };
-  }, [activeIndex, clearActivePoint]);
-  const activatePoint = useCallback((event: ReactPointerEvent<SVGRectElement>) => {
-    const svg = svgRef.current;
-    const rect = svg?.getBoundingClientRect();
-    if (!rect || !rect.width || !rect.height) return;
-    const localX = (event.clientX - rect.left) * width / rect.width;
-    const plotX = Math.max(padding.left, Math.min(width - padding.right, localX));
-    const ratio = data.length === 1 ? 0 : (plotX - padding.left) / plotWidth;
-    const nextIndex = Math.max(0, Math.min(data.length - 1, Math.round(ratio * (data.length - 1))));
-    const point = data[nextIndex]!;
-    const screenX = rect.left + x(nextIndex) / width * rect.width;
-    const pointY = Math.min(totalY(point.total_sales), averageY(point.adjusted_daily_average));
-    const screenY = rect.top + pointY / height * rect.height;
-    const viewportWidth = window.innerWidth || document.documentElement.clientWidth || 1024;
-    const anchoredX = Math.max(8, Math.min(viewportWidth - 8, screenX));
-    const anchoredY = Math.max(8, Math.min(window.innerHeight - 8, screenY));
-    setActiveIndex(nextIndex);
-    setTooltipPosition({
-      left: anchoredX,
-      top: anchoredY,
-      horizontal: anchoredX < 120 ? 'right' : anchoredX > viewportWidth - 120 ? 'left' : 'center',
-      vertical: anchoredY > 130 ? 'above' : 'below',
-    });
-  }, [averageY, data, height, padding.left, padding.right, plotWidth, totalY, width, x]);
+  const axis = useChartAxisTooltip({
+    points: data.map((item, index) => ({ x: x(index), y: Math.min(totalY(item.total_sales), averageY(item.adjusted_daily_average)) })),
+    width, height, revision: months,
+  });
+  const { activeIndex } = axis;
   const activePoint = activeIndex === null ? null : data[activeIndex];
-  const portalIsDark = typeof document !== 'undefined' && Boolean(document.querySelector('.app-shell.dark-mode'));
-  const tooltip = activePoint && tooltipPosition && typeof document !== 'undefined'
-    ? createPortal(
-      <div
-        className={`replenishment-monthly-chart-tooltip ${compact ? 'compact' : 'full'} tooltip-${tooltipPosition.horizontal} tooltip-${tooltipPosition.vertical}${portalIsDark ? ' is-dark' : ''}`}
-        role="tooltip"
-        aria-live="polite"
-        style={{ left: tooltipPosition.left, top: tooltipPosition.top }}
-      >
-        <strong>{String(activePoint.month)}</strong>
-        <div><i className="replenishment-monthly-chart-tooltip-total" />月总销量 <b>{display(activePoint.total_sales)} 件</b></div>
-        <div><i className="replenishment-monthly-chart-tooltip-average" />校准日均 <b>{activePoint.adjusted_average_available ? adjustedDailyDisplay(activePoint.adjusted_daily_average) : '—'}</b></div>
-        <small>计入 {display(activePoint.included_days)} 天</small>
-      </div>,
-      document.body,
-    )
-    : null;
+  const tooltip = activePoint && <ChartAxisTooltip
+    id={axis.tooltipId}
+    anchor={axis.anchor}
+    title={String(activePoint.month)}
+    items={[
+      { label: '月总销量', value: `${display(activePoint.total_sales)} 件`, color: 'var(--app-color-chart-line)' },
+      { label: '校准日均', value: activePoint.adjusted_average_available ? adjustedDailyDisplay(activePoint.adjusted_daily_average) : '—', color: 'var(--app-color-chart-comparison)' },
+    ]}
+    footer={<>计入 {display(activePoint.included_days)} 天</>}
+  />;
   if (!data.length) return <span className="replenishment-history-group-empty">—</span>;
   return <div className={`replenishment-monthly-chart ${compact ? 'compact' : 'full'}`}>
     <div className="replenishment-monthly-chart-legend" aria-label="销量图例">
@@ -261,16 +205,16 @@ function MonthlySalesTrendChart({
       <span><i className="replenishment-monthly-chart-legend-average" />校准日均</span>
     </div>
     <svg
-      ref={svgRef}
-      className="replenishment-monthly-chart-svg"
+      {...axis.svgProps}
+      className="replenishment-monthly-chart-svg app-chart-interactive"
       viewBox={`0 0 ${width} ${height}`}
       role="img"
       aria-label="月总销量与校准日均销量趋势"
     >
       <defs>
         <linearGradient id={gradientId} x1="0" y1="0" x2="0" y2="1">
-          <stop offset="0%" stopColor="#2563eb" stopOpacity={compact ? 0.18 : 0.2} />
-          <stop offset="100%" stopColor="#2563eb" stopOpacity="0" />
+          <stop offset="0%" stopColor="var(--app-color-chart-line)" stopOpacity={compact ? 0.18 : 0.2} />
+          <stop offset="100%" stopColor="var(--app-color-chart-line)" stopOpacity="0" />
         </linearGradient>
       </defs>
       {!compact && <>
@@ -292,7 +236,7 @@ function MonthlySalesTrendChart({
         <circle className={`replenishment-monthly-chart-average-point ${activeIndex === index ? 'is-active' : ''}`} cx={x(index)} cy={averageY(item.adjusted_daily_average)} r={activeIndex === index ? (compact ? 4 : 5) : (compact ? 2.5 : 3.5)} />
         {(!compact || index === 0 || index === data.length - 1) && <text className="replenishment-monthly-chart-month-label" x={x(index)} y={height - 5} textAnchor="middle">{String(item.month)}</text>}
       </g>)}
-      {activeIndex !== null && <line className="replenishment-monthly-chart-crosshair" x1={x(activeIndex)} x2={x(activeIndex)} y1={padding.top} y2={baselineY} data-index={activeIndex} />}
+      {activeIndex !== null && <line className="replenishment-monthly-chart-crosshair app-chart-crosshair" x1={x(activeIndex)} x2={x(activeIndex)} y1={padding.top} y2={baselineY} data-index={activeIndex} />}
       <rect
         className="replenishment-monthly-chart-hit-area"
         x={padding.left}
@@ -300,10 +244,7 @@ function MonthlySalesTrendChart({
         width={plotWidth}
         height={plotHeight}
         aria-label="按月份查看销量数据"
-        onPointerDown={activatePoint}
-        onPointerMove={activatePoint}
-        onPointerLeave={event => { if (event.pointerType !== 'touch') clearActivePoint(); }}
-        onPointerCancel={clearActivePoint}
+        {...axis.hitAreaProps}
       />
     </svg>
     {tooltip}
@@ -367,9 +308,8 @@ export function maxWeightClass(value: number | null) {
 function ratingClass(score: number | null, reviewCount: number | null = null) {
   if (reviewCount !== null && Number(reviewCount) === 0) return 'rating-missing';
   if (score === null || score === undefined || Number.isNaN(Number(score))) return 'rating-missing';
-  if (Number(score) >= 4.3) return 'rating-healthy';
-  if (Number(score) >= 3.5) return 'rating-warning';
-  return 'rating-danger';
+  const band = ratingBand(Number(score));
+  return band === 'good' ? 'rating-healthy' : `rating-${band}`;
 }
 
 function stableTagColor(label: string) {
@@ -535,11 +475,7 @@ function PriceTrendMiniChart({
   code: typeof COUNTRY_ORDER[number];
   price: ReplenishmentPriceCountry;
 }) {
-  const data = normalizedPriceHistory(price.history);
-  const chartId = useId();
-  const svgRef = useRef<SVGSVGElement | null>(null);
-  const [activeIndex, setActiveIndex] = useState<number | null>(null);
-  const [tooltipPosition, setTooltipPosition] = useState<ChartTooltipPosition | null>(null);
+  const data = useMemo(() => normalizedPriceHistory(price.history), [price.history]);
   const width = 190;
   const height = 58;
   const padding = { left: 4, right: 4, top: 5, bottom: 11 };
@@ -561,75 +497,36 @@ function PriceTrendMiniChart({
     if (!previous || !current) return [];
     return [{ previous, current, gap: Boolean(point.gap_days && point.gap_days > 1), promo: Boolean(previous.point.is_promotion || point.is_promotion) }];
   });
-  const clearActivePoint = useCallback(() => {
-    setActiveIndex(null);
-    setTooltipPosition(null);
-  }, []);
-  useEffect(() => {
-    if (activeIndex !== null && activeIndex >= data.length) clearActivePoint();
-  }, [activeIndex, clearActivePoint, data.length]);
-  useEffect(() => {
-    if (activeIndex === null) return undefined;
-    const clearOnViewportChange = () => clearActivePoint();
-    window.addEventListener('scroll', clearOnViewportChange, true);
-    window.addEventListener('resize', clearOnViewportChange);
-    return () => {
-      window.removeEventListener('scroll', clearOnViewportChange, true);
-      window.removeEventListener('resize', clearOnViewportChange);
-    };
-  }, [activeIndex, clearActivePoint]);
-  const activatePoint = useCallback((event: ReactPointerEvent<SVGRectElement>) => {
-    const svg = svgRef.current;
-    const rect = svg?.getBoundingClientRect();
-    if (!rect || !rect.width || !rect.height || !data.length) return;
-    const localX = (event.clientX - rect.left) * width / rect.width;
-    const ratio = Math.max(0, Math.min(1, (localX - padding.left) / plotWidth));
-    const nextIndex = data.length <= 1 ? 0 : Math.max(0, Math.min(data.length - 1, Math.round(ratio * (data.length - 1))));
-    const point = data[nextIndex]!;
-    const screenX = rect.left + x(nextIndex) / width * rect.width;
-    const numeric = point.current_price === null ? null : y(point.current_price);
-    const screenY = rect.top + (numeric === null ? height / 2 : numeric) / height * rect.height;
-    const viewportWidth = window.innerWidth || document.documentElement.clientWidth || 1024;
-    const anchoredX = Math.max(8, Math.min(viewportWidth - 8, screenX));
-    const anchoredY = Math.max(8, Math.min(window.innerHeight - 8, screenY));
-    setActiveIndex(nextIndex);
-    setTooltipPosition({
-      left: anchoredX,
-      top: anchoredY,
-      horizontal: anchoredX < 135 ? 'right' : anchoredX > viewportWidth - 135 ? 'left' : 'center',
-      vertical: anchoredY > 135 ? 'above' : 'below',
-    });
-  }, [data, height, padding.left, plotWidth, width, x, y]);
-  if (!data.length) return null;
-  const portalIsDark = typeof document !== 'undefined' && Boolean(document.querySelector('.app-shell.dark-mode'));
+  const axis = useChartAxisTooltip({
+    points: data.map((point, index) => ({ x: x(index), y: point.current_price === null ? height / 2 : y(point.current_price) })),
+    width, height, revision: price,
+  });
+  const { activeIndex } = axis;
   const activePoint = activeIndex === null ? null : data[activeIndex];
-  const tooltip = activePoint && tooltipPosition && typeof document !== 'undefined'
-    ? createPortal(
-      <div
-        className={`replenishment-price-chart-tooltip tooltip-${tooltipPosition.horizontal} tooltip-${tooltipPosition.vertical}${portalIsDark ? ' is-dark' : ''}`}
-        role="tooltip"
-        aria-live="polite"
-        style={{ left: tooltipPosition.left, top: tooltipPosition.top }}
-      >
-        <strong>{priceHistoryTooltip(code, price, activePoint, price.representative_sku).split('\n')[0]}</strong>
-        <div>当前实际总价 <b>{activePoint.current_price === null ? '无当前价' : display(activePoint.current_price)}</b></div>
-        <div>原价 / 优惠 <b>{display(activePoint.listing_price)} / {display(activePoint.promotion_price)}</b></div>
-        {activePoint.is_promotion && <small className="replenishment-price-chart-promo-label">促销中</small>}
-        {price.launch_price !== null && price.launch_price !== undefined && activePoint.current_price !== null && <small>较开售 {((activePoint.current_price / price.launch_price - 1) * 100).toFixed(1)}%</small>}
-        {activePoint.amount_change !== null && activePoint.amount_change !== undefined && <small>{signedPriceChange(activePoint.amount_change)} · {activePoint.percent_change === null || activePoint.percent_change === undefined ? '' : `${(activePoint.percent_change * 100).toFixed(1)}%`}</small>}
-        {activePoint.gap_days && activePoint.gap_days > 1 && <small>间隔 {activePoint.gap_days} 天 · 首次观察到</small>}
-        {activePoint.anomaly && <small>异常：{activePoint.anomaly}</small>}
-        {price.representative_sku && <small>代表SKU：{price.representative_sku}</small>}
-      </div>,
-      document.body,
-    )
-    : null;
+  const tooltip = activePoint && <ChartAxisTooltip
+    id={axis.tooltipId}
+    anchor={axis.anchor}
+    title={priceHistoryTooltip(code, price, activePoint, price.representative_sku).split('\n')[0]}
+    items={[
+      { label: '当前实际总价', value: activePoint.current_price === null ? '无当前价' : display(activePoint.current_price), color: activePoint.is_promotion ? 'var(--app-color-chart-comparison)' : 'var(--app-color-chart-line)' },
+      { label: '原价 / 优惠', value: `${display(activePoint.listing_price)} / ${display(activePoint.promotion_price)}` },
+    ]}
+    footer={<>
+      {activePoint.is_promotion && <small className="app-chart-price-promo">促销中</small>}
+      {price.launch_price !== null && price.launch_price !== undefined && activePoint.current_price !== null && <small>较开售 {((activePoint.current_price / price.launch_price - 1) * 100).toFixed(1)}%</small>}
+      {activePoint.amount_change !== null && activePoint.amount_change !== undefined && <small>{signedPriceChange(activePoint.amount_change)} · {activePoint.percent_change === null || activePoint.percent_change === undefined ? '' : `${(activePoint.percent_change * 100).toFixed(1)}%`}</small>}
+      {activePoint.gap_days && activePoint.gap_days > 1 && <small>间隔 {activePoint.gap_days} 天 · 首次观察到</small>}
+      {activePoint.anomaly && <small>异常：{activePoint.anomaly}</small>}
+      {price.representative_sku && <small>代表SKU：{price.representative_sku}</small>}
+    </>}
+  />;
+  if (!data.length) return null;
   return <div className="replenishment-price-trend" aria-label={`${code} 31天价格趋势`}>
     <div className="replenishment-price-trend-caption">
       <span><i className="replenishment-price-trend-line" />价格</span>
       <span className="replenishment-price-trend-promo"><i />促销</span>{data.length < 2 && <em className="replenishment-price-trend-empty">暂无趋势</em>}
     </div>
-    <svg ref={svgRef} className="replenishment-price-trend-svg" viewBox={`0 0 ${width} ${height}`} role="img" aria-label={`${code}当前实际总价阶梯趋势`}>
+    <svg {...axis.svgProps} className="replenishment-price-trend-svg app-chart-interactive" viewBox={`0 0 ${width} ${height}`} role="img" aria-label={`${code}当前实际总价阶梯趋势`}>
       <line className="replenishment-price-trend-baseline" x1={padding.left} x2={width - padding.right} y1={padding.top + plotHeight} y2={padding.top + plotHeight} />
       {segments.map(segment => <path
         key={`${segment.previous.index}-${segment.current.index}`}
@@ -638,10 +535,10 @@ function PriceTrendMiniChart({
       />)}
       {available.map((item, index) => item && <circle key={`${item.point.date}-${index}`} className={`replenishment-price-trend-point${item.point.is_promotion ? ' is-promo' : ''}${activeIndex === index ? ' is-active' : ''}`} cx={item.x} cy={item.y} r={activeIndex === index ? 3.4 : 2} />)}
       {available.some(item => item === null) && data.map((point, index) => point.current_price === null && <circle key={`unavailable-${point.date}-${index}`} className="replenishment-price-trend-unavailable" cx={x(index)} cy={padding.top + plotHeight} r="2.4" />)}
-      {activeIndex !== null && <line className="replenishment-price-trend-crosshair" x1={x(activeIndex)} x2={x(activeIndex)} y1={padding.top} y2={padding.top + plotHeight} />}
+      {activeIndex !== null && <line className="replenishment-price-trend-crosshair app-chart-crosshair" x1={x(activeIndex)} x2={x(activeIndex)} y1={padding.top} y2={padding.top + plotHeight} />}
       <text className="replenishment-price-trend-date" x={padding.left} y={height - 1}>{compactPriceDate(data[0]!.date)}</text>
       <text className="replenishment-price-trend-date" x={width - padding.right} y={height - 1} textAnchor="end">{compactPriceDate(latestPoint!.date)}</text>
-      <rect className="replenishment-price-trend-hit-area" x={padding.left} y={padding.top} width={plotWidth} height={plotHeight} aria-label="按日期查看价格" onPointerDown={activatePoint} onPointerMove={activatePoint} onPointerLeave={event => { if (event.pointerType !== 'touch') clearActivePoint(); }} onPointerCancel={clearActivePoint} />
+      <rect className="replenishment-price-trend-hit-area" x={padding.left} y={padding.top} width={plotWidth} height={plotHeight} aria-label="按日期查看价格" {...axis.hitAreaProps} />
     </svg>
     {tooltip}
   </div>;
@@ -882,6 +779,12 @@ export function DecisionBoardRow({
   switchSaving: boolean;
 }) {
   const recommendation = row.recommendation;
+  const totalAvailable = row.inventory.group_total;
+  const dailySales = row.trend.calibrated_daily_sales;
+  const availableDays = totalAvailable !== null && Number.isFinite(totalAvailable)
+    && dailySales !== null && Number.isFinite(dailySales) && dailySales > 0
+    ? totalAvailable / dailySales
+    : null;
   const officialPositive = Number(recommendation.official_quantity || 0) > 0;
   const suggestionClass = recommendation.status === '数据异常'
     ? 'recommendation-error'
@@ -935,6 +838,9 @@ export function DecisionBoardRow({
               ]}
             />
           </div>
+          <Tooltip title={row.identity.product_name || undefined}>
+            <div className="replenishment-product-name">{row.identity.product_name || '—'}</div>
+          </Tooltip>
           <div className="replenishment-sku-summary">
             <span>原</span><Tooltip title={row.identity.original_sku}>{row.identity.original_sku || '—'}</Tooltip>
             <span>跟</span><CompactText values={row.identity.follower_skus} limit={2} />
@@ -967,6 +873,7 @@ export function DecisionBoardRow({
       <div className="replenishment-inventory-cell" data-section="库存矩阵" role="gridcell">
         <MetricLine label="亚马逊" value={row.inventory.amazon_available} />
         <MetricLine label="总可售" value={row.inventory.group_total} />
+        <MetricLine label="可售天数" value={availableDays !== null && Number.isFinite(availableDays) ? `${display(availableDays)}天` : null} />
         <MetricLine label={row.inventory.is_split_reference ? 'ASIN参考*' : '跟卖汇总'} value={row.inventory.asin_reference_total} />
         <div className="replenishment-aging-line">
           <span className={Number(row.inventory.aged_over_90 || 0) > 0 ? 'aging-warning' : ''}>90+ {display(row.inventory.aged_over_90)}</span>
@@ -1040,7 +947,7 @@ export function ReplenishmentDecisionBoard({
   </div>;
 }
 
-export default function ReplenishmentPage({ active = true, routeVersion = 0, refreshVersion = 0 }: { active?: boolean; routeVersion?: number; refreshVersion?: number }) {
+export default function ReplenishmentPage({ active = true, routeVersion = 0, refreshVersion = 0 }: PageLifecycleProps) {
   const [payload, setPayload] = useState<DashboardPayload>();
   const [section, setSection] = useState<DashboardSection>();
   const [loading, setLoading] = useState(true);
@@ -1049,7 +956,7 @@ export default function ReplenishmentPage({ active = true, routeVersion = 0, ref
   const [pricingError, setPricingError] = useState('');
   const [error, setError] = useState('');
   const [appliedDevelopers, setAppliedDevelopers] = useState<string[]>([]);
-  const [appliedMinQty, setAppliedMinQty] = useState(30);
+  const [appliedMinQty, setAppliedMinQty] = useState(0);
   const [search, setSearch] = useState('');
   const [appliedSearch, setAppliedSearch] = useState('');
   const [sort, setSort] = useState('建议补货数量:desc');
@@ -1214,7 +1121,7 @@ export default function ReplenishmentPage({ active = true, routeVersion = 0, ref
   const resetFilters = () => {
     setSearch('');
     setAppliedDevelopers([]);
-    setAppliedMinQty(30);
+    setAppliedMinQty(0);
     setAppliedSearch('');
     setSort('建议补货数量:desc');
     sectionQueryRef.current = { page: 1, pageSize: section?.page_size || 50, search: '', sort: '建议补货数量:desc', initialized: true };
@@ -1314,16 +1221,13 @@ export default function ReplenishmentPage({ active = true, routeVersion = 0, ref
   const exportHref = `/api/dashboard/replenishment/export.xlsx?${new URLSearchParams(exportParams).toString()}`;
   const sortLabel = useMemo(() => SORT_OPTIONS.find(item => item.value === sort)?.label || '建议补货数量：高到低', [sort]);
   return <>
-    <div className="page-heading replenishment-page-heading">
-      <div><Typography.Title level={2}>补货管理</Typography.Title><Typography.Text type="secondary">ASIN主行汇总所有SKU销量与库存；导出将使用当前筛选条件。</Typography.Text></div>
-      <Space><Button icon={<DownloadOutlined />} disabled={loading || queryLoading || (!section?.total && !rows.length)} title="导出全部匹配行，不限当前页" href={exportHref} onClick={event => { event.preventDefault(); void downloadWithFeedback(exportHref, '补货建议.xlsx', '补货筛选结果'); }}>导出筛选结果</Button><Button icon={<ReloadOutlined />} loading={loading} onClick={() => void (async () => { const refreshed = await load(); if (refreshed) message.success('补货数据已刷新'); else message.error('补货数据刷新失败'); })()}>刷新</Button></Space>
-    </div>
+    <PageHeading title={'补货管理'} description={'ASIN主行汇总所有SKU销量与库存；导出将使用当前筛选条件。'} className="replenishment-page-heading" actions={<Space><Button icon={<DownloadOutlined />} disabled={loading || queryLoading || (!section?.total && !rows.length)} title="导出全部匹配行，不限当前页" href={exportHref} onClick={event => { event.preventDefault(); void downloadWithFeedback(exportHref, '补货建议.xlsx', '补货筛选结果'); }}>导出筛选结果</Button><Button icon={<ReloadOutlined />} loading={loading} onClick={() => void (async () => { const refreshed = await load(); if (refreshed) message.success('补货数据已刷新'); else message.error('补货数据刷新失败'); })()}>刷新</Button></Space>} />
     {error && <Alert className="persistent-page-error" type="error" showIcon message="补货管理读取失败" description={error} action={<Button size="small" onClick={() => void load()}>重试</Button>} />}
     <Card className="filter-card replenishment-filter-card">
       <Space wrap>
         <Typography.Text strong>开发员</Typography.Text>
         <ConfirmFilterSelect
-          ariaLabel="开发员筛选"
+          ariaLabel="开发员筛选" selectionUnit="人"
           mode="multiple"
           value={appliedDevelopers}
           options={developerOptions.map(value => ({ value, label: value }))}
@@ -1336,16 +1240,16 @@ export default function ReplenishmentPage({ active = true, routeVersion = 0, ref
           ariaLabel="建议补货数量门槛"
           mode="single"
           value={appliedMinQty}
-          normalizeValue={value => Number(value ?? 30)}
+          normalizeValue={value => Number(value ?? 0)}
           options={MIN_QTY_OPTIONS}
-          onConfirm={value => setAppliedMinQty(value === undefined ? 30 : Number(value))}
+          onConfirm={value => setAppliedMinQty(value === undefined ? 0 : Number(value))}
           placeholder="补货数量门槛"
           style={{ width: 150 }}
         />
         <Input.Search
           allowClear
           value={search}
-          placeholder="搜索ASIN、SKU、店铺、标签"
+          placeholder="搜索ASIN、SKU、产品名称、店铺、标签"
           onChange={event => setSearch(event.target.value)}
           onSearch={applySearch}
           style={{ width: 250 }}
@@ -1369,7 +1273,7 @@ export default function ReplenishmentPage({ active = true, routeVersion = 0, ref
         {appliedSearch && <Tag>搜索：{appliedSearch}</Tag>}
       </Space>
     </Card>
-    <div className="metric-grid replenishment-metric-grid">{(payload?.metrics || []).map(item => <Card key={item.name}><Statistic title={item.name} value={Number(item.value) || 0} precision={0} /></Card>)}</div>
+    <div className="metric-grid replenishment-metric-grid">{(payload?.metrics || []).map(item => <MetricCard key={item.name} title={item.name} value={Number(item.value) || 0} precision={0} />)}</div>
     {pricingLoading && <Typography.Text type="secondary" className="replenishment-pricing-status">价格与趋势加载中…</Typography.Text>}
     {pricingError && <Alert className="section-load-error" type="warning" showIcon message="价格与趋势加载失败" description={pricingError} action={<Button size="small" onClick={() => void loadPricing(rows)}>重试</Button>} />}
     <Card className="dashboard-section replenishment-dashboard-card" title="ASIN补货运营决策矩阵" extra={<Typography.Text type="secondary">{sortLabel} · 点击行展开SKU明细</Typography.Text>}>
@@ -1403,15 +1307,13 @@ export default function ReplenishmentPage({ active = true, routeVersion = 0, ref
         </div>
       </Spin>
     </Card>
-    <Modal
+    <MutationModal busy={Boolean(switchSavingAsin)}
       title={`设置${switchTarget?.identity.asin || ''}为不补货`}
       open={Boolean(switchTarget)}
       okText="确认不补货"
       cancelText="取消"
       okButtonProps={{ danger: true, disabled: !switchReason.trim(), loading: Boolean(switchSavingAsin) }}
       cancelButtonProps={{ disabled: Boolean(switchSavingAsin) }}
-      closable={!switchSavingAsin}
-      maskClosable={!switchSavingAsin}
       onCancel={() => {
         if (!switchSavingAsin) {
           setSwitchTarget(undefined);
@@ -1432,6 +1334,6 @@ export default function ReplenishmentPage({ active = true, routeVersion = 0, ref
         placeholder="请输入不补货原因（必填）"
         onChange={event => setSwitchReason(event.target.value)}
       />
-    </Modal>
+    </MutationModal>
   </>;
 }

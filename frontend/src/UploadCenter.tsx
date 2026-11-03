@@ -1,10 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Alert, Button, Card, Modal, Popconfirm, Space, Spin, Table, Tag, Typography, Upload } from 'antd';
-import { feedbackMessage as message, downloadWithFeedback } from './feedback';
 import { DeleteOutlined, DownloadOutlined, EyeOutlined, InboxOutlined, ReloadOutlined } from '@ant-design/icons';
 import type { TableProps, UploadProps } from 'antd';
-import { api, apiErrorMessage, type ReportsResponse, type SourceRecord } from './api';
 
+import type { PageLifecycleProps } from './pageLifecycle';
+import PageHeading from './components/PageHeading';
+import { feedbackMessage as message, downloadWithFeedback } from './feedback';
+import { api, type ReportsResponse, type SourceRecord } from './api';
 export type UploadFrequencyTab = 'daily' | 'weekly' | 'monthly';
 
 export function uploadFrequencyTabFromSearch(search: string): UploadFrequencyTab {
@@ -18,7 +20,7 @@ const sourceDefinitions = [
   { key: 'rating', frequency: 'weekly', title: 'Rating', accept: '.xls,.xlsx', description: 'ASIN 各站点评分和评价数量' },
   { key: 'sales_volume_detail', frequency: 'daily', title: '销量明细', accept: '.csv', description: '部门监控的销量明细数据' },
   { key: 'sales_amount_detail', frequency: 'daily', title: '销售额明细', accept: '.csv', description: '部门监控的销售额明细数据' },
-  { key: 'sku_image_map', frequency: 'monthly', title: 'SKU图片映射表', accept: '.xls,.xlsx', description: '按库存SKU和虚拟SKU关联补货、滞销和产品矩阵中的图片' },
+  { key: 'sku_image_map', frequency: 'monthly', title: 'SKU图片映射表', accept: '.xls,.xlsx', description: '新版字段：MSKU、ASIN、图片链接；按 MSKU + ASIN 关联图片，空链接跳过并显示无图片' },
 ] as const;
 const { Dragger } = Upload;
 
@@ -33,7 +35,7 @@ function latestUploadTime(data: ReportsResponse) {
   return timestamps.at(-1) || '';
 }
 
-export default function UploadCenter({ active = true, routeVersion = 0, refreshVersion = 0 }: { active?: boolean; routeVersion?: number; refreshVersion?: number }) {
+export default function UploadCenter({ active = true, routeVersion = 0, refreshVersion = 0 }: PageLifecycleProps) {
   const [data, setData] = useState<ReportsResponse>({ reports: [], sources: {} });
   const [initialLoading, setInitialLoading] = useState(true);
   const [pending, setPending] = useState<Record<string, number>>({});
@@ -104,11 +106,7 @@ export default function UploadCenter({ active = true, routeVersion = 0, refreshV
       const noticeKey = `upload-${key}-${file.uid}`;
       message.loading({ content: `正在上传 ${displayName}…`, key: noticeKey, duration: 0 });
       try {
-        const body = new FormData();
-        selectedFiles.forEach(selected => body.append(multiple ? 'files' : 'file', selected));
-        const response = await fetch(url, { method: 'POST', body });
-        const result = await response.json().catch(() => null);
-        if (!response.ok) throw new Error(apiErrorMessage(result, '上传失败'));
+        const result = await api.uploadReports(url, selectedFiles, multiple);
         const warnings = Array.isArray(result?.warnings)
           ? result.warnings.filter((warning: unknown): warning is string => typeof warning === 'string' && Boolean(warning))
           : [];
@@ -198,7 +196,7 @@ export default function UploadCenter({ active = true, routeVersion = 0, refreshV
         <p className="ant-upload-drag-icon"><InboxOutlined /></p><p className="ant-upload-text">拖拽 Listing 文件到这里，或点击选择</p><p className="ant-upload-hint">支持 .xlsx/.xls；按文件名日期建立历史快照</p>
       </Dragger>
     </Spin>
-    <Table rowKey={row => String(row['日期'])} columns={listingColumns} dataSource={listingRecords} pagination={{ pageSize: 8 }} scroll={{ x: 980 }} locale={{ emptyText: '暂无 Listing 价格历史' }} />
+    <Table size="small" rowKey={row => String(row['日期'])} columns={listingColumns} dataSource={listingRecords} pagination={{ pageSize: 8 }} scroll={{ x: 980 }} locale={{ emptyText: '暂无 Listing 价格历史' }} />
   </Card>;
 
   const sourceCard = (definition: typeof sourceDefinitions[number]) => {
@@ -218,7 +216,7 @@ export default function UploadCenter({ active = true, routeVersion = 0, refreshV
 
 
   return <div className="upload-center-page">
-    <div className="page-heading"><div><Typography.Title level={2}>上传中心</Typography.Title><Typography.Text type="secondary">所有文件会先执行字段与格式校验，通过后才会覆盖现有数据。{lastUpdated && ` · 数据更新时间 ${lastUpdated}`}</Typography.Text></div><Button loading={initialLoading} disabled={Object.keys(pending).length > 0} icon={<ReloadOutlined />} onClick={() => void manualRefresh()}>刷新记录</Button></div>
+    <PageHeading title={'上传中心'} description={<>所有文件会先执行字段与格式校验，通过后才会覆盖现有数据。{lastUpdated && ` · 数据更新时间 ${lastUpdated}`}</>} actions={<Button loading={initialLoading} disabled={Object.keys(pending).length > 0} icon={<ReloadOutlined />} onClick={() => void manualRefresh()}>刷新记录</Button>} />
     {error && <Alert className="persistent-page-error" type="error" showIcon message="上传中心操作失败" description={error} action={<Button size="small" onClick={() => void manualRefresh()}>重新加载</Button>} />}
     <Spin spinning={initialLoading} tip="正在读取上传记录…"><div className="page-loading-min-height">
       {tab === 'daily' && <><div className="upload-grid">{listingCard}{sourceDefinitions.filter(definition => definition.frequency === 'daily').map(sourceCard)}</div></>}
@@ -227,7 +225,7 @@ export default function UploadCenter({ active = true, routeVersion = 0, refreshV
           <Card title="业绩报表 CSV" data-testid="performance-reports"><Typography.Paragraph type="secondary">支持一次拖入或选择多个文件；相同月份会替换原记录。</Typography.Paragraph><Spin spinning={isPending('upload-performance')} tip="正在逐个校验并保存…"><Dragger {...uploader('performance', '/api/reports/performance', true, '.csv')} disabled={isPending('upload-performance')} className="source-dragger"><p className="ant-upload-drag-icon"><InboxOutlined /></p><p className="ant-upload-text">拖拽一个或多个 CSV 到这里，或点击选择</p><p className="ant-upload-hint">每个文件都会先校验，再保存为对应月份的业绩报表</p></Dragger></Spin></Card>
           {sourceDefinitions.filter(definition => definition.frequency === 'weekly').map(sourceCard)}
         </div>
-        <Card title="已上传业绩报表" className="section-card"><Table rowKey={row => String(row['月份'])} columns={reportColumns} dataSource={[...data.reports].sort((a, b) => String(b['月份']).localeCompare(String(a['月份'])))} pagination={{ pageSize: 8 }} scroll={{ x: 760 }} locale={{ emptyText: '暂无业绩报表' }} /></Card>
+        <Card title="已上传业绩报表" className="section-card"><Table size="small" rowKey={row => String(row['月份'])} columns={reportColumns} dataSource={[...data.reports].sort((a, b) => String(b['月份']).localeCompare(String(a['月份'])))} pagination={{ pageSize: 8 }} scroll={{ x: 760 }} locale={{ emptyText: '暂无业绩报表' }} /></Card>
       </>}
       {tab === 'monthly' && <>
         <div className="upload-grid">{sourceDefinitions.filter(definition => definition.frequency === 'monthly').map(sourceCard)}</div>
@@ -239,10 +237,10 @@ export default function UploadCenter({ active = true, routeVersion = 0, refreshV
           </Dragger>
         </Spin>
         <Space wrap className="source-actions"><Tag color={historyRecords.length === 12 ? 'success' : 'warning'}>{historyRecords.length}/12 个月</Tag><Popconfirm title="确定清空全部往月销量原始表吗？" description="清空后补货页将暂时没有销量画像。" onConfirm={() => void deleteSalesHistory()} okButtonProps={{ loading: isPending('delete-sales-history') }}><Button danger loading={isPending('delete-sales-history')} icon={<DeleteOutlined />}>清空全部</Button></Popconfirm></Space>
-        <Table rowKey={row => String(row['月份'])} columns={historyColumns} dataSource={historyRecords} pagination={{ pageSize: 12, hideOnSinglePage: true }} scroll={{ x: 760 }} locale={{ emptyText: '暂无往月销量原始表' }} />
+        <Table size="small" rowKey={row => String(row['月份'])} columns={historyColumns} dataSource={historyRecords} pagination={{ pageSize: 12, hideOnSinglePage: true }} scroll={{ x: 760 }} locale={{ emptyText: '暂无往月销量原始表' }} />
         </Card>
       </>}
     </div></Spin>
-    <Modal width="90vw" title={preview ? `${preview.title}预览（共 ${preview.total} 行，显示前 ${preview.rows.length} 行）` : '数据预览'} open={!!preview} footer={null} onCancel={() => setPreview(undefined)} destroyOnHidden>{preview && <Table rowKey={(_, index) => String(index)} size="small" columns={preview.columns.map(column => ({ title: column, dataIndex: column, key: column, ellipsis: true }))} dataSource={preview.rows} scroll={{ x: 'max-content', y: 500 }} pagination={{ pageSize: 15 }} />}</Modal>
+    <Modal width="90vw" title={preview ? `${preview.title}预览（共 ${preview.total} 行，显示前 ${preview.rows.length} 行）` : '数据预览'} open={!!preview} footer={null} onCancel={() => setPreview(undefined)} destroyOnHidden>{preview && <Table size="small" rowKey={(_, index) => String(index)} columns={preview.columns.map(column => ({ title: column, dataIndex: column, key: column, ellipsis: true }))} dataSource={preview.rows} scroll={{ x: 'max-content', y: 500 }} pagination={{ pageSize: 15 }} />}</Modal>
   </div>;
 }

@@ -4,6 +4,8 @@ import type { InputRef } from 'antd';
 import { DownOutlined, SearchOutlined } from '@ant-design/icons';
 import type { CSSProperties, KeyboardEvent as ReactKeyboardEvent } from 'react';
 
+import { designTokens } from './designTokens';
+import { useFilterPopoverMotion } from './useWorkspaceMotion';
 export type FilterOptionValue = string | number;
 export type ConfirmFilterValue = FilterOptionValue | FilterOptionValue[] | undefined;
 export type ConfirmFilterMode = 'single' | 'multiple';
@@ -15,6 +17,7 @@ export interface ConfirmFilterSelectProps {
   mode?: ConfirmFilterMode;
   placeholder: string;
   ariaLabel: string;
+  selectionUnit?: string;
   normalizeValue?: (value: FilterOptionValue | undefined) => FilterOptionValue | undefined;
   style?: CSSProperties;
 }
@@ -34,6 +37,7 @@ export default function ConfirmFilterSelect({
   mode = 'multiple',
   placeholder,
   ariaLabel,
+  selectionUnit = '项',
   normalizeValue,
   style,
 }: ConfirmFilterSelectProps) {
@@ -42,6 +46,8 @@ export default function ConfirmFilterSelect({
   const [search, setSearch] = useState('');
   const [draft, setDraft] = useState<FilterOptionValue | FilterOptionValue[] | undefined>(value);
   const searchRef = useRef<InputRef>(null);
+  const panelRef = useRef<HTMLDivElement>(null);
+  useFilterPopoverMotion(panelRef, open);
   const multiple = mode === 'multiple';
   const selectedValues = multiple && Array.isArray(value) ? value : [];
   const selectedSingle = !multiple && !Array.isArray(value) ? value : undefined;
@@ -61,7 +67,7 @@ export default function ConfirmFilterSelect({
   const summary = multiple
     ? selectedCount === 0 || (options.length > 0 && options.every(option => selectedValues.includes(option.value)))
       ? placeholder
-      : `已选 ${selectedCount}${ariaLabel.includes('开发员') ? ' 人' : ' 项'}`
+      : `已选 ${selectedCount}${selectionUnit ? ' ' + selectionUnit : ''}`
     : selectedOption?.label || placeholder;
 
   const openPanel = (nextOpen: boolean) => {
@@ -77,9 +83,9 @@ export default function ConfirmFilterSelect({
   }, [open]);
 
   const cancel = () => setOpen(false);
-  const confirm = () => {
+  const confirm = (nextDraft: ConfirmFilterValue = draft) => {
     if (multiple) {
-      const next = draftValues;
+      const next = Array.isArray(nextDraft) ? nextDraft : [];
       const representsAll = (values: FilterOptionValue[]) => values.length === 0
         || options.length > 0 && options.every(option => values.includes(option.value));
       const isSame = sameSelection(selectedValues, next)
@@ -87,7 +93,8 @@ export default function ConfirmFilterSelect({
       if (!isSame) onConfirm(next);
     } else {
       const normalize = (candidate: FilterOptionValue | undefined) => normalizeValue ? normalizeValue(candidate) : candidate;
-      if (!sameValue(normalize(selectedSingle), normalize(draftSingle))) onConfirm(draftSingle);
+      const next = Array.isArray(nextDraft) ? undefined : nextDraft;
+      if (!sameValue(normalize(selectedSingle), normalize(next))) onConfirm(next);
     }
     setOpen(false);
   };
@@ -111,14 +118,29 @@ export default function ConfirmFilterSelect({
       event.stopPropagation();
     }
   };
+  const optionRows = visibleOptions.map(option => <div className="confirm-filter-option-row" key={String(option.value)}>
+    {multiple ? <Checkbox
+      checked={draftValues.includes(option.value)}
+      onChange={event => toggleVisibleOption(option.value, event.target.checked)}
+      className="confirm-filter-option"
+    >{option.label}</Checkbox> : <Radio value={option.value} className="confirm-filter-option">{option.label}</Radio>}
+    <Button
+      type="link"
+      size="small"
+      className="confirm-filter-only"
+      aria-label={`仅筛选此项：${option.label}`}
+      onClick={() => confirm(multiple ? [option.value] : option.value)}
+    >仅筛选此项</Button>
+  </div>);
 
   const content = <div
+    ref={panelRef}
     className="confirm-filter-panel"
     role="dialog"
     aria-label={`${ariaLabel}筛选选项`}
     onKeyDown={handlePanelKeyDown}
     style={{
-      width: Math.max(Number(style?.width || style?.minWidth || 210), 230),
+      width: Math.max(Number(style?.width || style?.minWidth || 210), 300),
       maxWidth: 'calc(100vw - 24px)',
       color: token.colorText,
     }}
@@ -150,14 +172,9 @@ export default function ConfirmFilterSelect({
       style={{ borderColor: token.colorBorderSecondary }}
     >
       {visibleOptions.length ? multiple
-        ? visibleOptions.map(option => <Checkbox
-          key={String(option.value)}
-          checked={draftValues.includes(option.value)}
-          onChange={event => toggleVisibleOption(option.value, event.target.checked)}
-          className="confirm-filter-option"
-        >{option.label}</Checkbox>)
+        ? optionRows
         : <Radio.Group value={draftSingle} onChange={event => setDraft(event.target.value)} className="confirm-filter-radio-group">
-          {visibleOptions.map(option => <Radio key={String(option.value)} value={option.value} className="confirm-filter-option">{option.label}</Radio>)}
+          {optionRows}
         </Radio.Group>
         : <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="没有匹配项" />}
     </div>
@@ -168,7 +185,7 @@ export default function ConfirmFilterSelect({
       </Space>
       <Space size={8}>
         <Button size="small" aria-label="取消" onClick={cancel}>取消</Button>
-        <Button size="small" type="primary" aria-label="确定" onClick={confirm}>确定</Button>
+        <Button size="small" type="primary" aria-label="确定" onClick={() => confirm()}>确定</Button>
       </Space>
     </div>
   </div>;
@@ -180,7 +197,7 @@ export default function ConfirmFilterSelect({
     onOpenChange={openPanel}
     content={content}
     overlayClassName="confirm-filter-popover"
-    overlayStyle={{ zIndex: 1200 }}
+    overlayStyle={{ zIndex: designTokens.layer.floating }}
     arrow={false}
   >
     <Button

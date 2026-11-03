@@ -1,9 +1,11 @@
 import { useEffect, useRef, useState } from 'react';
 import dayjs, { type Dayjs } from 'dayjs';
-import { Alert, Button, Card, DatePicker, Form, Input, InputNumber, Modal, Select, Space, Table, Tag, Typography } from 'antd';
+import { Alert, Button, Card, DatePicker, Form, Input, InputNumber, Select, Space, Table, Tag, Typography } from 'antd';
+
+import MutationModal from './components/MutationModal';
 import { api, type AdjustmentInput, type PricingBatch, type PricingHistoryRow } from './api';
 import { feedbackMessage as message } from './feedback';
-
+import { SectionError } from './components/PageState';
 export function pricingPercent(value?: number) {
   return value == null ? '-' : value.toLocaleString('zh-CN', { maximumFractionDigits: 2 }) + '%';
 }
@@ -54,11 +56,11 @@ export function PricingRegistration({ open, skus, discount, onClose, onSaved }: 
       if (reason instanceof Error) setError(reason.message);
     } finally { lock.current = false; setBusy(false); }
   };
-  return <Modal title="登记调价或限时促销" open={open} onCancel={() => { if (!busy) onClose(); }}
+  return <MutationModal title="登记调价或限时促销" open={open} onCancel={() => { if (!busy) onClose(); }}
     onOk={() => void submit()} okText={kind === 'adjustment' ? preview ? '确认登记调价' : '预览调价影响' : '登记限时促销'}
-    confirmLoading={busy} cancelButtonProps={{ disabled: busy }} maskClosable={!busy} closable={!busy}>
+    busy={busy} cancelButtonProps={{ disabled: busy }}>
     <Alert type="info" showIcon message="仅登记与监控，不修改电商平台售价" description="长期调价累乘；限时优惠作用于调价后的价格。" />
-    {error && <Alert type="error" message={error} />}
+    {error && <Alert type="error" showIcon message={error} />}
     <Form form={form} layout="vertical" disabled={busy || !!preview}>
       <Form.Item name="kind" label="记录类型"><Select options={[{ value: 'promotion', label: '限时促销（额外优惠）' }, { value: 'adjustment', label: '长期调价（再次降价会累计）' }]} /></Form.Item>
       <Form.Item name="name" label={kind === 'adjustment' ? '调价批次名称' : '活动名称'} rules={[{ required: true, whitespace: true, max: 100 }]}><Input maxLength={100} /></Form.Item>
@@ -80,9 +82,9 @@ export function PricingRegistration({ open, skus, discount, onClose, onSaved }: 
         { title: '本次降幅', render: () => pricingPercent(preview.payload.discount_percent) },
         { title: '登记后累计', dataIndex: 'after', render: pricingPercent },
       ]} />
-      <Button onClick={() => { requestId.current = crypto.randomUUID(); setPreview(null); }}>返回修改</Button>
+      <Button disabled={busy} onClick={() => { requestId.current = crypto.randomUUID(); setPreview(null); }}>返回修改</Button>
     </>}
-  </Modal>;
+  </MutationModal>;
 }
 
 const statusNames: Record<string, string> = { pending: '待生效', active: '已生效', ended: '已结束', voided: '已作废', historical: '历史快照（不代表当前生效）' };
@@ -92,6 +94,7 @@ export function PricingBatches({ refreshToken, onRegister }: {
   const [rows, setRows] = useState<PricingBatch[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+  const [retry, setRetry] = useState(0);
   useEffect(() => {
     const controller = new AbortController();
     setLoading(true); setError('');
@@ -99,9 +102,9 @@ export function PricingBatches({ refreshToken, onRegister }: {
       if (!controller.signal.aborted) setError(reason instanceof Error ? reason.message : '长期调价批次加载失败');
     }).finally(() => { if (!controller.signal.aborted) setLoading(false); });
     return () => controller.abort();
-  }, [refreshToken]);
+  }, [refreshToken, retry]);
   return <Card title="长期调价批次" extra={<Button onClick={onRegister}>登记调价 / 促销</Button>}>
-    {error && <Alert type="error" message={error} />}
+    {error && <SectionError title="长期调价批次加载失败" error={error} onRetry={() => setRetry(value => value + 1)} />}
     <Table<PricingBatch>
       rowKey="batch_id"
       size="small"
@@ -139,6 +142,7 @@ export function PricingHistory({ refreshToken, onRefresh, onRegister }: {
 }) {
   const [rows, setRows] = useState<PricingHistoryRow[]>([]);
   const [search, setSearch] = useState('');
+  const [retry, setRetry] = useState(0);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [voidRow, setVoidRow] = useState<PricingHistoryRow | null>(null);
@@ -151,10 +155,10 @@ export function PricingHistory({ refreshToken, onRefresh, onRegister }: {
       if (!controller.signal.aborted) setError(e.message);
     }).finally(() => { if (!controller.signal.aborted) setLoading(false); });
     return () => controller.abort();
-  }, [refreshToken, search]);
+  }, [refreshToken, search, retry]);
   return <Card title="SKU 历史">
     <Space wrap><Input.Search placeholder="搜索 SKU" onSearch={setSearch} allowClear /><Button onClick={onRegister}>批量登记调价 / 促销</Button></Space>
-    {error && <Alert type="error" message={error} />}
+    {error && <SectionError title="SKU历史加载失败" error={error} onRetry={() => setRetry(value => value + 1)} />}
     <Table rowKey={r => r.type + ':' + r.id} size="small" loading={loading} dataSource={rows} scroll={{ x: 1050 }} pagination={{ pageSize: 30 }} columns={[
       { title: 'SKU', dataIndex: 'sku', width: 190 },
       { title: '类型', dataIndex: 'type', render: v => <Tag>{v === 'adjustment' ? '长期调价' : v === 'snapshot' ? '限时历史快照' : '限时促销'}</Tag> },
@@ -169,15 +173,15 @@ export function PricingHistory({ refreshToken, onRefresh, onRegister }: {
         {r.void_reason || (r.type === 'adjustment' && r.status !== 'voided' && <Button danger size="small" onClick={() => { setVoidRow(r); setReason(''); }}>作废</Button>)}
       </Space> },
     ]} />
-    <Modal title="作废调价记录" open={!!voidRow} confirmLoading={saving} onCancel={() => { if (!saving) setVoidRow(null); }} onOk={async () => {
+    <MutationModal title="作废调价记录" open={!!voidRow} busy={saving} okText="确认作废" okButtonProps={{ danger: true, disabled: !reason.trim() }} onCancel={() => { if (!saving) setVoidRow(null); }} onOk={async () => {
       if (!voidRow || saving || !reason.trim()) return;
       setSaving(true);
-      try { await api.voidAdjustment(voidRow.id, reason); setVoidRow(null); onRefresh(); }
+      try { await api.voidAdjustment(voidRow.id, reason); setVoidRow(null); message.success('调价记录已作废'); onRefresh(); }
       catch (e) { message.error(e instanceof Error ? e.message : '作废失败'); }
       finally { setSaving(false); }
     }}>
       <Alert type="warning" message="作废仅纠正系统记录，不恢复平台价格。作废后累计降幅会重新计算。" />
-      <Input.TextArea value={reason} onChange={e => setReason(e.target.value)} placeholder="必填：误登记原因" maxLength={500} />
-    </Modal>
+      <Input.TextArea disabled={saving} aria-label="作废原因" value={reason} onChange={e => setReason(e.target.value)} placeholder="必填：误登记原因" maxLength={500} />
+    </MutationModal>
   </Card>;
 }

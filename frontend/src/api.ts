@@ -1,3 +1,6 @@
+import { apiErrorMessage } from './apiErrors';
+export { apiErrorMessage } from './apiErrors';
+
 export type Status = 'todo' | 'current' | 'in_progress' | 'snoozed' | 'completed';
 export type Recurrence = 'none' | 'daily' | 'weekly' | 'monthly';
 export interface Task { id: string; title: string; notes: string; status: Status; due_at?: string | null; remind_at?: string | null; next_reminder_at?: string | null; recurrence_type: Recurrence; recurrence_days: number[]; created_at: string; updated_at: string; sort_order: number; is_overdue: boolean; }
@@ -163,6 +166,7 @@ export interface ReplenishmentGroupRow {
   group_id: string;
   identity: {
     asin: string;
+    product_name: string | null;
     image: (DashboardImage & {
       source_role: 'original' | 'follower';
     }) | null;
@@ -516,22 +520,6 @@ export interface PromotionDateInput { start_date: string; end_date: string | nul
 export interface PromotionInput extends PromotionDateInput { promotion_name: string }
 export interface ManualPromotionInput extends PromotionInput { discount_percent: number }
 
-export function apiErrorMessage(payload: unknown, fallback = '请求失败') {
-  const response = payload && typeof payload === 'object' ? payload as Record<string, unknown> : {};
-  const detail = response.detail ?? payload;
-  if (typeof detail === 'string' && detail) return detail;
-  if (detail && typeof detail === 'object') {
-    const structured = detail as Record<string, unknown>;
-    const message = typeof structured.message === 'string' && structured.message ? structured.message : fallback;
-    const count = Number.isFinite(Number(structured.count)) ? `（${Number(structured.count)} 条）` : '';
-    const examples = Array.isArray(structured.examples) && structured.examples.length
-      ? `；示例：${structured.examples.slice(0, 3).map(item => typeof item === 'string' ? item : JSON.stringify(item)).join('、')}`
-      : '';
-    return `${message}${count}${examples}`;
-  }
-  return fallback;
-}
-
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, { headers: { 'Content-Type': 'application/json', ...(init?.headers || {}) }, ...init });
   if (!response.ok) throw new Error(apiErrorMessage(await response.json().catch(() => null)));
@@ -548,9 +536,9 @@ async function requestText(url: string, init?: RequestInit): Promise<string> {
   return response.text();
 }
 
-async function requestForm<T>(url: string, body: FormData): Promise<T> {
+async function requestForm<T>(url: string, body: FormData, fallback = '请求失败'): Promise<T> {
   const response = await fetch(url, { method: 'POST', body });
-  if (!response.ok) throw new Error(apiErrorMessage(await response.json().catch(() => null)));
+  if (!response.ok) throw new Error(apiErrorMessage(await response.json().catch(() => null), fallback));
   return response.json();
 }
 
@@ -713,6 +701,18 @@ export const api = {
       { method: 'PUT', body: JSON.stringify({ arrived, arrival_date: arrivalDate || null }) },
     ),
   reports: () => request<ReportsResponse>('/api/reports'),
+  uploadReports: (url: string, files: File[], multiple: boolean) => {
+    const body = new FormData();
+    files.forEach(file => body.append(multiple ? 'files' : 'file', file));
+    return requestForm<{ warnings?: unknown[] }>(url, body, '上传失败');
+  },
+  uploadConfig: (name: string, file: File) => {
+    const body = new FormData();
+    body.append('file', file);
+    return requestForm<{ rows: Record<string, unknown>[]; updated_at?: string | null }>(
+      `/api/config/${name}/upload`, body, '导入失败',
+    );
+  },
   uploadListingPrices: (file: File) => { const body = new FormData(); body.append('file', file); return requestForm<Record<string, unknown>>('/api/reports/listing-prices', body); },
   listingPrices: (signal?: AbortSignal) => request<{ records: SourceRecord[]; retention_days: number }>('/api/reports/listing-prices', { signal }),
   previewListingPrices: (day: string) => request<{ title: string; columns: string[]; rows: Record<string, unknown>[]; total: number }>('/api/reports/listing-prices/' + encodeURIComponent(day) + '/preview'),

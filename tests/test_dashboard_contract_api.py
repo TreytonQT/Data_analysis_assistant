@@ -215,7 +215,8 @@ class DashboardContractApiTests(unittest.TestCase):
 
     def test_replenishment_section_returns_structured_group_rows(self) -> None:
         frame = pd.DataFrame([{
-            "补货组ID": "B001", "ASIN": "B001", "原SKU": "SKU-1", "跟卖SKU": "SKU-2；SKU-3",
+            "补货组ID": "B001", "ASIN": "B001", "产品名称": "原SKU商品名", "组内产品名称": "原SKU商品名；跟卖SKU商品名",
+            "原SKU": "SKU-1", "跟卖SKU": "SKU-2；SKU-3",
             "SKU数量": 3, "店铺编码": "ZXU", "店铺状态": "ZXU·正常", "库存SKU": "MIT-SKU-1",
             "虚拟SKU": "SKU-1", "库存图片链接": "https://cdn.example.com/sku-1.jpg", "开发员": "甲",
             "产品标签": "爆款", "产品标签颜色": "#16A34A", "产品评价数": 120, "产品评分值": 4.5,
@@ -251,6 +252,7 @@ class DashboardContractApiTests(unittest.TestCase):
         )
         payload = dashboard_api._serialized_section(model)
 
+        self.assertEqual(payload["group_rows"][0]["identity"]["product_name"], "原SKU商品名")
         self.assertEqual(payload["group_rows"][0]["identity"]["follower_skus"], ["SKU-2", "SKU-3"])
         self.assertEqual(
             payload["group_rows"][0]["identity"]["image"],
@@ -271,6 +273,14 @@ class DashboardContractApiTests(unittest.TestCase):
         self.assertEqual(payload["group_rows"][0]["history"]["peak_months"][0]["month"], 12)
         self.assertNotIn("remarks", payload["group_rows"][0]["identity"])
         self.assertEqual(payload["group_rows"][0]["recommendation"]["official_quantity"], 310)
+
+        search_frame = pd.concat(
+            [frame, frame.assign(补货组ID="B002", ASIN="B002", 产品名称="其他商品", 组内产品名称="其他商品")],
+            ignore_index=True,
+        )
+        name_search = dashboard_api._serialized_section({**model, "frame": search_frame}, search="跟卖sku商品名")
+        self.assertEqual(name_search["total"], 1)
+        self.assertEqual(name_search["group_rows"][0]["identity"]["asin"], "B001")
 
     def test_replenishment_pricing_serializes_missing_event_prices_as_null(self) -> None:
         frame = pd.DataFrame([{

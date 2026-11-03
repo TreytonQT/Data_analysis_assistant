@@ -7,7 +7,6 @@ import {
   Drawer,
   Empty,
   Input,
-  Modal,
   Pagination,
   Popconfirm,
   Progress,
@@ -16,9 +15,6 @@ import {
   Tag,
   Typography,
 } from 'antd';
-import { feedbackMessage as message, copyWithFeedback } from './feedback';
-import FilterActions from './FilterActions';
-import ConfirmFilterSelect from './ConfirmFilterSelect';
 import type { TextAreaRef } from 'antd/es/input/TextArea';
 import {
   CheckCircleOutlined,
@@ -31,6 +27,15 @@ import {
   RightOutlined,
 } from '@ant-design/icons';
 import dayjs, { type Dayjs } from 'dayjs';
+
+import type { PageLifecycleProps } from './pageLifecycle';
+import MutationModal from './components/MutationModal';
+import MetricCard from './components/MetricCard';
+import { PageLoading } from './components/PageState';
+import PageHeading from './components/PageHeading';
+import { feedbackMessage as message, copyWithFeedback } from './feedback';
+import FilterActions from './FilterActions';
+import ConfirmFilterSelect from './ConfirmFilterSelect';
 import {
   api,
   type BatchCopyLists,
@@ -41,7 +46,6 @@ import {
   type BatchMonitorSku,
   type BatchOrphanPage,
 } from './api';
-
 type BatchView = 'incomplete' | 'all' | 'completed';
 
 const emptyMetrics: BatchMonitorMetrics = {
@@ -84,13 +88,6 @@ function rowVisible(row: BatchMonitorRow, view: BatchView) {
     || (view === 'incomplete' && !row.is_complete);
 }
 
-function MetricCard({ label, value, tone }: { label: string; value: number; tone: string }) {
-  return <Card className={'batch-monitor-metric ' + tone}>
-    <Typography.Text>{label}</Typography.Text>
-    <strong>{integer(value)}</strong>
-  </Card>;
-}
-
 function metricContribution(row: BatchMonitorRow) {
   if (row.manual_completed_at) {
     return { incomplete_batches: 0, pending_artwork_batches: 0, pending_shipment_skus: 0, pending_arrival_skus: 0 };
@@ -130,11 +127,7 @@ export default function BatchMonitorPage({
   active = true,
   routeVersion = 0,
   refreshVersion = 0,
-}: {
-  active?: boolean;
-  routeVersion?: number;
-  refreshVersion?: number;
-}) {
+}: PageLifecycleProps) {
   const [payload, setPayload] = useState<BatchMonitorPayload>();
   const [completionBusy, setCompletionBusy] = useState<Set<string>>(new Set());
   const [busyBatches, setBusyBatches] = useState<Set<string>>(new Set());
@@ -767,17 +760,12 @@ export default function BatchMonitorPage({
   };
 
   if (initialLoading) {
-    return <div className="route-loading"><Spin size="large" tip="正在读取批次监控…" /></div>;
+    return <PageLoading label="正在读取批次监控…" />;
   }
 
   const metrics = payload?.metrics || emptyMetrics;
   return <div className="batch-monitor-page">
-    <div className="page-heading">
-      <div>
-        <Typography.Title level={2}>批次监控</Typography.Title>
-        <Typography.Text type="secondary">首次货件永久绑定；批次级监控美工图、发货和到货进度。</Typography.Text>
-      </div>
-      <Space wrap>
+    <PageHeading title={'批次监控'} description={'首次货件永久绑定；批次级监控美工图、发货和到货进度。'} actions={<Space wrap>
         <Button
           icon={<InboxOutlined />}
           disabled={payload ? !payload.orphan_scope_available : false}
@@ -815,8 +803,7 @@ export default function BatchMonitorPage({
         >
           刷新
         </Button>
-      </Space>
-    </div>
+      </Space>} />
 
     {error && <Alert
       className="persistent-page-error"
@@ -829,10 +816,10 @@ export default function BatchMonitorPage({
     />}
 
     <div className="batch-monitor-metrics">
-      <MetricCard label="未完成批次" value={metrics.incomplete_batches} tone="metric-blue" />
-      <MetricCard label="待美工批次" value={metrics.pending_artwork_batches} tone="metric-violet" />
-      <MetricCard label="待发货SKU" value={metrics.pending_shipment_skus} tone="metric-orange" />
-      <MetricCard label="待到货SKU" value={metrics.pending_arrival_skus} tone="metric-green" />
+      <MetricCard className="batch-monitor-metric" title="未完成批次" value={metrics.incomplete_batches} tone="blue" />
+      <MetricCard className="batch-monitor-metric" title="待美工批次" value={metrics.pending_artwork_batches} tone="violet" />
+      <MetricCard className="batch-monitor-metric" title="待发货SKU" value={metrics.pending_shipment_skus} tone="orange" />
+      <MetricCard className="batch-monitor-metric" title="待到货SKU" value={metrics.pending_arrival_skus} tone="green" />
     </div>
 
     <div className="batch-copy-lists">
@@ -1002,10 +989,10 @@ export default function BatchMonitorPage({
       />}
     </Card>
 
-    <Modal
+    <MutationModal
       title="新建批次"
       open={createOpen}
-      confirmLoading={creating}
+      busy={creating}
       okText="创建批次"
       cancelText="取消"
       onOk={() => void createBatch()}
@@ -1036,12 +1023,12 @@ export default function BatchMonitorPage({
           <small>读取SKU及DE/FR/ES/IT_PRICE；重复批次或跨批次SKU会整批拒绝。</small>
         </label>
       </div>
-    </Modal>
+    </MutationModal>
 
-    <Modal
+    <MutationModal
       title="货件到货"
       open={shipmentArrivalOpen}
-      confirmLoading={shipmentArrivalSaving}
+      busy={shipmentArrivalSaving}
       okButtonProps={{ disabled: !shipmentArrivalNo.trim() || !shipmentArrivalDate }}
       okText="保存整票到货"
       cancelText="取消"
@@ -1077,12 +1064,12 @@ export default function BatchMonitorPage({
           />
         </label>
       </div>
-    </Modal>
+    </MutationModal>
 
-    <Modal
+    <MutationModal
       title={`${arrivalTarget?.sku.sku || ''} 到货日期`}
       open={Boolean(arrivalTarget)}
-      confirmLoading={arrivalSaving}
+      busy={arrivalSaving}
       okButtonProps={{ disabled: !arrivalDate }}
       okText="保存到货"
       cancelText="取消"
@@ -1096,7 +1083,7 @@ export default function BatchMonitorPage({
         allowClear={false}
         style={{ width: '100%' }}
       />
-    </Modal>
+    </MutationModal>
 
     <Drawer
       title={`未归属批次的首次货件SKU（${orphans?.total ?? payload?.orphan_count ?? 0}）`}
