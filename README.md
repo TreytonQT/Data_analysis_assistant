@@ -8,6 +8,8 @@
 
 ## 下载 Windows 便携版
 
+发布审计通知：此前公开的 v2.0.0～v2.3.0 便携包误含本地业务配置，现已撤为草稿，暂不提供公开下载。源码仅提供 `config_templates/` 空白配置结构及通用指标公式，真实 `configs/` 与内部交接记录不再跟踪；历史提交的残留另行清理。
+
 不需要配置 Python、Node.js 或 Docker，可直接从 [GitHub Releases](https://github.com/TreytonQT/Data_analysis_assistant/releases/latest) 下载 `DataAnalysisAssistant-windows-x64-v2.3.0.zip`：
 
 1. 完整解压到固定目录，不要直接在压缩包内运行。
@@ -36,6 +38,8 @@
 界面使用多级菜单和最近访问标签页组织业务视图，支持浏览器前进/后退恢复页面与筛选状态。保存、上传、下载、复制、删除等操作会显示统一的进行中、成功或失败反馈。
 
 ## 本地源码运行
+
+首次克隆后，先执行 `Copy-Item config_templates configs -Recurse` 初始化配置，再按需在配置中心填写。已有 `configs/` 时请保留原目录，不执行覆盖。模板不含人员、店铺、提成金额、目标和具体运输规则。
 
 建议使用 Python 3.12 和 Node.js 20 或更高版本。
 
@@ -149,7 +153,8 @@ cd frontend
 - `backend/`：FastAPI 路由、看板接口、配置、上传、批次和本地 SQLite 功能
 - `frontend/`：React 桌面端界面
 - `dashboard/`：数据标准化、公式、业务计算、文件存储和 Parquet 缓存
-- `configs/`：默认业务配置
+- `config_templates/`：可公开的配置表头和通用指标公式
+- `configs/`：本机业务配置（不提交）
 - `data/`：本地原始数据、缓存和数据库（不提交到 Git）
 - `packaging/`：PyInstaller Windows 便携版入口与打包配置
 - `.github/workflows/`：标签触发的 Windows 测试、打包和 Release 发布流程
@@ -162,4 +167,4 @@ cd frontend
 
 前端沿用现有Ant Design工作台、深浅主题与业务决策矩阵。Design Tokens、基础组件API、筛选/表单/上传/反馈约定及代码组织要求见 [UI、代码与组件复用规范](docs/UI_CODE_STANDARDS.md)。
 
-统一改造的修改清单、分模块验证与浏览器待验项见 [实施记录](docs/STYLE_UNIFICATION.md)。新对话和后续开发同时遵守 [AGENTS.md](AGENTS.md)，不改动业务计算和存储契约来迁就界面。
+内部实施记录、代理指令和本机交接材料仅在本地保留，不作为公开项目文档。后续开发不改动业务计算和存储契约来迁就界面。

@@ -4,6 +4,8 @@
 
 ## Windows 便携版（推荐）
 
+发布审计通知：此前 v2.0.0～v2.3.0 误包含本地业务配置，已撤为草稿；以下旧版下载步骤暂不可用于公开下载。等待使用安全模板重新构建后再发布。
+
 从 [GitHub Releases](https://github.com/TreytonQT/Data_analysis_assistant/releases/latest) 下载 `DataAnalysisAssistant-windows-x64-v2.3.0.zip` 和对应的 `.sha256.txt`：
 
 1. 可选：使用 `Get-FileHash` 核对压缩包 SHA-256。
@@ -20,6 +22,8 @@ Get-FileHash .\DataAnalysisAssistant-windows-x64-v2.3.0.zip -Algorithm SHA256
 升级便携版时，先关闭旧程序并备份旧目录中的 `data/` 与 `configs/`，完整解压新版后再将备份复制到新版目录。不要直接用新版空目录覆盖唯一的数据副本。
 
 ## 本机源码运行
+
+新克隆在首次安装前执行 `Copy-Item config_templates configs -Recurse`。已有业务配置时保留原目录；不要用空白模板覆盖。人员、店铺、目标、提成和运输规则需自行配置。
 
 首次安装：
 

@@ -16,6 +16,11 @@ htmlcov/
 
 # Local app/runtime files
 .tmp/
+configs/*.csv
+HANDOFF.md
+AGENTS.md
+docs/STYLE_UNIFICATION.md
+docs/APPLE_UI_REDESIGN.md
 .playwright-mcp/
 data/
 data/cache/

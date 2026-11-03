@@ -65,6 +65,7 @@ jobs:
       - name: Run regression tests
         shell: pwsh
         run: |
+          Copy-Item config_templates configs -Recurse
           Get-ChildItem tests/test_*.py | Sort-Object Name | ForEach-Object {
             python scripts/run_bounded.py --timeout 85 -- python -m pytest -q $_.FullName
             if ($LASTEXITCODE -ne 0) { throw "Backend regression failed: $($_.Name)" }
@@ -79,9 +80,11 @@ jobs:
       - name: Build portable application
         shell: pwsh
         run: |
+          python -c "import csv; from pathlib import Path; assert all(not list(csv.DictReader(p.open(encoding='utf-8-sig'))) for p in Path('config_templates').glob('*.csv') if p.name != 'metrics_config.csv'), 'Business configuration templates must contain headers only'"
+          if ($LASTEXITCODE -ne 0) { throw "Unsafe business configuration template" }
           python scripts/run_bounded.py --timeout 85 -- python -m PyInstaller --noconfirm --clean packaging/DataAnalysisAssistant.spec
           if ($LASTEXITCODE -ne 0) { throw "Portable application build failed" }
-          Copy-Item configs "dist/$env:APP_NAME/configs" -Recurse
+          Copy-Item config_templates "dist/$env:APP_NAME/configs" -Recurse
           Copy-Item "packaging/README-WINDOWS.txt" "dist/$env:APP_NAME/README-WINDOWS.txt"
 
       - name: Package and verify archive
