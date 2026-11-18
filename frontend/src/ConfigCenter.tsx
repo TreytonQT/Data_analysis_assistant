@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Alert, Button, Card, Input, Popconfirm, Select, Space, Spin, Table, Tag, Typography, Upload } from 'antd';
+import { Alert, Button, Card, DatePicker, Input, Popconfirm, Select, Space, Spin, Table, Tag, Typography, Upload } from 'antd';
 import { DeleteOutlined, DownloadOutlined, PlusOutlined, ReloadOutlined, SaveOutlined, UploadOutlined } from '@ant-design/icons';
 import type { UploadProps } from 'antd';
+import dayjs from 'dayjs';
 
 import type { PageLifecycleProps } from './pageLifecycle';
 import PageHeading from './components/PageHeading';
@@ -48,6 +49,8 @@ function cellEditor(
     return <Select disabled={disabled} value={enabled ? '是' : '否'} style={{ width: 90 }} options={[{ value: '是', label: '是' }, { value: '否', label: '否' }]} onChange={next => update(rowId, column, next)} />;
   }
   if (column === '店铺类型') return <Select disabled={disabled} allowClear value={value ? String(value) : undefined} style={{ minWidth: 110 }} options={['中企', '本土', '其他'].map(item => ({ value: item, label: item }))} onChange={next => update(rowId, column, next || '')} />;
+  if (column === '停提款时间') return <DatePicker aria-label="停提款月份" disabled={disabled} picker="month" format="YYYY-MM" inputReadOnly allowClear value={value ? dayjs(String(value)) : null} placeholder="选择停提款月份" style={{ width: '100%' }} onChange={next => update(rowId, column, next ? next.format('YYYY-MM') : '')} />;
+  if (column === '店铺所属部门') return <Select aria-label="店铺所属部门" disabled={disabled} allowClear value={value ? String(value) : undefined} placeholder="选择所属部门" style={{ width: '100%' }} options={['联合部门', '运营二十部'].map(item => ({ value: item, label: item }))} onChange={next => update(rowId, column, next || '')} />;
   if (column === '公式') return <Input.TextArea disabled={disabled} value={String(value ?? '')} autoSize={{ minRows: 1, maxRows: 4 }} onChange={event => update(rowId, column, event.target.value)} />;
   return <Input disabled={disabled} value={String(value ?? '')} onChange={event => update(rowId, column, event.target.value)} />;
 }
@@ -197,7 +200,7 @@ export default function ConfigCenter({ active: pageActive = true, routeVersion =
           locale={{ emptyText: '暂无配置，点击“新增一行”开始编辑' }}
           columns={[
             ...config.columns.map(column => ({
-              title: column, dataIndex: column, key: column, width: column === '公式' ? 440 : 160,
+              title: column === '停提款时间' ? '停提款月份' : column, dataIndex: column, key: column, width: column === '公式' ? 440 : 160,
               render: (value: unknown, row: ConfigRow) => cellEditor(row._rowId, column, value, locked, (rowId, key, next) => updateCell(config.name, rowId, key, next)),
             })),
             { title: '操作', key: 'action', fixed: 'right' as const, width: 76, render: (_: unknown, row: ConfigRow) => <Popconfirm disabled={locked} title="确定删除这一行吗？" onConfirm={() => deleteRow(config.name, row._rowId)}><Button disabled={locked} size="small" danger icon={<DeleteOutlined />} /></Popconfirm> },

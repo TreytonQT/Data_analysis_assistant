@@ -413,7 +413,7 @@ def warm_source_cache(source_key: str) -> None:
     titles = {
         "operational_sales": "运营原始表",
         "gross_profit": "毛利原始表",
-        "rating": "Rating",
+        "rating": "领星产品监控表",
         "sales_volume_detail": "销量明细",
         "sales_amount_detail": "销售额明细",
         "sales_history_rolling": "往月销量原始表",
@@ -640,7 +640,7 @@ def _build_slow_moving(developers: str | None, threshold: str) -> dict[str, Any]
     ]
     return {
         **_base_payload(
-            "滞销提醒",
+            "库龄清仓",
             {"developers": options, "thresholds": thresholds},
             {"developers": chosen, "threshold": threshold},
         ),
@@ -1005,7 +1005,7 @@ def _cached_new_product_base(revision: str, business_day: str) -> dict[str, Any]
         except Exception:
             context_columns = []
         try:
-            rating = normalize_rating_source(load_source_frame("rating", "Rating"))
+            rating = normalize_rating_source(load_source_frame("rating", "领星产品监控表"))
             rating_rows = build_product_rating_columns(rating)
             if "Rating" in rating_rows.columns:
                 detail = detail.merge(rating_rows, on="ASIN", how="left", validate="many_to_one")
@@ -1056,6 +1056,8 @@ def _cached_new_product_bundle(
     search: str | None,
     revision: str,
     business_day: str,
+    sales_min: int | None = None,
+    sales_max: int | None = None,
 ) -> dict[str, Any]:
     base = _new_product_base(revision, business_day)
     detail = base["detail"]
@@ -1081,7 +1083,7 @@ def _cached_new_product_bundle(
         "0-6": (0, 6),
         "7-29": (7, 29),
         "30-59": (30, 59),
-        "60-100": (60, 100),
+        "60-100": (60, 99),
     }
     if launch_stage not in NEW_PRODUCT_LAUNCH_STAGES:
         raise HTTPException(422, "未知新品开售阶段")
@@ -1100,6 +1102,11 @@ def _cached_new_product_bundle(
                     needle, case=False, regex=False
                 )
         scoped = scoped[search_match].copy()
+    from backend.product_filters import filter_new_sales
+    try:
+        scoped = filter_new_sales(scoped, sales_min, sales_max)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
     metrics_frame = scoped.copy()
     if status != "all":
         scoped = scoped[scoped["监控状态"].eq(NEW_PRODUCT_STATUS_LABELS[status])].copy()
@@ -1140,6 +1147,8 @@ def _cached_new_product_bundle(
                 "launch_stage": launch_stage,
                 "status": status,
                 "search": search or "",
+                "sales_min": sales_min,
+                "sales_max": sales_max,
             },
         ),
         "has_data": not metrics_frame.empty,
@@ -1171,10 +1180,12 @@ def _new_product_bundle(
     launch_stage: str = "all",
     status: str = "all",
     search: str | None = None,
+    sales_min: int | None = None,
+    sales_max: int | None = None,
 ) -> dict[str, Any]:
     business_day = _new_product_business_day().isoformat()
     return _cached_new_product_bundle(
-        developers, launch_stage, status, search, _new_product_revision(), business_day
+        developers, launch_stage, status, search, _new_product_revision(), business_day, sales_min, sales_max
     )
 
 
@@ -1211,7 +1222,7 @@ def _build_products(developers: str | None, view: str | None = None) -> dict[str
     low = pd.DataFrame()
 
     if include_detail:
-        rating = load_source_frame("rating", "Rating")
+        rating = load_source_frame("rating", "领星产品监控表")
         detail = merge_listing_price_data(
             merge_product_launch_data(
                 merge_product_promotion_data(
@@ -1239,7 +1250,15 @@ def _build_products(developers: str | None, view: str | None = None) -> dict[str
             gross,
             developers=chosen or None,
             allowed_skus=operational_skus,
+            include_all=True,
         ))
+        inventory = operational[["MSKU", "ASIN", "可售"]].rename(columns={"MSKU": "SKU", "可售": "可售数量"}).copy()
+        for key in ("SKU", "ASIN"):
+            inventory[key] = inventory[key].fillna("").astype(str).str.strip()
+        inventory["可售数量"] = normalize_config_number(inventory["可售数量"])
+        grouped_inventory = inventory.groupby(["SKU", "ASIN"], sort=False)["可售数量"]
+        inventory = grouped_inventory.sum(min_count=1).where(grouped_inventory.count().eq(grouped_inventory.size())).reset_index()
+        low = low.merge(inventory, on=["SKU", "ASIN"], how="left", validate="many_to_one")
         sections.append(section(
             "low-margin",
             "低毛利率 SKU",
@@ -1481,7 +1500,7 @@ def _cached_replenishment_base_tables(revision: str) -> dict[str, pd.DataFrame]:
     def build() -> tuple[dict[str, pd.DataFrame], dict[str, Any]]:
         operational = load_source_frame("operational_sales", "运营原始表")
         gross = load_source_frame("gross_profit", "毛利原始表") if get_latest_source_path("gross_profit") else pd.DataFrame()
-        rating = load_source_frame("rating", "Rating") if get_latest_source_path("rating") else pd.DataFrame()
+        rating = load_source_frame("rating", "领星产品监控表") if get_latest_source_path("rating") else pd.DataFrame()
         image_map = load_source_frame("sku_image_map", "SKU图片映射表") if get_latest_source_path("sku_image_map") else pd.DataFrame()
         history_paths = get_sales_history_paths()
         history = load_source_frame("sales_history_rolling", "往月销量原始表") if history_paths else pd.DataFrame()
@@ -2252,15 +2271,14 @@ def _revision_paths() -> list[Path]:
     listing_index = listing_index_path()
     if listing_index.exists():
         paths.append(listing_index)
-    listing_dir = listing_root()
-    paths.extend(path for path in listing_dir.glob('*.csv') if path.is_file())
-    paths.extend(path for path in listing_dir.glob('*.xlsx') if path.is_file())
     return sorted(set(paths), key=str)
 
 
 def dashboard_revision() -> str:
     paths = _revision_paths()
-    return revision_digest("dashboard-derived", paths) if paths else "empty"
+    from backend.listing_prices import listing_source_revision
+    base = revision_digest("dashboard-derived", paths) if paths else "empty"
+    return hashlib.sha256((base + listing_source_revision()).encode("ascii")).hexdigest()
 
 
 def _page_dependency_paths(page_name: str, view: str | None = None) -> list[Path]:
@@ -2390,6 +2408,8 @@ def _bundle(
     month: str | None = None,
     min_qty: int = 0,
     view: str | None = None,
+    margin_bands: str = "negative,0-5,5-12,12-20",
+    min_sales: float = 0,
 ) -> dict[str, Any]:
     revision = _page_revision(page_name, view)
     bundle = _cached_bundle(
@@ -2404,6 +2424,23 @@ def _bundle(
         view,
         revision.split("|", 1)[0],
     )
+    if page_name == "products" and view in {None, "low-margin"}:
+        from backend.product_filters import filter_margin
+        bundle = {**bundle, "sections": [dict(item) for item in bundle["sections"]],
+                  "selected": {**bundle["selected"], "margin_bands": [] if margin_bands == "all" else margin_bands.split(","), "min_sales": min_sales}}
+        for item in bundle["sections"]:
+            if item["key"] == "low-margin":
+                try:
+                    item["frame"] = filter_margin(item["frame"], margin_bands, min_sales)
+                except ValueError as exc:
+                    raise HTTPException(422, str(exc)) from exc
+                if view == "low-margin":
+                    frame = item["frame"]
+                    bundle["metrics"] = [metric("SKU站点记录数", len(frame), "integer"),
+                                         metric("涉及 ASIN 数", frame["ASIN"].nunique(), "integer"),
+                                         metric("小样本记录数", int(frame["销量"].lt(5).sum()), "integer")]
+                    bundle["has_data"] = not frame.empty
+                    bundle["message"] = None if not frame.empty else "当前条件下没有匹配产品"
     if "_updated_at" not in bundle:
         try:
             bundle["_updated_at"] = float(revision.rsplit("|", 1)[1])
@@ -2614,18 +2651,21 @@ def slow_moving(developers: str | None = None, threshold: str = "90天以上"):
 
 
 @router.get("/products")
-def products(developers: str | None = None, view: str | None = Query(None, pattern="^(detail|low-margin)$")):
-    return _dashboard_response("products", developers=developers, view=view)
+def products(developers: str | None = None, view: str | None = Query(None, pattern="^(detail|low-margin)$"),
+             margin_bands: str = "negative,0-5,5-12,12-20", min_sales: float = Query(0, ge=0)):
+    return _dashboard_response("products", developers=developers, view=view, margin_bands=margin_bands, min_sales=min_sales)
 
 
 @router.get("/new-products")
 def new_products(
     developers: str | None = None,
     launch_stage: str = "all",
+    sales_min: int | None = Query(None, ge=0),
+    sales_max: int | None = Query(None, ge=0),
     search: str | None = Query(None, max_length=200),
 ):
     return _new_product_response(
-        _new_product_bundle(developers=developers, launch_stage=launch_stage, search=search)
+        _new_product_bundle(developers=developers, launch_stage=launch_stage, search=search, sales_min=sales_min, sales_max=sales_max)
     )
 
 
@@ -2633,6 +2673,8 @@ def new_products(
 def new_products_view(
     developers: str | None = None,
     launch_stage: str = "all",
+    sales_min: int | None = Query(None, ge=0),
+    sales_max: int | None = Query(None, ge=0),
     status: str = "all",
     search: str | None = Query(None, max_length=200),
     page: int = Query(1, ge=1),
@@ -2642,7 +2684,7 @@ def new_products_view(
 ):
     """Return one consistent summary, full copy lists and requested table page."""
 
-    bundle = _new_product_bundle(developers=developers, launch_stage=launch_stage, status=status, search=search)
+    bundle = _new_product_bundle(developers=developers, launch_stage=launch_stage, status=status, search=search, sales_min=sales_min, sales_max=sales_max)
     return _new_product_response(bundle, page, page_size, sort_by, sort_order)
 
 
@@ -2650,6 +2692,8 @@ def new_products_view(
 def new_product_copy_lists(
     developers: str | None = None,
     launch_stage: str = "all",
+    sales_min: int | None = Query(None, ge=0),
+    sales_max: int | None = Query(None, ge=0),
     search: str | None = Query(None, max_length=200),
 ):
     bundle = _new_product_bundle(
@@ -2657,6 +2701,8 @@ def new_product_copy_lists(
         launch_stage=launch_stage,
         status="all",
         search=search,
+        sales_min=sales_min,
+        sales_max=sales_max,
     )
     frame = _section_model(bundle, "detail")["frame"]
     raise_skus = frame.loc[frame["监控状态"].eq("建议涨价"), "SKU"].drop_duplicates().astype(str).tolist()
@@ -2935,6 +2981,8 @@ def new_products_section(
     sort_order: str = Query("asc", pattern="^(asc|desc)$"),
     developers: str | None = None,
     launch_stage: str = "all",
+    sales_min: int | None = Query(None, ge=0),
+    sales_max: int | None = Query(None, ge=0),
     status: str = "all",
 ):
     bundle = _new_product_bundle(
@@ -2942,6 +2990,8 @@ def new_products_section(
         launch_stage=launch_stage,
         status=status,
         search=search,
+        sales_min=sales_min,
+        sales_max=sales_max,
     )
     return _serialized_section(
         _section_model(bundle, "detail"), page, page_size, search, sort_by, sort_order
@@ -2955,6 +3005,8 @@ def export_new_products(
     sort_order: str = Query("asc", pattern="^(asc|desc)$"),
     developers: str | None = None,
     launch_stage: str = "all",
+    sales_min: int | None = Query(None, ge=0),
+    sales_max: int | None = Query(None, ge=0),
     status: str = "all",
 ):
     bundle = _new_product_bundle(
@@ -2962,6 +3014,8 @@ def export_new_products(
         launch_stage=launch_stage,
         status=status,
         search=search,
+        sales_min=sales_min,
+        sales_max=sales_max,
     )
     model = _section_model(bundle, "detail")
     frame = _query_frame(model["frame"], search, sort_by, sort_order, model.get("columns"))
@@ -2991,6 +3045,8 @@ def dashboard_section(
     min_qty: int | None = Query(None, ge=0),
     include_pricing: bool = True,
     view: str | None = None,
+    margin_bands: str = "negative,0-5,5-12,12-20",
+    min_sales: float = Query(0, ge=0),
 ):
     try:
         effective_min_qty = min_qty if min_qty is not None else (0 if page_name == "replenishment" else 30)
@@ -3004,6 +3060,8 @@ def dashboard_section(
             month=month,
             min_qty=effective_min_qty,
             view=view,
+            margin_bands=margin_bands,
+            min_sales=min_sales,
         )
         return _serialized_section(_section_model(bundle, section_key), page, page_size, search, sort_by, sort_order, include_pricing=include_pricing)
     except HTTPException:
@@ -3038,6 +3096,8 @@ def export_dashboard_section(
     month: str | None = None,
     min_qty: int | None = Query(None, ge=0),
     view: str | None = None,
+    margin_bands: str = "negative,0-5,5-12,12-20",
+    min_sales: float = Query(0, ge=0),
 ):
     try:
         effective_min_qty = min_qty if min_qty is not None else (0 if page_name == "replenishment" else 30)
@@ -3051,6 +3111,8 @@ def export_dashboard_section(
             month=month,
             min_qty=effective_min_qty,
             view=view,
+            margin_bands=margin_bands,
+            min_sales=min_sales,
         )
         model = _section_model(bundle, section_key)
         frame = _query_frame(model["frame"], search, sort_by, sort_order, model.get("columns"))

@@ -4,6 +4,9 @@ export type PageKey =
   | 'slow-moving'
   | 'products'
   | 'new-products'
+  | 'variants'
+  | 'price-monitor'
+  | 'product-operations'
   | 'department'
   | 'replenishment'
   | 'batch-monitor'
@@ -19,6 +22,10 @@ export type RouteKey =
   | 'products:detail'
   | 'products:low-margin'
   | 'products:new-products'
+  | 'products:variants'
+  | 'products:price-up'
+  | 'products:price-down'
+  | 'products:diagnosis'
   | 'department:performance'
   | 'department:commission'
   | 'department:assessment'
@@ -76,16 +83,12 @@ const group = (key: string, label: string, children: NavigationNode[], parentKey
 export const navigationTree: NavigationNode[] = [
   leaf('overview', '经营首页', 'overview'),
   leaf('sales', '销量看板', 'sales'),
-  group('slow-moving', '滞销提醒', [
-    leaf('slow-moving:details', '滞销明细', 'slow-moving', ['slow-moving'], { tab: 'details' }),
-    leaf('slow-moving:promotion', '调价与促销', 'slow-moving', ['slow-moving'], { tab: 'promotion' }),
-    leaf('slow-moving:actual-prices', '实际价格', 'slow-moving', ['slow-moving'], { tab: 'promotion', promotion_view: 'actual-prices' }),
+  group('products', '产品经营', [
+    leaf('products:diagnosis', '经营诊断', 'product-operations', ['products']),
+    leaf('products:price-up', '涨价追踪', 'price-monitor', ['products'], { direction: 'up' }),
+    leaf('products:price-down', '降价追踪', 'price-monitor', ['products'], { direction: 'down' }),
   ]),
-  group('products', '产品管理', [
-    leaf('products:detail', '产品管理明细', 'products', ['products'], { tab: 'detail' }),
-    leaf('products:low-margin', '低毛利率 SKU', 'products', ['products'], { tab: 'low-margin' }),
-    leaf('products:new-products', '新品监控', 'new-products', ['products']),
-  ]),
+  leaf('products:variants', '变体管理', 'variants'),
   group('department', '部门监控', [
     leaf('department:performance', '业绩监控（统计报表）', 'department', ['department'], { tab: 'performance' }),
     leaf('department:commission', '提成监控（业绩报表）', 'department', ['department'], { tab: 'commission' }),
@@ -116,8 +119,13 @@ function flattenGroups(node: NavigationNode): NavigationGroup[] {
   return node.kind === 'leaf' ? [] : [node, ...node.children.flatMap(flattenGroups)];
 }
 
+// Keep old bookmarks and recent tabs without a second sidebar entry.
 export const navigationLeaves = navigationTree.flatMap(flattenLeaves);
 export const navigationLeafByKey = new Map<RouteKey, NavigationLeaf>(navigationLeaves.map(item => [item.key, item]));
+for (const key of ['products:detail', 'products:low-margin', 'products:new-products', 'slow-moving:details', 'slow-moving:promotion'] as RouteKey[]) {
+  navigationLeafByKey.set(key, navigationLeafByKey.get('products:diagnosis')!);
+}
+navigationLeafByKey.set('slow-moving:actual-prices', navigationLeafByKey.get('products:price-up')!);
 export const navigationGroupByKey = new Map<string, NavigationGroup>(navigationTree.flatMap(flattenGroups).map(item => [item.key, item]));
 
 export function pageForRoute(key: RouteKey): PageKey {
@@ -127,10 +135,8 @@ export function pageForRoute(key: RouteKey): PageKey {
 export function routeLeafForSearch(search: string): NavigationLeaf {
   const params = new URLSearchParams(search);
   const page = params.get('page') as PageKey | null;
-  if (page === 'slow-moving' && params.get('tab') === 'promotion') {
-    return params.get('promotion_view') === 'actual-prices'
-      ? navigationLeafByKey.get('slow-moving:actual-prices')!
-      : navigationLeafByKey.get('slow-moving:promotion')!;
+  if (page === 'products' || page === 'new-products' || page === 'slow-moving') {
+    return params.get('promotion_view') === 'actual-prices' ? navigationLeafByKey.get('products:price-up')! : navigationLeafByKey.get('products:diagnosis')!;
   }
   if (page === 'config') {
     const configTab = params.get('config_tab');
@@ -148,11 +154,14 @@ export function routeLeafForSearch(search: string): NavigationLeaf {
 export function searchForRoute(key: RouteKey, currentSearch = '') {
   const route = navigationLeafByKey.get(key) || navigationLeafByKey.get('overview')!;
   const params = new URLSearchParams(currentSearch);
-  const promotionView = (route.key === 'slow-moving:promotion' || route.key === 'slow-moving:actual-prices') && params.get('tab') === 'promotion' ? params.get('promotion_view') : null;
+  const originalPage = params.get('page');
+  const scene = originalPage === 'new-products' || key === 'products:new-products' ? 'new'
+    : params.get('tab') === 'low-margin' || key === 'products:low-margin' ? 'margin'
+      : originalPage === 'product-operations' ? params.get('scene') : 'clearance';
   params.set('page', route.page);
-  ['tab', 'promotion_view', 'config_tab'].forEach(name => params.delete(name));
+  ['tab', 'promotion_view', 'config_tab', 'direction', 'scene'].forEach(name => params.delete(name));
   Object.entries(route.params).forEach(([name, value]) => params.set(name, value));
-  if ((route.key === 'slow-moving:promotion' || route.key === 'slow-moving:actual-prices') && promotionView) params.set('promotion_view', promotionView);
+  if (route.page === 'product-operations' && scene) params.set('scene', scene);
   return `?${params.toString()}`;
 }
 

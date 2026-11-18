@@ -2742,6 +2742,20 @@ def build_replenishment_rating_summary(df: pd.DataFrame) -> pd.DataFrame:
     return best[["ASIN", "产品评价数", "产品评分值"]].reset_index(drop=True)
 
 
+def replenishment_calibrated_daily_sales(sales_7: pd.Series, sales_14: pd.Series,
+                                        sales_30: pd.Series, age_days: pd.Series) -> pd.Series:
+    new_daily = sales_7 / 7 * 0.90 + sales_14 / 14 * 0.09 + sales_30 / 30 * 0.01
+    old_daily = sales_7 / 7 * 0.60 + sales_14 / 14 * 0.30 + sales_30 / 30 * 0.10
+    return new_daily.where(age_days.lt(90), old_daily).where(age_days.ge(0))
+
+
+def replenishment_total_stock(data: pd.DataFrame) -> pd.Series:
+    return (
+        data["可售"] + data["待调仓"] + data["调仓中"] + data["待入库"] * 2
+        + data["采购在途"] + data["本地库存"] + data["在途"] + data["计划入库"]
+    )
+
+
 def build_replenishment_management_tables(
     operational_df: pd.DataFrame,
     gross_profit_df: pd.DataFrame | None = None,
@@ -2813,23 +2827,10 @@ def build_replenishment_management_tables(
     data["数据异常"] = ["；".join(issues) for issues in issue_lists]
 
     valid = data["数据异常"].eq("")
-    data["校准日销量"] = pd.NA
-    new_sku = valid & data["上架天数"].lt(90)
-    old_sku = valid & ~new_sku
-    data.loc[new_sku, "校准日销量"] = (
-        data.loc[new_sku, "7天销量"] / 7 * 0.90
-        + data.loc[new_sku, "14天销量"] / 14 * 0.09
-        + data.loc[new_sku, "30天销量"] / 30 * 0.01
-    )
-    data.loc[old_sku, "校准日销量"] = (
-        data.loc[old_sku, "7天销量"] / 7 * 0.60
-        + data.loc[old_sku, "14天销量"] / 14 * 0.30
-        + data.loc[old_sku, "30天销量"] / 30 * 0.10
-    )
-    data["SKU总库存"] = (
-        data["可售"] + data["待调仓"] + data["调仓中"] + data["待入库"] * 2
-        + data["采购在途"] + data["本地库存"] + data["在途"] + data["计划入库"]
-    )
+    data["校准日销量"] = replenishment_calibrated_daily_sales(
+        data["7天销量"], data["14天销量"], data["30天销量"], data["上架天数"]
+    ).where(valid)
+    data["SKU总库存"] = replenishment_total_stock(data)
     data["SKU亚马逊可售"] = data[["可售", "待调仓", "调仓中", "待入库"]].sum(axis=1, min_count=4)
     data["T值"] = data["7天销量"] / 7 - data["30天销量"] / 30
     data["库龄90天以上"] = data[AGING_STOCK_COLUMNS].sum(axis=1, min_count=1)
@@ -3321,12 +3322,13 @@ def build_new_product_monitor_table(
     # Vectorized sums preserve all-missing groups with min_count=1; Python
     # callbacks per SKU and metric otherwise dominate each cold calculation.
     totals = grouped[["可售", "日均销量", *NEW_PRODUCT_MONITOR_SALES_COLUMNS]].sum(min_count=1)
+    totals["90天销量"] = totals["90天销量"].where(grouped["90天销量"].count().eq(grouped.size()))
     rows = rows.join(totals.rename(columns={"可售": "可售数量"})).reset_index()
     rows = rows.merge(
         launch[["_sku_key", "_launch_date"]], on="_sku_key", how="left", validate="one_to_one"
     )
     rows["开售天数"] = (reference_day - rows["_launch_date"]).dt.days.astype("Int64")
-    valid_launch = rows["_launch_date"].notna() & rows["开售天数"].between(0, 100)
+    valid_launch = rows["_launch_date"].notna() & rows["开售天数"].between(0, 99)
     invalid_launch = rows["_launch_date"].isna() | rows["开售天数"].lt(0)
     invalid_launch_rows = rows.loc[invalid_launch, ["_sku_key", "开发员"]]
     output.attrs["excluded_invalid_launch_count"] = int(len(invalid_launch_rows))
@@ -3415,6 +3417,7 @@ def build_low_margin_product_table(
     min_sales: float = LOW_MARGIN_PRODUCT_MIN_SALES,
     developers: Iterable[str] | None = None,
     allowed_skus: Iterable[str] | None = None,
+    include_all: bool = False,
 ) -> pd.DataFrame:
     gross_profit = normalize_low_margin_gross_profit_source(gross_profit_df)
     if allowed_skus is not None:
@@ -3443,10 +3446,11 @@ def build_low_margin_product_table(
         .reset_index()
     )
     grouped["毛利率"] = grouped.apply(lambda row: safe_blank_ratio(row["毛利润"], row["销售额"]), axis=1)
-    grouped = grouped[
-        (pd.to_numeric(grouped["销量"], errors="coerce") >= min_sales)
-        & (pd.to_numeric(grouped["毛利率"], errors="coerce") < threshold)
-    ].copy()
+    if not include_all:
+        grouped = grouped[
+            (pd.to_numeric(grouped["销量"], errors="coerce") >= min_sales)
+            & (pd.to_numeric(grouped["毛利率"], errors="coerce") < threshold)
+        ].copy()
 
     if grouped.empty:
         return pd.DataFrame(columns=LOW_MARGIN_PRODUCT_COLUMNS)

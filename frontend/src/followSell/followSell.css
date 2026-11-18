@@ -1,0 +1,56 @@
+body { margin: 0; background: var(--app-color-page); color: var(--app-color-text); font-family: var(--app-font-family); }
+.follow-shell { min-height: 100vh; background: var(--app-color-page); }
+.follow-shell * { box-sizing: border-box; }
+.follow-topbar { height: var(--app-header-height); display: flex; align-items: center; justify-content: space-between; padding: 0 var(--app-space-page); border-bottom: 1px solid var(--app-color-border); }
+.follow-brand { font-weight: 600; display: flex; align-items: center; gap: var(--app-space-control); }
+.follow-main { max-width: 1380px; margin: auto; padding: var(--app-space-page); }
+.follow-main .page-heading { display: flex; justify-content: space-between; align-items: flex-start; gap: var(--app-space-card); margin-bottom: var(--app-space-heading); }
+.follow-main .page-heading h1 { font-size: 28px; margin: 0 0 6px; line-height: 1.35; }
+.follow-main .ant-card { box-shadow: none; } /* taste-skill-ignore: Explicitly removes resting card shadows. */
+.follow-muted { color: var(--app-color-secondary); font-size: 13px; }
+.follow-main .follow-mapping { margin-bottom: var(--app-space-section); }
+.follow-mapping-inner { display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr); gap: var(--app-space-heading); align-items: center; }
+.follow-mapping-note { color: var(--app-color-secondary); font-size: 13px; line-height: 1.8; border-left: 1px solid var(--app-color-border); padding-left: var(--app-space-heading); }
+/* At 1440: 1324px canvas = two 653px panels + 18px gutter. */
+.follow-stages { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--app-space-section); align-items: start; }
+.follow-stage { min-width: 0; }
+.follow-stage h2 { font-size: 18px; font-weight: 600; margin: 0; }
+.follow-stage .ant-card-head { padding: 0 var(--app-space-heading); }
+.follow-stage .ant-card-body { padding: var(--app-space-heading); }
+.follow-replacement-note { display: flex; flex-direction: column; align-items: flex-start; gap: var(--app-space-control); margin-bottom: var(--app-space-card); font-size: 14px; line-height: 1.5; }
+.follow-replacement-note img { display: block; max-width: 100%; height: auto; border: 1px solid var(--app-color-border); border-radius: var(--app-radius-control); }
+.follow-stage-description { color: var(--app-color-secondary); font-size: 13px; margin: 0 0 var(--app-space-section); line-height: 1.7; }
+.follow-file + .follow-file { margin-top: var(--app-space-section); }
+.follow-file { min-width: 0; }
+.follow-file-heading { display: flex; align-items: center; justify-content: space-between; gap: var(--app-space-control); margin-bottom: var(--app-space-control); }
+.follow-file-heading strong { font-weight: 500; font-size: 14px; }
+.follow-file-heading .ant-btn-link { color: var(--app-color-secondary); text-decoration: underline; text-underline-offset: 3px; }
+.follow-file-control { display: flex; align-items: center; gap: var(--app-space-control); min-width: 0; }
+.follow-file-control input[type=file] { display: none; }
+.follow-file-name { min-width: 0; flex: 1; white-space: nowrap; text-overflow: ellipsis; overflow: hidden; font-size: 13px; }
+.follow-stage-actions { display: flex; align-items: center; flex-wrap: wrap; gap: var(--app-space-control); margin: var(--app-space-heading) 0 0; }
+.follow-stage [role=alert], .follow-preview { margin-top: var(--app-space-section); }
+.follow-summary { display: flex; flex-wrap: wrap; gap: 8px 18px; padding-bottom: var(--app-space-card); color: var(--app-color-secondary); font-size: 13px; }
+.follow-summary strong { color: var(--app-color-text); font-size: 18px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.follow-preview .ant-table, .follow-issues .ant-table { font-size: 12px; font-variant-numeric: tabular-nums; }
+.follow-preview .ant-table-wrapper, .follow-issues { min-width: 0; max-width: 100%; margin-top: var(--app-space-card); }
+.follow-saved-path { overflow-wrap: anywhere; }
+.follow-main .follow-output { margin-top: var(--app-space-section); }
+.follow-output label { display: block; font-weight: 500; margin-bottom: var(--app-space-control); }
+.follow-output-control { display: flex; gap: var(--app-space-control); }
+.follow-footnote { color: var(--app-color-secondary); font-size: 13px; line-height: 1.7; margin-top: var(--app-space-card); }
+.follow-main .route-loading { padding: 60px 0; text-align: center; }
+@media (max-width: 1100px) {
+  .follow-main { padding: var(--app-space-page-narrow); }
+  .follow-stage .ant-card-body { padding: var(--app-space-card); }
+  .follow-file-control { flex-wrap: wrap; }
+  .follow-file-name { flex-basis: 50%; }
+}
+@media (max-width: 720px) {
+  .follow-stages, .follow-mapping-inner { grid-template-columns: minmax(0, 1fr); }
+  .follow-mapping-note { border-left: 0; border-top: 1px solid var(--app-color-border); padding: var(--app-space-card) 0 0; }
+  .follow-main .page-heading h1 { font-size: 23px; }
+  .follow-topbar { padding: 0 var(--app-space-page-narrow); }
+  .follow-output-control { flex-wrap: wrap; }
+  .follow-output-control .ant-input { width: 100%; }
+}

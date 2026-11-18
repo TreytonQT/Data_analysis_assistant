@@ -60,16 +60,17 @@ class NewProductMonitorTests(unittest.TestCase):
         self.assertEqual(by_sku.loc["OUT", "监控状态"], "已断货")
         self.assertTrue(pd.isna(by_sku.loc["OBSERVE", "可售覆盖天数"]))
 
-    def test_launch_window_includes_day_zero_and_day_one_hundred(self):
+    def test_launch_window_includes_day_zero_and_ninety_nine_but_excludes_one_hundred(self):
         rows = self.build([
             ("TODAY", "A1", 0, 1, 1, "甲"),
             ("DAY-7", "A2", 7, 1, 1, "甲"),
+            ("DAY-99", "A9", 99, 100, 1, "甲"),
             ("DAY-100", "A3", 100, 100, 1, "甲"),
             ("DAY-101", "A4", 101, 100, 1, "甲"),
             ("FUTURE", "A5", -1, 1, 1, "甲"),
             ("NO-DATE", "A6", None, 1, 1, "甲"),
         ])
-        self.assertEqual(set(rows["SKU"]), {"TODAY", "DAY-7", "DAY-100"})
+        self.assertEqual(set(rows["SKU"]), {"TODAY", "DAY-7", "DAY-99"})
         self.assertEqual(rows.attrs["excluded_invalid_launch_count"], 2)
 
     def test_missing_negative_and_conflicting_core_values_are_not_recommendations(self):
@@ -113,6 +114,15 @@ class NewProductMonitorTests(unittest.TestCase):
         self.assertEqual(rows["SKU"].tolist(), [
             "RAISE-2", "RAISE-4", "ZERO-SALES", "LOWER-120", "LOWER-91", "NORMAL",
         ])
+
+    def test_partial_missing_90_day_sales_does_not_become_zero(self):
+        operational = pd.DataFrame([
+            {"MSKU": "SKU", "ASIN": "A", "开发员": "甲", "可售": 2, "日均销量": 0, "90天销量": 0},
+            {"MSKU": "SKU", "ASIN": "A", "开发员": "乙", "可售": 2, "日均销量": 0, "90天销量": None},
+        ])
+        launches = pd.DataFrame([{"SKU": "SKU", "开售时间": self.reference.isoformat()}])
+        rows = build_new_product_monitor_table(operational, launches, self.reference)
+        self.assertTrue(pd.isna(rows.iloc[0]["90天销量"]))
 
 
 if __name__ == "__main__":

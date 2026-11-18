@@ -19,6 +19,7 @@ class AppRevisionsApiTests(unittest.TestCase):
             patch("backend.app_revisions.reports_revision", return_value="reports-v1"),
             patch("backend.app_revisions.config_revision", return_value="configs-v1"),
             patch("backend.app_revisions.batch_monitor_revision", return_value="batch-monitor-v1"),
+            patch("backend.app_revisions.variant_revision", return_value="variants-v1"),
         ):
             response = self.client.get("/api/app-revisions")
 
@@ -31,5 +32,6 @@ class AppRevisionsApiTests(unittest.TestCase):
                 "reports": "reports-v1",
                 "configs": "configs-v1",
                 "batch_monitor": "batch-monitor-v1",
+                "variants": "variants-v1",
             },
         )

@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: Release tag, for example v2.3.0
+        description: Release tag, for example v2.4.0
         required: true
-        default: v2.3.0
+        default: v2.4.0
 
 permissions:
   contents: write
@@ -20,8 +20,8 @@ jobs:
     timeout-minutes: 20
     env:
       APP_NAME: DataAnalysisAssistant
-      DEFAULT_RELEASE_TAG: v2.3.0
-      RELEASE_SUBTITLE: 桌面工作台与图表交互升级
+      DEFAULT_RELEASE_TAG: v2.4.0
+      RELEASE_SUBTITLE: 产品经营与变体管理
 
     steps:
       - name: Check out source
@@ -64,12 +64,18 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Test dependency installation failed" }
       - name: Run regression tests
         shell: pwsh
+        env:
+          DATA_ANALYSIS_ASSISTANT_DATA_DIR: ${{ runner.temp }}/release-test-data
+          DATA_ANALYSIS_ASSISTANT_CONFIG_DIR: ${{ github.workspace }}/config_templates
+          FOLLOW_SELL_TEST_ROOT: ${{ runner.temp }}/follow-sell-tests
         run: |
           Copy-Item config_templates configs -Recurse
           Get-ChildItem tests/test_*.py | Sort-Object Name | ForEach-Object {
             python scripts/run_bounded.py --timeout 85 -- python -m pytest -q $_.FullName
             if ($LASTEXITCODE -ne 0) { throw "Backend regression failed: $($_.Name)" }
           }
+          python scripts/run_bounded.py --timeout 85 -- python -m unittest follow_sell.test_processor
+          if ($LASTEXITCODE -ne 0) { throw "Independent tool regression failed" }
           Push-Location frontend
           Get-ChildItem src -Recurse -Include *.test.ts,*.test.tsx | Sort-Object FullName | ForEach-Object {
             python ../scripts/run_bounded.py --timeout 85 -- cmd.exe /d /c npm.cmd test -- $_.FullName --maxWorkers=2 --testTimeout=10000
@@ -118,6 +124,20 @@ jobs:
             if (-not ($entryNames -contains "$env:APP_NAME/DataAnalysisAssistant.exe")) {
               throw "Release archive does not contain DataAnalysisAssistant.exe"
             }
+            $configPrefix = "$env:APP_NAME/configs/"
+            $configEntries = @($zip.Entries | Where-Object { (($_.FullName -replace '\\', '/').StartsWith($configPrefix)) -and $_.Name })
+            $templates = @(Get-ChildItem config_templates -File -Filter *.csv)
+            if ($configEntries.Count -ne $templates.Count) { throw "Unexpected configuration files in archive" }
+            foreach ($template in $templates) {
+              $entry = $configEntries | Where-Object { ($_.FullName -replace '\\', '/') -eq "$configPrefix$($template.Name)" }
+              if (@($entry).Count -ne 1) { throw "Missing or duplicate configuration template" }
+              $stream = $entry.Open()
+              $sha = [System.Security.Cryptography.SHA256]::Create()
+              try {
+                $actual = [Convert]::ToHexString($sha.ComputeHash($stream))
+                if ($actual -ne (Get-FileHash $template.FullName -Algorithm SHA256).Hash) { throw "Archive configuration differs from safe template" }
+              } finally { $sha.Dispose(); $stream.Dispose() }
+            }
           } finally {
             $zip.Dispose()
           }
@@ -142,7 +162,7 @@ jobs:
           - 无需安装 Python、Node.js 或 Docker
           - 不包含业务数据目录、SQLite 数据库、上传文件或缓存
           - 首次运行会创建新的空数据目录
-          - configs 目录包含程序运行需要的默认配置
+          - configs 目录仅含空白业务配置和通用指标公式，请自行配置
           - 服务仅监听 127.0.0.1:8000
 
           迁移已有数据时，请在程序关闭后手动复制旧电脑的 data 和 configs 目录。
@@ -154,6 +174,7 @@ jobs:
           $entry = [regex]::Match($changelog, "(?ms)^## $escapedTag\b[^\r\n]*\r?\n(.*?)(?=^## |\z)")
           if (-not $entry.Success) { throw "CHANGELOG does not contain $env:RELEASE_TAG" }
           $notes += "`n`n" + $entry.Groups[1].Value.Trim() + "`n"
+          $notes = $notes.Replace('](DEPLOYMENT.md)', "](https://github.com/$env:GITHUB_REPOSITORY/blob/$env:RELEASE_TAG/DEPLOYMENT.md)")
           $notes | Set-Content release-notes.md -Encoding utf8
 
           if (gh release view $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY 2>$null) {

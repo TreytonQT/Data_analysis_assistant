@@ -39,6 +39,7 @@ describe('UploadCenter', () => {
     expect(screen.getByTestId('source-sales_volume_detail')).toBeInTheDocument();
     expect(screen.getByTestId('source-sales_amount_detail')).toBeInTheDocument();
     expect(screen.queryByTestId('source-rating')).not.toBeInTheDocument();
+    expect(screen.getByTestId('listing-prices')).toHaveTextContent('需包含 Rating总数、评分');
     expect(screen.queryByTestId('performance-reports')).not.toBeInTheDocument();
     expect(screen.queryByTestId('sales-history-rolling')).not.toBeInTheDocument();
 
@@ -46,7 +47,8 @@ describe('UploadCenter', () => {
     window.dispatchEvent(new PopStateEvent('popstate'));
     await waitFor(() => expect(screen.getByTestId('performance-reports')).toBeInTheDocument());
     expect(new URLSearchParams(window.location.search).get('tab')).toBe('weekly');
-    expect(screen.getByTestId('source-rating')).toBeInTheDocument();
+    expect(screen.queryByTestId('source-rating')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('listing-prices')).not.toBeInTheDocument();
     expect(screen.getByTestId('performance-reports')).toBeInTheDocument();
     expect(screen.queryByTestId('source-operational_sales')).not.toBeInTheDocument();
     expect(screen.queryByTestId('sales-history-rolling')).not.toBeInTheDocument();

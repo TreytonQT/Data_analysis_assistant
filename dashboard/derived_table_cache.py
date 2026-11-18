@@ -91,6 +91,7 @@ def _prune_old_bundles(root: Path, safe_namespace: str) -> None:
         "replenishment-base": 4,
         "listing-source-tables": 2,
         "listing-event-pair": 64,
+        "price-monitor-pair": 384,
     }
     keep = limits.get(safe_namespace, 4)
     manifests = []

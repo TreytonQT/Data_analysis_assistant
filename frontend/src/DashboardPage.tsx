@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import { Alert, Button, Card, Input, InputNumber, Pagination, Skeleton, Space, Table, Typography } from 'antd';
+import { Alert, Button, Card, Input, InputNumber, Skeleton, Space, Table, Typography } from 'antd';
 import { DownloadOutlined, ReloadOutlined } from '@ant-design/icons';
 import type { TableProps } from 'antd';
 
@@ -13,7 +13,6 @@ import type { PageKey } from './navigation';
 import { FORECAST_ASSESSMENT_COLUMN, useDepartmentRatio, withForecastAssessment } from './departmentRatio';
 import { api, type DepartmentAssessmentPayload, type DepartmentCommissionConfigDetails, type DepartmentCommissionConfigPayload, type DashboardChartSeries, type DashboardPayload, type DashboardSection } from './api';
 import { feedbackMessage as message, downloadBlobWithFeedback, downloadWithFeedback } from './feedback';
-import { DashboardDecisionMatrix, dashboardMatrixKind } from './DashboardDecisionMatrices';
 import FilterActions from './FilterActions';
 import ConfirmFilterSelect from './ConfirmFilterSelect';
 import OverviewBoard from './OverviewBoard';
@@ -22,11 +21,6 @@ const pageDescriptions: Record<string, string> = {
   'slow-moving': '识别高库龄库存、占用资金、库存计提与弃置费', products: '汇总产品销量、库存、毛利和 Rating',
   department: '部门与开发员业绩、人员提成汇总', replenishment: '结合库存、销量、毛利和 Rating 计算补货建议',
 };
-export type ProductManagementTab = 'detail' | 'low-margin';
-
-export function productManagementTabFromSearch(search: string): ProductManagementTab {
-  return new URLSearchParams(search).get('tab') === 'low-margin' ? 'low-margin' : 'detail';
-}
 export type DepartmentMonitoringTab = 'performance' | 'commission' | 'assessment';
 
 export function departmentMonitoringTabFromSearch(search: string): DepartmentMonitoringTab {
@@ -36,7 +30,7 @@ export function departmentMonitoringTabFromSearch(search: string): DepartmentMon
 
 type ValueMeta = { format?: string; type?: string; unit?: string; precision?: number };
 type SectionQuery = { page: number; pageSize: number; search: string; sortBy?: string; sortOrder?: 'asc' | 'desc' };
-const filterKeys = ['developers', 'months', 'month', 'departments', 'store_types', 'threshold'] as const;
+const filterKeys = ['developers', 'months', 'month', 'departments', 'store_types', 'threshold', 'margin_bands', 'min_sales'] as const;
 const amountNamePattern = /(销售额|营业额|毛利|利润|广告费|成本|货值|提成|计提|弃置费|占用资金|金额|费用|收入|支出)/;
 
 function isPercentField(name = '', meta: ValueMeta = {}) {
@@ -215,7 +209,6 @@ function sectionExportUrl(page: string, section: string, filters: Record<string,
 export function DashboardSectionCard({ initialSection, dashboardPage, filters, compactSales, commissionConfig, onCommissionSaved }: { initialSection: DashboardSection; dashboardPage: string; filters: Record<string, string>; compactSales: boolean; commissionConfig?: DepartmentCommissionConfigPayload; onCommissionSaved?: () => void }) {
   const performance = initialSection.title === '开发员业绩排行' || initialSection.title === '部门业绩' || initialSection.title === '店铺业绩排行';
   const remote = Boolean(initialSection.server_managed) && !performance;
-  const matrixKind = dashboardMatrixKind(dashboardPage, initialSection.key);
   const [section, setSection] = useState(initialSection);
   const [query, setQuery] = useState<SectionQuery>({ page: initialSection.page || 1, pageSize: initialSection.page_size || 50, search: '' });
   const [searchDraft, setSearchDraft] = useState('');
@@ -368,79 +361,17 @@ export function DashboardSectionCard({ initialSection, dashboardPage, filters, c
       <strong>{formattedValue(section.summary?.[column.key], column, column.label)}</strong>
     </Table.Summary.Cell>)}
   </Table.Summary.Row> : undefined;
-  const changeMatrixSort = (sortBy?: string) => {
-    void loadSection({
-      ...query,
-      page: 1,
-      sortBy: sortBy || undefined,
-      sortOrder: sortBy ? query.sortOrder || 'desc' : undefined,
-    });
-  };
-  const toggleMatrixSortOrder = () => {
-    if (!query.sortBy) return;
-    void loadSection({
-      ...query,
-      page: 1,
-      sortOrder: query.sortOrder === 'asc' ? 'desc' : 'asc',
-    });
-  };
-  const matrixPagination = matrixKind && remote ? <Pagination
-    className="dashboard-matrix-pagination"
-    current={query.page}
-    pageSize={query.pageSize}
-    total={section.total || 0}
-    showSizeChanger
-    pageSizeOptions={[10, 20, 50, 100, 200]}
-    showTotal={total => `共 ${total} 行`}
-    onChange={(nextPage, nextPageSize) => void loadSection({
-      ...query,
-      page: nextPageSize === query.pageSize ? nextPage : 1,
-      pageSize: nextPageSize,
-    })}
-  /> : null;
-
   return <Card
     className={`dashboard-section dashboard-section-${section.key}`}
     title={section.title}
     extra={<Space wrap className="dashboard-section-actions">
-      {matrixKind && remote && <ConfirmFilterSelect
-        ariaLabel={`${section.title}排序字段`}
-        mode="single"
-        value={query.sortBy || ''}
-        normalizeValue={value => value || undefined}
-        onConfirm={value => changeMatrixSort(value ? String(value) : undefined)}
-        options={[
-          { value: '', label: '默认排序' },
-          ...section.columns
-            .filter(column => column.sortable !== false)
-            .map(column => ({ value: column.key, label: displayLabel(column.label, column) })),
-        ]}
-        placeholder="默认排序"
-        style={{ width: 180, minWidth: 180 }}
-      />}
-      {matrixKind && remote && <Button
-        aria-label={`${section.title}排序方向`}
-        disabled={!query.sortBy}
-        onClick={toggleMatrixSortOrder}
-      >
-        {query.sortOrder === 'asc' ? '升序' : '降序'}
-      </Button>}
       {remote && <Input.Search allowClear value={searchDraft} loading={loading} placeholder="搜索当前表格" onChange={event => setSearchDraft(event.target.value)} onSearch={value => void loadSection({ ...query, page: 1, search: value.trim() })} style={{ width: 220 }} />}
       {exportButton}
     </Space>}
   >
     {error && <Alert className="section-load-error" type="error" showIcon message="表格加载失败" description={error} action={<Button size="small" onClick={() => void loadSection(query)}>重试</Button>} />}
     {performance ? <PerformanceOverviewImage section={section} /> : <>
-      {matrixKind
-        ? loading
-          ? <div className="dashboard-matrix-loading"><Skeleton active paragraph={{ rows: 5 }} title={false} /></div>
-          : !section.rows.length
-            ? <SectionEmpty />
-            : <>
-              <DashboardDecisionMatrix kind={matrixKind} section={section} />
-              {matrixPagination}
-            </>
-        : !loading && !section.rows.length ? <SectionEmpty /> : <>
+      {!loading && !section.rows.length ? <SectionEmpty /> : <>
         <MiniChart section={section} />
         <Table
           rowKey={row => rowKeys.get(row)!}
@@ -461,11 +392,12 @@ function selectionFromServer(selected: DashboardPayload['selected']) {
   return result;
 }
 
-function selectionParams(selection: Record<string, string | string[]>) {
+export function selectionParams(selection: Record<string, string | string[]>) {
   const params: Record<string, string> = {};
   filterKeys.forEach(key => {
     const value = selection[key];
     if (Array.isArray(value) && value.length) params[key] = value.join(',');
+    else if (key === 'margin_bands' && Array.isArray(value)) params[key] = 'all';
     else if (typeof value === 'string' && value) params[key] = value;
   });
   return params;
@@ -610,7 +542,6 @@ export default function DashboardPage({ page, active = true, routeVersion = 0, r
   const [assessmentData, setAssessmentData] = useState<DepartmentAssessmentPayload>();
   const { ratio, ratioError, onRatioChange } = useDepartmentRatio();
   const performanceSections = useMemo(() => data?.sections.map(section => page === 'department' ? withForecastAssessment(section, ratio) : section), [data, page, ratio]);
-  const [productTab, setProductTab] = useState<ProductManagementTab>(() => productManagementTabFromSearch(window.location.search));
   const [departmentTab, setDepartmentTab] = useState<DepartmentMonitoringTab>(() => departmentMonitoringTabFromSearch(window.location.search));
   const [assessmentDeveloper, setAssessmentDeveloper] = useState<string[]>(() => assessmentDevelopersFromSearch(window.location.search));
   const abortRef = useRef<AbortController | undefined>(undefined);
@@ -633,7 +564,7 @@ export default function DashboardPage({ page, active = true, routeVersion = 0, r
         return true;
       }
       const requestedTab = new URLSearchParams(window.location.search).get('tab') || '';
-      const view = page === 'products' ? productManagementTabFromSearch(window.location.search) : page === 'department' && requestedTab !== 'assessment' ? departmentMonitoringTabFromSearch(window.location.search) : '';
+      const view = page === 'department' && requestedTab !== 'assessment' ? departmentMonitoringTabFromSearch(window.location.search) : '';
       const result = await api.dashboard(page, view ? { ...params, view } : params, controller.signal);
       if (requestId !== requestRef.current) return;
       setData(result);
@@ -663,7 +594,6 @@ export default function DashboardPage({ page, active = true, routeVersion = 0, r
   useEffect(() => {
     if (!active || seenRouteVersion.current === routeVersion) return;
     seenRouteVersion.current = routeVersion;
-    if (page === 'products') setProductTab(productManagementTabFromSearch(window.location.search));
     if (page === 'department') {
       setDepartmentTab(departmentMonitoringTabFromSearch(window.location.search));
       setAssessmentDeveloper(assessmentDevelopersFromSearch(window.location.search));
@@ -674,8 +604,7 @@ export default function DashboardPage({ page, active = true, routeVersion = 0, r
     const onPopState = () => {
       const urlPage = new URLSearchParams(window.location.search).get('page') || 'overview';
       if (active && urlPage === page) {
-        if (page === 'products') setProductTab(productManagementTabFromSearch(window.location.search));
-        if (page === 'department') {
+            if (page === 'department') {
           setDepartmentTab(departmentMonitoringTabFromSearch(window.location.search));
           setAssessmentDeveloper(assessmentDevelopersFromSearch(window.location.search));
         }
@@ -729,29 +658,19 @@ export default function DashboardPage({ page, active = true, routeVersion = 0, r
     <FilterActions onReset={resetFilters} />
   </Space> : null;
   const compactSales = page === 'sales';
+  const pageTitle = assessmentData?.title || data?.title || '数据看板';
   const sectionCards = performanceSections?.map(section => (
     <DashboardSectionCard
       key={section.key}
       initialSection={section}
       dashboardPage={page}
-      filters={{ ...appliedParams, ...((page === 'products' || page === 'department') && departmentTab !== 'assessment' ? { view: page === 'products' ? productTab : departmentTab } : {}) }}
+      filters={{ ...appliedParams, ...(page === 'department' && departmentTab !== 'assessment' ? { view: departmentTab } : {}) }}
       compactSales={compactSales}
       commissionConfig={page === 'department' ? data?.commission_config : undefined}
       onCommissionSaved={page === 'department' ? () => { void load(appliedParams, 'commission'); } : undefined}
     />
   ));
-  const visibleSections = page === 'products'
-    ? data?.sections.map((section, index) => (
-      <div
-        className="product-management-tab-pane"
-        hidden={section.key !== productTab}
-        aria-hidden={section.key !== productTab}
-        key={section.key}
-      >
-        {sectionCards?.[index]}
-      </div>
-    ))
-    : page === 'department'
+  const visibleSections = page === 'department'
       ? data?.sections.map((section, index) => {
         const visible = departmentTab === 'commission' ? section.key === 'commission' : section.key !== 'commission';
         return <div
@@ -766,7 +685,7 @@ export default function DashboardPage({ page, active = true, routeVersion = 0, r
     : sectionCards;
 
   return <div className={`dashboard-page dashboard-page-${page}`}>
-    <PageHeading title={assessmentData?.title || data?.title || '数据看板'} description={<>{pageDescriptions[page]}{lastUpdated && ` · 数据更新时间 ${lastUpdated}`}{loading && (data || assessmentData) && ' · 正在更新'}</>} density={compactSales ? 'compact' : 'default'} actions={<Button loading={loading} icon={<ReloadOutlined />} onClick={() => void manualRefresh()}>刷新</Button>} />
+    <PageHeading title={pageTitle} description={<>{pageDescriptions[page]}{lastUpdated && ` · 数据更新时间 ${lastUpdated}`}{loading && (data || assessmentData) && ' · 正在更新'}</>} density={compactSales ? 'compact' : 'default'} actions={<Button loading={loading} icon={<ReloadOutlined />} onClick={() => void manualRefresh()}>刷新</Button>} />
     {error && <Alert className="persistent-page-error" type="error" showIcon message="看板加载失败" description={error} action={<Button size="small" onClick={() => void load(filtersFromUrl(), departmentMonitoringTabFromSearch(window.location.search), true)}>重试</Button>} />}
     {loading && !data && !assessmentData ? <DashboardSkeleton /> : departmentTab === 'assessment' && assessmentData ? <DepartmentAssessmentView data={assessmentData} developerFilter={assessmentDeveloper} onApplyFilters={applyAssessmentFilters} /> : data ? <>
       {filterControls && <Card className="filter-card">{filterControls}</Card>}

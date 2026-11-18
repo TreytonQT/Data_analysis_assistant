@@ -4,9 +4,9 @@
 
 ## Windows 便携版（推荐）
 
-发布审计通知：此前 v2.0.0～v2.3.0 误包含本地业务配置，已撤为草稿；以下旧版下载步骤暂不可用于公开下载。等待使用安全模板重新构建后再发布。
+发布审计通知：此前 v2.0.0～v2.3.0 因误包含本地业务配置已撤为草稿。v2.4.0 使用安全配置模板构建，不恢复旧包。
 
-从 [GitHub Releases](https://github.com/TreytonQT/Data_analysis_assistant/releases/latest) 下载 `DataAnalysisAssistant-windows-x64-v2.3.0.zip` 和对应的 `.sha256.txt`：
+从 [GitHub Releases](https://github.com/TreytonQT/Data_analysis_assistant/releases/latest) 下载 `DataAnalysisAssistant-windows-x64-v2.4.0.zip` 和对应的 `.sha256.txt`：
 
 1. 可选：使用 `Get-FileHash` 核对压缩包 SHA-256。
 2. 将压缩包完整解压到固定目录，不要直接在压缩包中运行。
@@ -14,7 +14,7 @@
 4. 保留启动窗口；关闭窗口或按 `Ctrl+C` 即停止程序。
 
 ```powershell
-Get-FileHash .\DataAnalysisAssistant-windows-x64-v2.3.0.zip -Algorithm SHA256
+Get-FileHash .\DataAnalysisAssistant-windows-x64-v2.4.0.zip -Algorithm SHA256
 ```
 
 便携版内置前端和 Python 运行环境，不要求另行安装 Python、Node.js 或 Docker。首次运行会在程序目录旁创建 `data/` 和空数据库，默认配置位于 `configs/`。
@@ -119,6 +119,15 @@ docker compose down
 ## 从 v2.2.x 升级到 v2.3.0
 
 停止旧程序并完整备份 `data/`、`configs/`，再复制到完整解压的新版目录。旧图片映射仍可读取，无需批量改写；新上传推荐使用 `MSKU、ASIN、图片链接`。补货默认最低数量现为 0，如需原来的筛选范围，请手动选择 30。本次保留 CSV/SQLite 结构及业务数据目录约定；源码部署须重新安装锁定的前端依赖并构建，以包含新增 GSAP 与品牌资源。
+
+## 升级到 v2.4.0
+
+1. 停止旧版，备份整个 `data/` 与 `configs/`，尤其 `app.db`、Listing 原表与索引、销量历史和变体人工记录；完整解压新版后复制自己的数据，勿以空模板覆盖旧配置。
+2. 首次启动会幂等补建变体父 SKU 结构及店铺列。旧未分店记录按关系唯一性继承，有歧义时在界面确认；不会把同一旧值批量复制到多家店。回退旧版请使用升级前备份。
+3. 新上传的领星产品监控表需同时含评分和产品／价格字段；旧 Rating 和旧 Listing 历史仍兼容。Listing 快照保留期扩为 180 天，已不存在的旧数据无法自动补回。
+4. 旧产品、低毛利、新品和滞销书签自动映射到新产品经营视图。新处理流程复制／导出清单，旧人工调价／促销记录仅作为历史证据，新页面不代替 ERP 执行改价。
+
+新装只带空白业务配置和通用指标公式，需自行填写店铺、目标、提成与运输规则。独立跟卖工具的资源和 EXE 不包含在看板便携包中。
 
 ## 常见问题
 

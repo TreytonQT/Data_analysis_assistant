@@ -1,6 +1,6 @@
 import { cleanup, fireEvent, render, screen, within } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { DashboardSectionCard } from './DashboardPage';
+import { DashboardSectionCard, selectionParams } from './DashboardPage';
 import type { DashboardSection } from './api';
 
 afterEach(() => { cleanup(); vi.restoreAllMocks(); });
@@ -14,6 +14,10 @@ function renderChart(section: DashboardSection) {
 }
 
 describe('dashboard chart tooltips', () => {
+  it('keeps an explicitly cleared margin selection as all for paging and exports', () => {
+    expect(selectionParams({ margin_bands: [], min_sales: '0', developers: [] })).toEqual({ margin_bands: 'all', min_sales: '0' });
+    expect(selectionParams({})).toEqual({});
+  });
   it('groups both store sales series at the nearest category center and removes permanent values', () => {
     const { svg, hit } = renderChart({
       key: 'store-chart', title: '店铺销量', columns: [],

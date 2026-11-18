@@ -26,6 +26,44 @@ export interface ListingObservation {
   sales_response?: { status: string; match_level?: string | null; baseline_units?: number; post_units?: number; daily_change?: number | null };
 }
 export interface ListingObservationPage { rows: ListingObservation[]; page: number; page_size: number; total: number; retention_days: number }
+export interface PriceMonitorRow {
+  sku: string; asin: string; country: string; developer: string; currency: string; date: string;
+  previous_date: string; gap_days: number; old_effective_price: number; new_effective_price: number;
+  change: number; band: number; units_7: number | null; units_30: number | null; t_value: number | null;
+  observation: string; image?: DashboardImage | null;
+  units_7_source?: string | null; units_30_source?: string | null;
+}
+export interface PriceMonitorPayload {
+  rows: PriceMonitorRow[]; total: number; page: number; page_size: number;
+  buckets: Array<{ band: number; label: string; count: number; valid_count: number; mean_t: number | null; up_ratio: number | null }>;
+  metrics: { total: number; up: number; down: number; valid: number; missing: number };
+  as_of: string | null; coverage: { start: string | null; end: string | null }; developers: string[]; warnings: string[]; retention_days: number;
+}
+export type DiagnosisScene = 'clearance' | 'margin' | 'new';
+export interface OperationsSource { available: boolean; uploaded_at?: string | null; start?: string | null; end?: string | null }
+export interface OperationsSku {
+  sku: string; product_name: string; asins: string[]; developer: string; image?: DashboardImage | null;
+  stock: number | null; units_7: number | null; units_30: number | null; units_90: number | null; daily_units: number | null; coverage_days: number | null;
+  clearance_daily_units: number | null; clearance_total_stock: number | null; clearance_available_days: number | null;
+  capital_90: number | null; aged_stock_90: number | null; launch_date: string | null; launch_days: number | null;
+  worst_margin: number | null; is_new: boolean; is_low_sales_new: boolean; is_aged: boolean; is_low_margin: boolean;
+  scope_capital?: number | null; scope_stock?: number | null; matched_markets?: number; matched_countries?: string; matched_margin?: number | null;
+  matched_sales?: number | null; matched_profit?: number | null; matched_units?: number | null; small_sample_markets?: number;
+  [key: `age_stock_${number}`]: number | null;
+  [key: `age_capital_${number}`]: number | null;
+}
+export interface OperationsMarket { sku: string; asin: string; country: string; units: number | null; sales: number | null; profit: number | null; margin: number | null; ad_ratio: number | null; current_price: number | null; base_price: number | null; currency: string | null; rating_count: number | null; rating: number | null; historical_only?: boolean }
+export interface OperationsPayload {
+  rows: OperationsSku[]; total: number; page: number; page_size: number; scene: DiagnosisScene; revision: string;
+  summary: { sku_count: number; scope_stock: number | null; scope_capital: number | null; matched_profit: number | null; market_count: number | null; zero_sales: number; stock: number | null };
+  developers: string[]; sources: Record<string, OperationsSource>; excluded_clearance_rows: number; missing_launch_count: number;
+}
+export interface OperationsDetail { identity: OperationsSku; markets: OperationsMarket[]; aging: Array<{ label: string; stock: number | null; capital: number | null }>; provision: number | null; discard_90: number | null; discard_reference: Record<string, number | null>; records: Array<Record<string, unknown>>; sources: Record<string, OperationsSource>; revision: string }
+export interface OperationsSeries { rows: Array<{ date: string; units: number | null; price: number | null; event: boolean }>; events: PriceMonitorRow[]; sales_as_of: string; days: number }
+export interface TrackingRow extends PriceMonitorRow { product_name: string; is_aged: boolean; is_low_margin: boolean; is_low_sales_new: boolean; sku_units_7?: number | null; sku_units_30?: number | null; sku_t_value?: number | null; sku_sales_source?: string | null; sku_sales_snapshot?: string | null }
+export interface TrackingPayload { rows: TrackingRow[]; total: number; page: number; page_size: number; distribution_total: number;
+  buckets: Array<{ band: number; count: number; mean_t: number | null; up: number; down: number; flat: number; missing: number }>;
+  metrics: { sku_count: number; records: number; up: number; down: number; missing: number; sku_reference?: number }; as_of: string | null; coverage: { start: string | null; end: string | null }; developers: string[]; sources: Record<string, OperationsSource>; warnings: string[] }
 export interface ConfigData { name: string; title: string; description: string; columns: string[]; rows: Record<string, unknown>[]; updated_at?: string | null }
 export interface DashboardMetric { name: string; value: unknown; format?: string; unit?: string; precision?: number }
 export interface DashboardColumn {
@@ -296,7 +334,51 @@ export interface ReplenishmentSwitchResult {
   close_reason: string;
   updated_at: string;
 }
-export interface AppRevisions { dashboard: string; promotions: string; reports: string; configs: string; batch_monitor: string }
+export interface AppRevisions { dashboard: string; promotions: string; reports: string; configs: string; batch_monitor: string; variants: string }
+export type VariantStatus = 'all' | 'filled' | 'empty' | 'pending';
+export type VariantFilterStatus = VariantStatus | 'unassembled';
+export interface VariantChild {
+  sku: string;
+  asin: string;
+  developer: string;
+  product_name: string;
+  daily_sales: number | null;
+  image: DashboardImage | null;
+  sites: Array<{ country: string; parent_asin: string; attributes: string }>;
+}
+export interface VariantParentSkuReference {
+  store_code: string;
+  parent_sku: string;
+  matched_child_asins: string[];
+}
+export interface VariantGroup {
+  store_code: string;
+  store_inferred: boolean;
+  other_parent_skus: VariantParentSkuReference[];
+  legacy_assignment: boolean;
+  key: string;
+  parent_sku: string;
+  product_name: string;
+  relation_kind: 'assembled' | 'unassembled';
+  child_asin_count: number;
+  status: Exclude<VariantStatus, 'all'>;
+  candidate_skus: string[];
+  parents: Array<{ asin: string; countries: string[] }>;
+  children: VariantChild[];
+  image: DashboardImage | null;
+  representative_sku: string | null;
+}
+export interface VariantPage {
+  developers: string[];
+  stores: string[];
+  date: string | null;
+  revision: string;
+  warning: string | null;
+  rows: VariantGroup[];
+  total: number;
+  page: number;
+  page_size: number;
+}
 
 export interface BatchMonitorMetrics {
   incomplete_batches: number;
@@ -617,6 +699,8 @@ function normalizeDashboardPayload(payload: DashboardPayload): DashboardPayload 
   };
 }
 export const api = {
+  variants: (params: { search: string; status: VariantFilterStatus; developers: string; stores?: string; page: number; page_size: number }, signal?: AbortSignal) => request<VariantPage>('/api/variants' + queryString(params), { signal }),
+  saveVariantParentSku: (key: string, parentSku: string, revision: string) => request<{ saved: boolean; parent_sku: string }>('/api/variants/' + encodeURIComponent(key) + '/parent-sku', { method: 'PUT', body: JSON.stringify({ parent_sku: parentSku, revision }) }),
   systemStatus: () => request<SystemStatus>('/api/system/status', { headers: systemControlHeaders }),
   restartSystem: () => request<SystemActionResult>('/api/system/restart', { method: 'POST', headers: systemControlHeaders }),
   shutdownSystem: () => request<SystemActionResult>('/api/system/shutdown', { method: 'POST', headers: systemControlHeaders }),
@@ -723,6 +807,17 @@ export const api = {
   configs: () => request<{ configs: ConfigData[] }>('/api/configs'),
   saveConfig: (name: string, rows: Record<string, unknown>[]) => request<{ ok: boolean; rows: Record<string, unknown>[]; updated_at?: string | null }>(`/api/config/${name}`, { method: 'PUT', body: JSON.stringify(rows) }),
   pricingObservations: (params?: { day?: string; country?: string; kind?: string; status?: string; search?: string; page?: number; page_size?: number }, signal?: AbortSignal) => request<ListingObservationPage>('/api/pricing/observations' + queryString(params as Record<string, string | number | undefined>), { signal }),
+  priceMonitor: (params: Record<string, string | number | undefined>, signal?: AbortSignal) => request<PriceMonitorPayload>('/api/pricing/monitor' + queryString(params), { signal }),
+  operations: (params: Record<string, string | number | undefined>, signal?: AbortSignal) => request<OperationsPayload>('/api/product-operations/workbench' + queryString(params), { signal }),
+  operationsDetail: (sku: string, signal?: AbortSignal) => request<OperationsDetail>('/api/product-operations/skus/' + encodeURIComponent(sku), { signal }),
+  operationsSeries: (sku: string, params: { asin: string; country: string; days: number }, signal?: AbortSignal) => request<OperationsSeries>('/api/product-operations/skus/' + encodeURIComponent(sku) + '/series' + queryString(params), { signal }),
+  tracking: (params: Record<string, string | number | undefined>, signal?: AbortSignal) => request<TrackingPayload>('/api/product-operations/prices' + queryString(params), { signal }),
+  exportOperations: async (filters: Record<string, string | number | undefined>, selected_skus?: string[]) => {
+    const response = await fetch('/api/product-operations/export.csv', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ filters, selected_skus }) });
+    if (!response.ok) throw new Error(apiErrorMessage(await response.json().catch(() => null), '导出失败'));
+    return response.blob();
+  },
+  priceMonitorHistory: (row: Pick<PriceMonitorRow, 'sku' | 'asin' | 'country'>, signal?: AbortSignal) => request<{ rows: PriceMonitorRow[] }>('/api/pricing/monitor/history' + queryString(row), { signal }),
   pricingTimeline: (sku: string, signal?: AbortSignal) => request<{ sku: string; rows: ListingObservation[] }>('/api/pricing/observations/' + encodeURIComponent(sku) + '/timeline', { signal }),
   pricingHistory: (sku = "", signal?: AbortSignal) => request<{ rows: PricingHistoryRow[] }>('/api/pricing/history' + queryString({ sku }), { signal }),
   pricingBatches: (signal?: AbortSignal) => request<{ rows: PricingBatch[] }>('/api/pricing/adjustment-batches', { signal }),

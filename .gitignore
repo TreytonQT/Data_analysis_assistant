@@ -36,5 +36,8 @@ Thumbs.db
 
 # Frontend build artifacts
 frontend/node_modules/
+node_modules/
 frontend/dist/
+follow_sell/web/
+frontend/src/followSell/assets/mabang-listing1-reference.png
 *.tsbuildinfo

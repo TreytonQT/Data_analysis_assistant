@@ -70,7 +70,7 @@
 .workspace-shell .ant-input,
 .workspace-shell .ant-input-affix-wrapper,
 .workspace-shell .confirm-filter-trigger { border-color: var(--app-color-control-border); }
-.workspace-shell .metric-grid:not(.new-product-metrics) .metric-card { background: var(--app-color-surface); }
+.workspace-shell .metric-grid .metric-card { background: var(--app-color-surface); }
 .workspace-shell .metric-card-plain .ant-statistic-content { font-size: 26px; line-height: 1.3; }
 .workspace-shell .metric-card-plain .ant-statistic-title { margin-bottom: 6px; font-size: 13px; }
 
@@ -127,34 +127,6 @@
 .overview-ranking-card .mini-chart-row b { color: var(--app-color-text); font-size: 13px; font-weight: 500; }
 
 /* A single quiet metric band and two independent SKU copy lists. */
-.workspace-shell .new-product-metrics { grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 0; padding: 20px 8px; background: var(--app-color-surface); border: 1px solid var(--app-color-border); border-radius: var(--app-radius-card); }
-.workspace-shell .new-product-metrics .metric-card { border: 0; border-radius: 0; background: transparent; }
-.workspace-shell .new-product-metrics .metric-card + .metric-card { border-left: 1px solid var(--app-color-border); }
-.workspace-shell .new-product-metrics .ant-card-body { padding: 0 20px; }
-.workspace-shell .new-product-metrics .ant-statistic-content { font-size: 28px; font-weight: 500; }
-.workspace-shell .new-product-metrics .metric-card:first-child .ant-statistic-content { font-size: 34px; font-weight: 600; }
-.workspace-shell .new-product-status-counts { padding: 0; margin: 0 0 22px; }
-.workspace-shell .new-product-copy-scope { display: block; margin-bottom: 12px; font-size: 12px; }
-.workspace-shell .new-product-copy-grid { gap: 28px; margin-bottom: 24px; }
-.workspace-shell .new-product-copy-card { border: 0; background: transparent; }
-.workspace-shell .new-product-copy-card + .new-product-copy-card { border-left: 1px solid var(--app-color-border); border-radius: 0; padding-left: 28px; }
-.workspace-shell .new-product-copy-card .ant-card-head { padding: 0; border: 0; }
-.workspace-shell .new-product-copy-card > .ant-card-body { padding: 0; }
-.workspace-shell .new-product-copy-card .ant-collapse { border: 0; }
-.workspace-shell .new-product-copy-card .ant-collapse-header { padding-inline: 0; color: var(--app-color-secondary); }
-.workspace-shell .new-product-copy-card .ant-collapse-content { border-top: 0; background: transparent; }
-.workspace-shell .new-product-copy-card .ant-collapse-content-box { padding: 0 0 12px; }
-.workspace-shell .new-product-copy-card textarea { font-family: ui-monospace, Consolas, monospace; }
-.workspace-shell .new-product-table-card { background: transparent; border: 0; }
-.workspace-shell .new-product-table-card .ant-card-head { padding-inline: 0; border: 0; }
-.workspace-shell .new-product-table-card > .ant-card-body { padding: 12px 0 0; }
-.workspace-shell .new-product-table-card .ant-table { background: transparent; }
-.workspace-shell .new-product-table-card .ant-table-thead > tr > th { background: transparent; }
-.workspace-shell .new-product-table-card .ant-table-thead > tr > th:is(.ant-table-cell-fix-left, .ant-table-cell-fix-right),
-.workspace-shell .new-product-table-card .ant-table-tbody > tr > td:is(.ant-table-cell-fix-left, .ant-table-cell-fix-right) { background: var(--app-color-page); }
-.workspace-shell .new-product-table-card .ant-table-tbody > tr:hover > td:is(.ant-table-cell-fix-left, .ant-table-cell-fix-right) { background: var(--app-color-hover); }
-.workspace-shell .new-product-table-card .ant-table-tbody > tr > td { padding-block: 10px; }
-.workspace-shell .new-product-extra { background: var(--app-color-hover); color: var(--app-color-text); }
 .confirm-filter-popover .ant-popover-inner { border: 1px solid var(--app-color-border); }
 .confirm-filter-popover .confirm-filter-panel { transform-origin: top left; }
 

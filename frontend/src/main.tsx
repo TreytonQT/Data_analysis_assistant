@@ -30,10 +30,11 @@ import {
 const UploadCenter = lazy(() => import('./UploadCenter'));
 const ConfigCenter = lazy(() => import('./ConfigCenter'));
 const DashboardPage = lazy(() => import('./DashboardPage'));
-const NewProductMonitorPage = lazy(() => import('./NewProductMonitorPage'));
+const ProductOperationsPage = lazy(() => import('./ProductOperationsPage'));
+const VariantManagementPage = lazy(() => import('./VariantManagementPage'));
+const PriceTrackingPage = lazy(() => import('./PriceTrackingPage'));
 const ReplenishmentPage = lazy(() => import('./ReplenishmentPage'));
 const BatchMonitorPage = lazy(() => import('./BatchMonitorPage'));
-const SlowMovingPage = lazy(() => import('./SlowMovingPage'));
 const TaskBoard = lazy(() => import('./TaskBoard'));
 
 function FeedbackBridge() {
@@ -44,22 +45,26 @@ function FeedbackBridge() {
 
 const { Header, Content, Sider } = Layout;
 type RevisionDomain = keyof AppRevisions;
-const pageKeys: PageKey[] = ['overview', 'sales', 'slow-moving', 'products', 'new-products', 'department', 'replenishment', 'batch-monitor', 'uploads', 'config'];
+const pageKeys: PageKey[] = ['overview', 'sales', 'product-operations', 'variants', 'price-monitor', 'department', 'replenishment', 'batch-monitor', 'uploads', 'config'];
 const routeChangeEvent = 'sales-dashboard-route-change';
 const quickTabsStorageKey = 'sales-dashboard-quick-tabs-v1';
 const iconByKey: Record<string, ReactNode> = {
   overview: <DashboardOutlined />, sales: <FundOutlined />, 'slow-moving': <InboxOutlined />, products: <UnorderedListOutlined />,
+  variants: <DeploymentUnitOutlined />,
   department: <FundOutlined />, replenishment: <FileAddOutlined />, 'batch-monitor': <DeploymentUnitOutlined />, uploads: <FileAddOutlined />, config: <SettingOutlined />,
 };
 
 const pageRevisionDomains: Record<PageKey, RevisionDomain[]> = {
+  variants: ['reports', 'dashboard', 'variants'],
+  'price-monitor': ['reports', 'dashboard', 'promotions'],
+  'product-operations': ['reports', 'dashboard', 'batch_monitor', 'promotions'],
   overview: ['dashboard'], sales: ['dashboard'], products: ['dashboard', 'batch_monitor', 'promotions'], 'new-products': ['dashboard', 'batch_monitor'], department: ['dashboard'], replenishment: ['dashboard', 'promotions'],
   'slow-moving': ['dashboard', 'promotions'], 'batch-monitor': ['batch_monitor', 'dashboard'], uploads: ['reports'], config: ['configs'],
 };
 
 function menuItems(nodes: NavigationNode[]): NonNullable<MenuProps['items']> {
   return nodes.map(node => node.kind === 'group'
-    ? { key: node.key, icon: iconByKey[node.key], label: node.label, children: menuItems(node.children) }
+    ? { key: node.key, className: node.key === 'products' ? 'product-operations-navigation' : undefined, icon: iconByKey[node.key], label: node.label, children: menuItems(node.children) }
     : { key: node.key, className: node.page === 'department' ? 'department-navigation-item' : undefined, icon: node.parentKeys.length ? undefined : iconByKey[node.page], label: node.label });
 }
 
@@ -67,7 +72,7 @@ const sidebarItems = menuItems(navigationTree);
 
 function quickTabForRoute(key: RouteKey, search: string): QuickTabState {
   const route = navigationLeafByKey.get(key)!;
-  return { key, label: route.label, search, closable: route.closable };
+  return { key: route.key, label: route.label, search, closable: route.closable };
 }
 
 function readQuickTabs(initialKey: RouteKey, initialSearch: string): QuickTabState[] {
@@ -79,7 +84,7 @@ function readQuickTabs(initialKey: RouteKey, initialSearch: string): QuickTabSta
       stored.forEach(item => {
         if (!item || typeof item !== 'object') return;
         const key = (item as { key?: unknown }).key;
-        if (!validRouteKey(key) || key === 'overview' || result.some(tab => tab.key === key)) return;
+        if (!validRouteKey(key) || key === 'overview' || result.some(tab => tab.key === navigationLeafByKey.get(key)?.key)) return;
         const search = typeof (item as { search?: unknown }).search === 'string'
           ? searchForRoute(key, (item as { search: string }).search)
           : searchForRoute(key);
@@ -112,7 +117,7 @@ function App() {
   const initialSearch = useRef(searchForRoute(initialRoute.key, window.location.search)).current;
   const [activeRouteKey, setActiveRouteKey] = useState<RouteKey>(initialRoute.key);
   const [mountedPages, setMountedPages] = useState<Set<PageKey>>(() => new Set([initialRoute.page]));
-  const [domainRefreshVersions, setDomainRefreshVersions] = useState<Record<RevisionDomain, number>>({ dashboard: 0, promotions: 0, reports: 0, configs: 0, batch_monitor: 0 });
+  const [domainRefreshVersions, setDomainRefreshVersions] = useState<Record<RevisionDomain, number>>({ dashboard: 0, promotions: 0, reports: 0, configs: 0, batch_monitor: 0, variants: 0 });
   const [pageRouteVersions, setPageRouteVersions] = useState<Record<PageKey, number>>(() => Object.fromEntries(pageKeys.map(key => [key, 0])) as Record<PageKey, number>);
   const [quickTabs, setQuickTabs] = useState<QuickTabState[]>(() => readQuickTabs(initialRoute.key, initialSearch));
   const [openKeys, setOpenKeys] = useState<string[]>(() => ancestorKeysForRoute(initialRoute.key));
@@ -236,16 +241,16 @@ function App() {
     const active = pageForRoute(activeRouteKey) === key;
     const dashboardRefreshVersion = domainRefreshVersions.dashboard;
     const productRefreshVersion = dashboardRefreshVersion + domainRefreshVersions.batch_monitor + domainRefreshVersions.promotions;
-    const content = key === 'new-products'
-      ? <NewProductMonitorPage active={active} routeVersion={pageRouteVersions[key]} refreshVersion={dashboardRefreshVersion + domainRefreshVersions.batch_monitor} />
+    const content = key === 'price-monitor'
+      ? <PriceTrackingPage active={active} routeVersion={pageRouteVersions[key]} refreshVersion={dashboardRefreshVersion + domainRefreshVersions.reports + domainRefreshVersions.promotions + domainRefreshVersions.batch_monitor} />
+      : key === 'variants'
+      ? <VariantManagementPage active={active} routeVersion={pageRouteVersions[key]} refreshVersion={dashboardRefreshVersion + domainRefreshVersions.reports + domainRefreshVersions.variants} />
+      : key === 'product-operations'
+      ? <ProductOperationsPage active={active} routeVersion={pageRouteVersions[key]} refreshVersion={productRefreshVersion + domainRefreshVersions.reports} />
       : key === 'uploads'
       ? <UploadCenter active={active} routeVersion={pageRouteVersions[key]} refreshVersion={domainRefreshVersions.reports} />
       : key === 'config'
         ? <ConfigCenter active={active} routeVersion={pageRouteVersions[key]} refreshVersion={domainRefreshVersions.configs} />
-        : key === 'slow-moving'
-          ? <SlowMovingPage active={active} routeVersion={pageRouteVersions[key]} dashboardRefreshVersion={dashboardRefreshVersion} promotionsRefreshVersion={domainRefreshVersions.promotions} />
-          : key === 'products'
-            ? <DashboardPage page={key} active={active} routeVersion={pageRouteVersions[key]} refreshVersion={productRefreshVersion} />
           : key === 'replenishment'
             ? <ReplenishmentPage active={active} routeVersion={pageRouteVersions[key]} refreshVersion={dashboardRefreshVersion + domainRefreshVersions.promotions} />
             : key === 'batch-monitor'

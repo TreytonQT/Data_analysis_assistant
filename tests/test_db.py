@@ -18,6 +18,29 @@ class DatabaseMigrationTests(unittest.TestCase):
         db.DB_PATH = self.original_db
         self.temp.cleanup()
 
+    def test_variant_store_column_is_added_idempotently_without_assigning_legacy_rows(self):
+        conn = sqlite3.connect(db.DB_PATH)
+        conn.executescript("""
+            CREATE TABLE variant_parent_skus (
+                group_key TEXT PRIMARY KEY, parent_sku TEXT NOT NULL DEFAULT '',
+                parent_asins TEXT NOT NULL, child_asins TEXT NOT NULL,
+                candidate_skus TEXT NOT NULL DEFAULT '[]',
+                needs_confirmation INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL
+            );
+            INSERT INTO variant_parent_skus VALUES ('old', 'OLD-PARENT', '["P"]', '["X","Y"]', '[]', 0, '2026-11-01');
+            CREATE TABLE untouched_fixture (id INTEGER PRIMARY KEY, value TEXT);
+            INSERT INTO untouched_fixture VALUES (1, 'keep');
+        """)
+        conn.close()
+        db.initialize_database()
+        db.initialize_database()
+        with db.connect() as migrated:
+            row = dict(migrated.execute("SELECT * FROM variant_parent_skus WHERE group_key='old'").fetchone())
+            self.assertEqual(row["parent_sku"], "OLD-PARENT")
+            self.assertEqual(row["child_asins"], '["X","Y"]')
+            self.assertIsNone(row["store_code"])
+            self.assertEqual(migrated.execute("SELECT value FROM untouched_fixture").fetchone()[0], "keep")
+
     def test_legacy_promotion_discount_constraint_is_widened_idempotently(self):
         conn = sqlite3.connect(db.DB_PATH)
         conn.executescript(

@@ -259,7 +259,7 @@ def reports():
             for key, (title, _) in SOURCE_DEFINITIONS.items()
         }
         | {"sales_history_rolling": {"title": "往月销量原始表", "records": frame_records(history_records)}}
-        | {"listing_prices": {"title": "Listing价格", "records": reports_listing_index()["records"]}},
+        | {"listing_prices": {"title": "领星产品监控表", "records": reports_listing_index()["records"]}},
     }
 
 

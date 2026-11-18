@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="320" height="26" viewBox="0 0 320 26" role="img" aria-label="马帮上架表1.xlsx 文件名示例">
+  <rect width="320" height="26" rx="3" fill="#e8f1ff"/>
+  <rect x="8" y="5" width="14" height="16" rx="2" fill="#fff" stroke="#48a868"/>
+  <path d="M12 9h6m-6 4h6m-6 4h6" stroke="#48a868"/>
+  <text x="30" y="18" font-size="14" font-family="Microsoft YaHei, sans-serif" fill="#172033">马帮上架表1.xlsx</text>
+</svg>

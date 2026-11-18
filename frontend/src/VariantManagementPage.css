@@ -1,0 +1,19 @@
+.variant-page { display: grid; gap: var(--app-space-card); min-width: 0; }
+.variant-page > .ant-card, .variant-page .ant-table-wrapper { min-width: 0; }
+.variant-toolbar { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; margin-bottom: 16px; }
+.variant-search { width: 360px; max-width: 100%; }
+.variant-parents, .variant-sites, .variant-editor { display: grid; gap: 8px; }
+.variant-parents > div, .variant-sites > div { display: flex; align-items: baseline; gap: 12px; }
+.variant-country { flex: 0 0 24px; color: var(--app-color-secondary); }
+.variant-attributes { white-space: normal; overflow-wrap: anywhere; }
+.variant-page .ant-table-cell { font-variant-numeric: tabular-nums; }
+.variant-editor .ant-typography { margin-bottom: 0; }
+.variant-editor { width: 300px; max-width: calc(100vw - 56px); }
+.variant-editor-actions { display: flex; justify-content: flex-end; gap: var(--app-space-control); }
+.variant-parent-sku-trigger { display: inline-flex; align-items: center; max-width: 100%; gap: var(--app-space-control); }
+.variant-parent-sku-value { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.variant-parent-cell, .variant-other-parent-skus { display: grid; gap: var(--app-space-control); min-width: 0; }
+.variant-parent-reference { display: block; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.variant-other-parent-skus .ant-btn { height: auto; min-height: 24px; white-space: normal; overflow-wrap: anywhere; }
+.variant-other-parent-skus { max-height: 240px; overflow-y: auto; }

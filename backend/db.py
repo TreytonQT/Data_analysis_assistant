@@ -20,6 +20,16 @@ def initialize_database() -> None:
     with connect() as conn:
         conn.executescript(
             """
+            CREATE TABLE IF NOT EXISTS variant_parent_skus (
+                group_key TEXT PRIMARY KEY,
+                parent_sku TEXT NOT NULL DEFAULT '',
+                parent_asins TEXT NOT NULL,
+                child_asins TEXT NOT NULL,
+                candidate_skus TEXT NOT NULL DEFAULT '[]',
+                needs_confirmation INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL,
+                store_code TEXT
+            );
             CREATE TABLE IF NOT EXISTS tasks (
                 id TEXT PRIMARY KEY,
                 title TEXT NOT NULL,
@@ -134,6 +144,9 @@ def initialize_database() -> None:
                 ON sku_launch_prices(source_file_hash);
             """
         )
+        variant_columns = {row["name"] for row in conn.execute("PRAGMA table_info(variant_parent_skus)")}
+        if "store_code" not in variant_columns:
+            conn.execute("ALTER TABLE variant_parent_skus ADD COLUMN store_code TEXT")
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
         if "sort_order" not in columns:
             conn.execute("ALTER TABLE tasks ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0")

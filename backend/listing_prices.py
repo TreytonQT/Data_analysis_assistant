@@ -13,16 +13,21 @@ import backend.db as db
 from backend.db import DB_PATH, connect
 from dashboard.parquet_cache import revision_digest
 from dashboard.derived_table_cache import load_or_build_frame_bundle
+from dashboard.report_store import ALLOWED_SOURCE_SUFFIXES, get_latest_source_path, latest_source_index_path, persist_latest_source
 
 router = APIRouter(prefix="/api/pricing", tags=["listing-prices"])
 LISTING_REQUIRED = ["MSKU", "ASIN", "国家", "币种", "售价(总价)", "运费", "积分", "价格", "优惠价"]
 LISTING_NUMERIC = ["售价(总价)", "运费", "积分", "价格", "优惠价"]
+LISTING_VARIANT_COLUMNS = ["父ASIN", "变体属性"]
+LISTING_RATING_COLUMNS = ["Rating总数", "评分"]
 COUNTRY_MAP = {"DE": "DE", "德国": "DE", "FR": "FR", "法国": "FR", "ES": "ES", "西班牙": "ES", "IT": "IT", "意大利": "IT"}
 DATE_PATTERN = re.compile(r"Listing(?P<date>20\d{6})", re.IGNORECASE)
-INDEX_COLUMNS = ["日期","原始文件名","保存文件名","标准化文件名","文件哈希","上传时间","行数","有效售价数","促销数","无可售价数","异常数","异常摘要"]
-NORMALIZED_COLUMNS = ["日期","MSKU","ASIN","国家","币种","MSKU原值","ASIN原值","国家原值","售价(总价)","运费","积分","价格","优惠价","当前实际总价","Listing原价","Listing优惠价","可售","促销中","异常类型"]
+INDEX_COLUMNS = ["日期","原始文件名","保存文件名","标准化文件名","文件哈希","上传时间","行数","有效售价数","促销数","无可售价数","异常数","异常摘要","变体字段齐全"]
+NORMALIZED_COLUMNS = ["日期","MSKU","ASIN","国家","币种","MSKU原值","ASIN原值","国家原值","售价(总价)","运费","积分","价格","优惠价","当前实际总价","Listing原价","Listing优惠价","可售","促销中","异常类型",*LISTING_VARIANT_COLUMNS,*LISTING_RATING_COLUMNS]
 LISTING_EVENT_COLUMNS = ["date", "previous_date", "gap_days", "observed_as", "sku", "asin", "country", "type", "old_base_price", "new_base_price", "old_effective_price", "new_effective_price", "old_promo", "new_promo", "anomaly"]
 LISTING_EVENT_CODE_VERSION = "2"
+LISTING_RETENTION_DAYS = 180
+LISTING_SNAPSHOT_LOCK = RLock()
 
 def listing_root(data_dir: Path = DATA_DIR) -> Path:
     path = data_dir / "listing_prices"; path.mkdir(parents=True, exist_ok=True); return path
@@ -73,9 +78,18 @@ def _matching_sheet(data: bytes) -> tuple[str, pd.DataFrame]:
     if len(matches) != 1: raise ValueError("Listing 工作簿必须恰好有一个包含完整字段的工作表")
     return matches[0]
 
-def normalize_listing_workbook(data: bytes, listing_date: str | None = None) -> tuple[str, pd.DataFrame, dict[str, Any]]:
+def normalize_listing_workbook(data: bytes, listing_date: str | None = None, *, require_rating: bool = False) -> tuple[str, pd.DataFrame, dict[str, Any]]:
     sheet, frame = _matching_sheet(data)
-    frame = frame[LISTING_REQUIRED].copy()
+    variant_columns_available = set(LISTING_VARIANT_COLUMNS).issubset(frame.columns)
+    rating_columns_available = set(LISTING_RATING_COLUMNS).issubset(frame.columns)
+    if require_rating and not rating_columns_available:
+        raise ValueError("领星产品监控表缺少评分字段：Rating总数、评分；请导出包含评分数据的完整表")
+    for column in [*LISTING_VARIANT_COLUMNS, *LISTING_RATING_COLUMNS]:
+        if column not in frame.columns:
+            frame[column] = pd.NA
+    frame = frame[[*LISTING_REQUIRED, *LISTING_VARIANT_COLUMNS, *LISTING_RATING_COLUMNS]].copy()
+    frame["父ASIN"] = frame["父ASIN"].map(_normal_text)
+    frame["变体属性"] = frame["变体属性"].map(_display_text)
     frame["MSKU原值"] = frame["MSKU"].map(lambda value: _display_text(value))
     frame["ASIN原值"] = frame["ASIN"].map(lambda value: _display_text(value))
     frame["国家原值"] = frame["国家"].map(lambda value: _display_text(value))
@@ -85,12 +99,18 @@ def normalize_listing_workbook(data: bytes, listing_date: str | None = None) -> 
     if frame[["MSKU","ASIN","国家"]].eq("").any(axis=None): raise ValueError("Listing 的 MSKU、ASIN、国家不能为空")
     unknown = sorted(set(frame["国家"]) - set(COUNTRY_MAP.values()))
     if unknown: raise ValueError("Listing 国家必须是 DE/FR/ES/IT：" + "、".join(unknown[:10]))
-    for column in LISTING_NUMERIC:
+    for column in [*LISTING_NUMERIC, *LISTING_RATING_COLUMNS]:
         raw = frame[column]; converted = pd.to_numeric(raw, errors="coerce")
         invalid = raw.notna() & raw.astype(str).str.strip().ne("") & converted.isna()
         if invalid.any(): raise ValueError(f"Listing 第 {int(invalid.to_numpy().nonzero()[0][0]) + 2} 行{column}不是有效数值")
         frame[column] = converted.astype(float)
         if (frame[column].dropna() < 0).any(): raise ValueError(f"Listing {column}不能为负数")
+        if frame[column].dropna().isin([float("inf"), float("-inf")]).any():
+            raise ValueError(f"Listing {column}必须是有限数字")
+    if frame["Rating总数"].dropna().mod(1).ne(0).any():
+        raise ValueError("Rating总数必须是非负整数")
+    if frame["评分"].dropna().gt(5).any():
+        raise ValueError("评分必须在0到5之间")
     if frame.duplicated(["MSKU","ASIN","国家"], keep=False).any(): raise ValueError("Listing 存在重复的 MSKU+ASIN+国家")
     total = frame["售价(总价)"]; freight = frame["运费"].fillna(0); promo = frame["优惠价"]; base = frame["价格"]
     mismatch = total.notna() & (total - promo.fillna(0) - freight).abs().gt(0.01)
@@ -101,6 +121,8 @@ def normalize_listing_workbook(data: bytes, listing_date: str | None = None) -> 
     frame["可售"] = frame["当前实际总价"].notna(); frame["促销中"] = frame["Listing优惠价"].notna() & frame["Listing原价"].notna() & frame["Listing优惠价"].lt(frame["Listing原价"])
     frame["日期"] = listing_date or date.today().isoformat(); frame["异常类型"] = anomalies.replace("", pd.NA)
     normalized = frame[NORMALIZED_COLUMNS].copy()
+    normalized.attrs["variant_columns_available"] = variant_columns_available
+    normalized.attrs["rating_columns_available"] = rating_columns_available
     stats = {"sheet": sheet, "rows": len(normalized), "effective_price_count": int(normalized["当前实际总价"].notna().sum()), "promotion_count": int(normalized["促销中"].sum()), "unavailable_count": int(normalized["当前实际总价"].isna().sum()), "anomaly_count": int(normalized["异常类型"].notna().sum()), "anomaly_examples": normalized.loc[normalized["异常类型"].notna(), ["MSKU","ASIN","国家","异常类型"]].head(10).to_dict("records")}
     return sheet, normalized, stats
 
@@ -115,17 +137,44 @@ def load_listing_index(data_dir: Path = DATA_DIR) -> pd.DataFrame:
 def _paths_for_date(day: str, data_dir: Path = DATA_DIR) -> tuple[Path, Path]:
     root = listing_root(data_dir); return root / f"{day}.xlsx", root / f"{day}.csv"
 
-def persist_listing_snapshot(name: str, data: bytes, data_dir: Path = DATA_DIR) -> dict[str, Any]:
+def _persist_listing_rating(name: str, normalized: pd.DataFrame, data_dir: Path) -> None:
+    # Keep legacy rating readers/revisions on one derived CSV from the latest Listing.
+    rating = normalized[["ASIN", "国家", *LISTING_RATING_COLUMNS]].copy()
+    rating["国家"] = rating["国家"].replace({"DE": "德国", "FR": "法国", "ES": "西班牙", "IT": "意大利"})
+    content = rating.to_csv(index=False).encode("utf-8-sig")
+    source = data_dir / "sources" / "rating.csv"
+    if source.is_file() and source.read_bytes() == content and get_latest_source_path("rating", data_dir) == source:
+        return
+    upload = io.BytesIO(content)
+    upload.name = f"{Path(name).stem}.csv"
+    persist_latest_source(upload, "rating", "领星产品监控表（Rating）", data_dir)
+
+
+def persist_listing_snapshot(name: str, data: bytes, data_dir: Path = DATA_DIR, *, require_rating: bool = False) -> dict[str, Any]:
+    with LISTING_SNAPSHOT_LOCK:
+        return _persist_listing_snapshot(name, data, data_dir, require_rating=require_rating)
+
+
+def _persist_listing_snapshot(name: str, data: bytes, data_dir: Path, *, require_rating: bool = False) -> dict[str, Any]:
     day = listing_date_from_name(name); digest = hashlib.sha256(data).hexdigest()
-    _, normalized, stats = normalize_listing_workbook(data, day)
+    _, normalized, stats = normalize_listing_workbook(data, day, require_rating=require_rating)
     index = load_listing_index(data_dir); existing = index[index["日期"].eq(day)]
-    if not existing.empty and str(existing.iloc[-1]["文件哈希"]) == digest:
-        result = existing.iloc[-1].to_dict(); result.update({"date": day, "idempotent": True, "replaced": False, "warnings": [f"检测到 {result.get("异常数", "0")} 条数据异常"] if int(result.get("异常数", 0) or 0) else []}); return result
+    sync_rating = normalized.attrs["rating_columns_available"] and (index.empty or day >= str(index["日期"].max()))
     raw_path, csv_path = _paths_for_date(day, data_dir); index_path = listing_index_path(data_dir)
+    unchanged = not existing.empty and str(existing.iloc[-1]["文件哈希"]) == digest
+    normalized_current = csv_path.is_file() and set(NORMALIZED_COLUMNS).issubset(pd.read_csv(csv_path, encoding="utf-8-sig", nrows=0).columns)
+    if unchanged and normalized_current:
+        if sync_rating:
+            _persist_listing_rating(name, normalized, data_dir)
+        result = existing.iloc[-1].to_dict(); result.update({"date": day, "idempotent": True, "replaced": False, "warnings": [f"检测到 {result.get("异常数", "0")} 条数据异常"] if int(result.get("异常数", 0) or 0) else []}); return result
     record = {"日期": day, "原始文件名": name, "保存文件名": raw_path.name, "标准化文件名": csv_path.name, "文件哈希": digest, "上传时间": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "行数": str(stats["rows"]), "有效售价数": str(stats["effective_price_count"]), "促销数": str(stats["promotion_count"]), "无可售价数": str(stats["unavailable_count"]), "异常数": str(stats["anomaly_count"]), "异常摘要": json.dumps(stats["anomaly_examples"], ensure_ascii=False)}
+    record["变体字段齐全"] = "是" if normalized.attrs["variant_columns_available"] else "否"
     next_index = pd.concat([index[~index["日期"].eq(day)], pd.DataFrame([record])], ignore_index=True)[INDEX_COLUMNS].sort_values("日期").reset_index(drop=True)
-    previous = {path: path.read_bytes() if path.exists() else None for path in (raw_path, csv_path, index_path)}
+    rating_paths = [data_dir / "sources" / f"rating{suffix}" for suffix in ALLOWED_SOURCE_SUFFIXES] + [latest_source_index_path("rating", data_dir)] if sync_rating else []
+    previous = {path: path.read_bytes() if path.exists() else None for path in (raw_path, csv_path, index_path, *rating_paths)}
     try:
+        if sync_rating:
+            _persist_listing_rating(name, normalized, data_dir)
         _atomic_bytes(raw_path, data); _atomic_frame(csv_path, normalized); _atomic_frame(index_path, next_index)
     except Exception:
         for path, old in previous.items():
@@ -133,7 +182,7 @@ def persist_listing_snapshot(name: str, data: bytes, data_dir: Path = DATA_DIR) 
                 if path.exists(): path.unlink()
             else: _atomic_bytes(path, old)
         raise
-    cutoff = pd.Timestamp(next_index["日期"].max()).date() - timedelta(days=30); retained = []; cleanup_warning = None
+    cutoff = pd.Timestamp(next_index["日期"].max()).date() - timedelta(days=LISTING_RETENTION_DAYS - 1); retained = []; cleanup_warning = None
     for _, row in next_index.iterrows():
         if pd.Timestamp(row["日期"]).date() >= cutoff: retained.append(row.to_dict()); continue
         old_raw, old_csv = _paths_for_date(str(row["日期"]), data_dir)
@@ -144,7 +193,7 @@ def persist_listing_snapshot(name: str, data: bytes, data_dir: Path = DATA_DIR) 
             cleanup_warning = f"过期快照清理失败：{exc}"; retained.append(row.to_dict())
     _atomic_frame(index_path, pd.DataFrame(retained, columns=INDEX_COLUMNS))
     warning_text = [f"检测到 {stats["anomaly_count"]} 条数据异常" if stats["anomaly_count"] else ""]
-    result = record | {"date": day, "idempotent": False, "replaced": not existing.empty, "warnings": [item for item in warning_text if item]}
+    result = record | {"date": day, "idempotent": unchanged, "replaced": not existing.empty and not unchanged, "warnings": [item for item in warning_text if item]}
     if cleanup_warning: result["cleanup_warning"] = cleanup_warning
     return result
 
@@ -152,6 +201,10 @@ def load_snapshot(day: str, data_dir: Path = DATA_DIR) -> pd.DataFrame:
     _, path = _paths_for_date(day, data_dir)
     if not path.exists(): return pd.DataFrame(columns=NORMALIZED_COLUMNS)
     frame = pd.read_csv(path, encoding="utf-8-sig")
+    # Older CSVs discarded these fields; recover from the authoritative raw file.
+    raw, _ = _paths_for_date(day, data_dir)
+    if not set(LISTING_VARIANT_COLUMNS).issubset(frame.columns) and raw.is_file():
+        _, frame, _ = normalize_listing_workbook(raw.read_bytes(), day)
     for column in NORMALIZED_COLUMNS:
         if column not in frame.columns: frame[column] = pd.NA
     return frame[NORMALIZED_COLUMNS]
@@ -330,7 +383,7 @@ def _snapshot_events(data_dir: Path = DATA_DIR) -> list[dict[str, Any]]:
 def listing_source_revision(data_dir: Path = DATA_DIR) -> str:
     root = listing_root(data_dir)
     paths = [listing_index_path(data_dir), *root.glob("*.csv"), *root.glob("*.xlsx")]
-    digest = hashlib.sha256(b"listing-source-stat-v3")
+    digest = hashlib.sha256(b"listing-source-stat-v5-rating")
     found = False
     for path in sorted({path for path in paths if path.is_file()}, key=str):
         found = True
@@ -765,20 +818,20 @@ def observations(day: str | None = None, country: str | None = None, kind: str |
         source_context = _sales_response_source()
         for row in page_rows:
             row["sales_response"] = _sales_response(row, source_context)
-    return {"rows": page_rows, "page": page, "page_size": page_size, "total": total, "retention_days": 31}
+    return {"rows": page_rows, "page": page, "page_size": page_size, "total": total, "retention_days": LISTING_RETENTION_DAYS}
 
 
 def reports_listing_index(data_dir: Path = DATA_DIR) -> dict[str, Any]:
-    return {"records": load_listing_index(data_dir).to_dict("records"), "retention_days": 31}
+    return {"records": load_listing_index(data_dir).to_dict("records"), "retention_days": LISTING_RETENTION_DAYS}
 
 def upload_listing_file(name: str, data: bytes, data_dir: Path = DATA_DIR) -> dict[str, Any]:
-    return persist_listing_snapshot(name, data, data_dir)
+    return persist_listing_snapshot(name, data, data_dir, require_rating=True)
 
 def listing_preview(day: str, limit: int = 50, data_dir: Path = DATA_DIR) -> dict[str, Any]:
     frame = load_snapshot(day, data_dir)
     if frame.empty: raise HTTPException(404, "该日期没有 Listing 快照")
     bounded = min(max(limit, 1), 200)
-    return {"title": f"Listing价格 {day}", "columns": list(frame.columns), "rows": json.loads(frame.head(bounded).to_json(orient="records", force_ascii=False)), "total": len(frame)}
+    return {"title": f"领星产品监控表 {day}", "columns": list(frame.columns), "rows": json.loads(frame.head(bounded).to_json(orient="records", force_ascii=False)), "total": len(frame)}
 
 def listing_download(day: str, data_dir: Path = DATA_DIR) -> Path:
     raw, _ = _paths_for_date(day, data_dir)

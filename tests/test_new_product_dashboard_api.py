@@ -14,7 +14,7 @@ from fastapi.testclient import TestClient
 from backend import dashboard_api
 
 
-def build_bundle(*, developers=None, launch_stage="all", status="all", search=None):
+def build_bundle(*, developers=None, launch_stage="all", status="all", search=None, sales_min=None, sales_max=None):
     rows = []
     for index in range(60):
         rows.append({
@@ -42,6 +42,8 @@ def build_bundle(*, developers=None, launch_stage="all", status="all", search=No
         frame = frame[frame["开售天数"].between(start, end)]
     if search:
         frame = frame[frame.astype(str).apply(lambda column: column.str.contains(search, case=False, regex=False)).any(axis=1)]
+    from backend.product_filters import filter_new_sales
+    frame = filter_new_sales(frame, sales_min, sales_max)
     copy_lists = {
         "raise_skus": frame.loc[frame["监控状态"].eq("建议涨价"), "SKU"].tolist(),
         "lower_skus": frame.loc[frame["监控状态"].eq("建议降价"), "SKU"].tolist(),
@@ -123,6 +125,23 @@ class NewProductDashboardApiTests(unittest.TestCase):
         self.assertEqual(len(payload["rows"]), 10)
         self.assertEqual(payload["rows"][0]["SKU"], "SKU-020")
         self.assertTrue(all(row["监控状态"] == "建议涨价" for row in payload["rows"]))
+
+    def test_real_sales_filter_reaches_summary_copy_lists_and_export(self):
+        original = build_bundle()["sections"][0]["frame"].iloc[:3].copy()
+        original["90天销量"] = [4, 5, 10]
+        base = {"detail": original, "developers": ["甲", "乙"], "excluded_invalid_launch_count": 0,
+                "excluded_invalid_launch_by_developer": {}, "context_columns": [], "image_lookup": {},
+                "source_uploaded_at": None, "updated_at": 0}
+        with (patch.object(dashboard_api, "_new_product_base", return_value=base),
+              patch.object(dashboard_api, "_new_product_revision", return_value="sales-filter")):
+            params = {"sales_min": 5, "sales_max": 10}
+            view = self.client.get("/api/dashboard/new-products/view", params=params).json()
+            self.assertEqual(view["sections"][0]["total"], 1)
+            self.assertEqual(view["sections"][0]["rows"][0]["SKU"], "SKU-001")
+            self.assertEqual(view["copy_lists"]["lower_skus"], ["SKU-001"])
+            exported = self.client.get("/api/dashboard/new-products/sections/detail/export.csv", params=params)
+            self.assertEqual(len(exported.content.decode("utf-8-sig").splitlines()), 2)
+            self.assertEqual(self.client.get("/api/dashboard/new-products/view", params={"sales_min": 10, "sales_max": 5}).status_code, 422)
 
     def test_export_contains_all_filtered_rows_beyond_first_page(self):
         with patch.object(dashboard_api, "_new_product_bundle", side_effect=build_bundle):
